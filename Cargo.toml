@@ -1,0 +1,129 @@
+[package]
+name = "kodegend"
+version = "0.1.0"
+edition = "2024"
+description = "KODEGEN.ᴀɪ: Memory-efficient, Blazing-Fast, MCP tools for code generation agents."
+authors = ["KODEGEN.ᴀɪ"]
+homepage = "https://kodegen.ai"
+repository = "https://github.com/cyrup-ai/kodegend"
+readme = "README.md"
+categories = ["development-tools", "command-line-utilities", "api-bindings"]
+keywords = [
+    "mcp",
+    "terminal",
+    "agent",
+    "daemon",
+    "claude"
+]
+license = "Apache-2.0 OR MIT"
+
+[dependencies]
+anyhow               = "1"
+chrono               = { version = "0.4", features = ["serde"] }
+crossbeam-channel    = "0.5"
+env_logger           = "0.11"
+log                  = "0.4"
+nix                  = { version = "0.30", default-features = false, features = ["fs", "process", "signal", "user"] }
+once_cell            = "1"          # one‑time global config
+serde                = { version = "1", features = ["derive"] }
+serde_json           = "1"
+toml                 = "0.9"
+clap         = { version = "4", features = ["derive"] }   # for the new CLI
+which        = "8"                                         # locate system executables
+exec = "0.3"
+dirs = "6"
+thiserror   = "2"
+cfg-if      = "1"
+base64      = "0.22"
+flate2      = { version = "1", default-features = false, features = ["rust_backend"] }
+async-recursion = "1"
+
+# Auto-configuration support
+kodegen_bundler_autoconfig = { version = "0.1" }
+
+kodegen_tools_config = { version = "0.1" }
+kodegen_utils = { version = "0.1" }
+
+# Plugin system support
+extism = "1"
+oci-client = "0.15"
+
+# async support (always enabled)
+async-process = { version = "2" }
+tokio         = { version = "1", features = ["process", "macros", "signal", "rt-multi-thread", "time", "fs"] }
+
+# SSE server dependencies (always enabled)
+axum          = { version = "0.8" }
+tower         = { version = "0.5" }
+tower-http    = { version = "0.6", features = ["cors", "trace"] }
+reqwest       = { version = "0.12", features = ["json"] }
+regex         = { version = "1" }
+url           = { version = "2" }
+uuid          = { version = "1", features = ["v4"] }
+rmcp          = { version = "0.8", features = ["server", "transport-streamable-http-server"] }
+cyrup_termcolor = "2"
+async-stream  = { version = "0.3" }
+futures-util  = { version = "0.3" }
+serde_urlencoded = { version = "0.7" }
+rcgen = "0.14"
+futures = "0.3"
+time = { version = "0.3", features = ["macros", "serde"] }
+tokio-stream = "0.1"
+pem = "3"
+x509-parser = "0.18"
+p256 = { version = "0.13", features = ["ecdsa", "pem"] }
+sha2 = "0.10"
+
+# Zero-allocation performance optimizations
+arrayvec = { version = "0.7", features = ["serde"] }          # Fixed-size arrays without heap allocation
+memmap2 = { version = "0.9" }           # Memory-mapped file I/O for zero-copy access
+atomic-counter = { version = "1" }    # Lock-free atomic counters
+tokio-util = { version = "0.7" }        # Tokio utilities for cancellation
+dashmap = { version = "6" }           # Lock-free concurrent hash maps
+memchr = { version = "2" }            # SIMD-accelerated string matching
+fastrand = "2"
+jwalk = "0.8"
+rayon = "1"
+walkdir = "2"
+
+[features]
+default = []
+systemd-notify = ["systemd"]
+systemd = ["dep:systemd"]
+
+# platform-specific deps
+[target.'cfg(target_os = "linux")'.dependencies]
+users = "0.11"
+systemd = { version = "0.10", optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+winapi  = { version = "0.3", features = ["processthreadsapi", "winnt", "handleapi", "securitybaseapi"] }
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_Services",
+  "Win32_System_Console",
+  "Win32_System_Threading",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging"
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+plist  = "1"
+zip    = { version = "6", default-features = false, features = ["aes-crypto", "bzip2", "deflate64", "deflate", "time", "zstd"] }
+
+[build-dependencies]
+pkg-config = "0.3"
+cc = "1"
+tempfile = "3"
+which = "8"
+zip = { version = "6", default-features = false, features = ["aes-crypto", "bzip2", "deflate64", "deflate", "time", "zstd"] }
+plist = "1"
+# Dependencies needed for build scripts
+jwalk = "0.8"
+rayon = "1"
+fastrand = "2"
+
+[[bin]]
+name = "kodegend"
+path = "src/main.rs"
