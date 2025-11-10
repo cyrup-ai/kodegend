@@ -1,6 +1,6 @@
 mod autoconfig;
 
-pub mod kodegen_http;
+pub mod embedded_servers;
 
 use std::process::{Child, Command, Stdio};
 use std::thread;

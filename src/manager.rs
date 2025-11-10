@@ -9,6 +9,7 @@ use crate::config::ServiceConfig;
 use crate::ipc::{Cmd, Evt};
 use crate::lifecycle::Lifecycle;
 use crate::state_machine::{Action, Event};
+use crate::service::embedded_servers::{EmbeddedServer, start_all_servers, shutdown_all_servers};
 
 /// Global event bus size – small fixed size → zero heap growth.
 const BUS_BOUND: usize = 128;
@@ -27,7 +28,7 @@ pub struct ServiceManager {
     workers: HashMap<String, Sender<Cmd>>,
     pending_restarts: HashMap<String, RestartState>,
     lifecycle: Lifecycle,
-    kodegen_http_service: Option<crate::service::kodegen_http::KodegenHttpService>,
+    embedded_servers: Option<Vec<EmbeddedServer>>,
 }
 
 impl ServiceManager {
@@ -99,24 +100,28 @@ impl ServiceManager {
             workers,
             pending_restarts: HashMap::new(),
             lifecycle: Lifecycle::default(),
-            kodegen_http_service: None,
+            embedded_servers: None,
         })
     }
 
-    /// Start category HTTP servers if configured
+    /// Start category HTTP servers as embedded in-process servers
     pub async fn start_http_servers(&mut self, cfg: &ServiceConfig) -> Result<()> {
         let configs = cfg.category_servers.clone();
-        
-        log::info!("Starting {} category HTTP servers", configs.len());
+        let (tls_cert, tls_key) = crate::config::discover_certificate_paths();
+
+        log::info!("Starting {} embedded HTTP servers", configs.len());
         for config in &configs {
             if config.enabled {
                 log::info!("  {} (port {})", config.name, config.port);
             }
         }
 
-        let mut service = crate::service::kodegen_http::KodegenHttpService::new(configs);
-        service.start().await?;
-        self.kodegen_http_service = Some(service);
+        // Start all servers (fail-fast on error with automatic rollback)
+        let servers = start_all_servers(configs, tls_cert, tls_key).await?;
+
+        log::info!("✓ All HTTP servers started successfully");
+        self.embedded_servers = Some(servers);
+
         Ok(())
     }
 
@@ -166,11 +171,10 @@ impl ServiceManager {
                             pid: Some(std::process::id()),
                         }).ok();
 
-                        // Shutdown kodegen HTTP server if running
-                        if let Some(mut service) = self.kodegen_http_service.take()
-                            && let Err(e) = service.stop().await {
-                                error!("Error stopping kodegen HTTP server: {e}");
-                            }
+                        // Shutdown embedded HTTP servers if running
+                        if let Some(servers) = self.embedded_servers.take() {
+                            shutdown_all_servers(servers).await;
+                        }
 
                         for tx in self.workers.values() { tx.send(Cmd::Shutdown).ok(); }
                         break;
