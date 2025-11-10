@@ -172,8 +172,10 @@ impl ServiceManager {
                         }).ok();
 
                         // Shutdown embedded HTTP servers if running
-                        if let Some(servers) = self.embedded_servers.take() {
-                            shutdown_all_servers(servers).await;
+                        if let Some(servers) = self.embedded_servers.take()
+                            && let Err(e) = shutdown_all_servers(servers).await
+                        {
+                            log::error!("Error shutting down embedded servers: {}", e);
                         }
 
                         for tx in self.workers.values() { tx.send(Cmd::Shutdown).ok(); }

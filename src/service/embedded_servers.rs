@@ -9,6 +9,7 @@ use crate::config::CategoryServerConfig;
 /// Handle to an embedded HTTP server running in background tasks
 pub struct EmbeddedServer {
     pub name: String,
+    #[allow(dead_code)]
     pub port: u16,
     pub server_handle: ServerHandle,
 }
