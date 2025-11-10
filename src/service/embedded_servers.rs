@@ -125,9 +125,10 @@ async fn rollback_servers(servers: Vec<EmbeddedServer>) {
     let timeout = Duration::from_secs(10);
     
     for server in servers {
-        log::info!("Rolling back {} server", server.name);
+        let server_name = server.name.clone();
+        log::info!("Rolling back {} server", server_name);
         if let Err(e) = server.shutdown(timeout).await {
-            log::error!("Failed to rollback {}: {}", server.name, e);
+            log::error!("Failed to rollback {}: {}", server_name, e);
         }
     }
     
@@ -143,8 +144,9 @@ pub async fn shutdown_all_servers(servers: Vec<EmbeddedServer>) -> Result<()> {
     let mut errors = Vec::new();
     
     for server in servers {
+        let server_name = server.name.clone();
         if let Err(e) = server.shutdown(timeout).await {
-            let msg = format!("{} shutdown error: {}", server.name, e);
+            let msg = format!("{} shutdown error: {}", server_name, e);
             log::error!("{}", msg);
             errors.push(msg);
         }
