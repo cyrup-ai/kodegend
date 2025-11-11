@@ -11,7 +11,7 @@ mod state_machine;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use log::{error, info};
 use manager::ServiceManager;
@@ -94,12 +94,51 @@ async fn run_daemon(
         config_dir.join("kodegend.toml")
     };
 
-    // Load or create default config
-    let cfg_str = fs::read_to_string(&cfg_path).or_else(|_| {
-        info!("Config not found at {}, using defaults", cfg_path.display());
-        Ok::<String, anyhow::Error>(toml::to_string_pretty(&config::ServiceConfig::default())?)
-    })?;
-    let cfg: config::ServiceConfig = toml::from_str(&cfg_str)?;
+    // Check installation state before starting services
+    use kodegen_bundler_install::{check_installation_state, ensure_installed, InstallationState};
+    
+    info!("Checking Kodegen installation state...");
+    let install_state = check_installation_state();
+    
+    match install_state {
+        InstallationState::NotInstalled | InstallationState::PartiallyInstalled => {
+            info!("Installation required: {:?}", install_state);
+            info!("Running automatic installation...");
+            
+            ensure_installed().await
+                .context("Failed to install Kodegen binaries")?;
+            
+            info!("Installation completed successfully");
+        }
+        InstallationState::FullyInstalled => {
+            info!("Installation verified - all components present");
+        }
+    }
+
+    // Auto-generate config file if it doesn't exist
+    if !cfg_path.exists() {
+        info!("Config not found at {}, creating default configuration", cfg_path.display());
+        
+        // Create parent directory if needed
+        if let Some(parent) = cfg_path.parent() {
+            fs::create_dir_all(parent)
+                .context("Failed to create config directory")?;
+        }
+        
+        // Serialize and write default config
+        let default_toml = toml::to_string_pretty(&config::ServiceConfig::default())
+            .context("Failed to serialize default config")?;
+        fs::write(&cfg_path, default_toml)
+            .context("Failed to write config file")?;
+        
+        info!("Created default configuration at {}", cfg_path.display());
+    }
+
+    // Load config from disk
+    let cfg_str = fs::read_to_string(&cfg_path)
+        .context("Failed to read config file")?;
+    let cfg: config::ServiceConfig = toml::from_str(&cfg_str)
+        .context("Failed to parse config")?;
 
     info!("Using config from: {}", cfg_path.display());
 
