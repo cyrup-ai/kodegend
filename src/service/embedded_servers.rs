@@ -110,7 +110,6 @@ async fn start_server(
         "github" => kodegen_tools_github::start_server(addr, tls_cert, tls_key).await,
         "database" => kodegen_tools_database::start_server(addr, tls_cert, tls_key).await,
         "browser" => kodegen_tools_browser::start_server(addr, tls_cert, tls_key).await,
-        "config" => kodegen_tools_config::start_server(addr, tls_cert, tls_key).await,
         "reasoner" => kodegen_tools_reasoner::start_server(addr, tls_cert, tls_key).await,
         "claude-agent" => kodegen_claude_agent::start_server(addr, tls_cert, tls_key).await,
         "candle-agent" => kodegen_candle_agent::start_server(addr, tls_cert, tls_key).await,

@@ -95,7 +95,7 @@ async fn run_daemon(
     };
 
     // Check installation state before starting services
-    use kodegen_bundler_install::{check_installation_state, ensure_installed, InstallationState};
+    use kodegend::install::{check_installation_state, ensure_installed, InstallationState};
     
     info!("Checking Kodegen installation state...");
     let install_state = check_installation_state();

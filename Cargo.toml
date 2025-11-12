@@ -25,7 +25,6 @@ macos = "public.app-category.developer-tools"
 [dependencies]
 
 kodegen_bundler_autoconfig = { version = "0.1" }
-kodegen_bundler_install = { version = "0.1" }
 kodegen_config_manager = { version = "0.1" }
 kodegen_utils = { version = "0.1" }
 kodegen_server_http = { version = "0.1" }
@@ -41,7 +40,6 @@ kodegen_tools_github = { version = "0.1" }
 kodegen_tools_database = { version = "0.1" }
 kodegen_tools_browser = { version = "0.1" }
 kodegen_tools_reasoner = { version = "0.1" }
-kodegen_tools_config = { version = "0.1" }
 kodegen_claude_agent = { version = "0.1" }
 kodegen_candle_agent = { version = "0.1" }
 
@@ -71,6 +69,18 @@ flate2 = { version = "1", default-features = false, features = [
   "rust_backend",
 ] }
 async-recursion = "1"
+cc = "1"
+tempfile = "3"
+libc = "0.2"
+hex = "0.4"
+
+# Archive extraction (for installer binary downloads)
+zip = { version = "6", default-features = false, features = ["deflate"] }
+tar = "0.4"
+
+# Interactive installer wizard UI
+inquire = "0.9"
+indicatif = "0.18"
 
 # Plugin system support
 extism = "1"
@@ -82,7 +92,9 @@ tokio = { version = "1", features = [
   "process",
   "macros",
   "signal",
+  "rt",
   "rt-multi-thread",
+  "sync",
   "time",
   "fs",
 ] }
@@ -126,10 +138,17 @@ jwalk = "0.8"
 rayon = "1"
 walkdir = "2"
 
+# GUI installer dependencies (optional, feature-gated)
+eframe = { version = "0.33", optional = true }
+egui = { version = "0.33", optional = true }
+image = { version = "0.25", optional = true }
+opener = { version = "0.8", optional = true }
+
 [features]
 default = []
 systemd-notify = ["systemd"]
 systemd = ["dep:systemd"]
+gui = ["eframe", "egui", "image", "opener"]
 
 # platform-specific deps
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -146,6 +165,7 @@ winapi = { version = "0.3", features = [
 windows = { version = "0.62", features = [
   "Win32_Foundation",
   "Win32_Security",
+  "Win32_System_Registry",
   "Win32_System_Services",
   "Win32_System_Console",
   "Win32_System_Threading",
@@ -182,6 +202,8 @@ plist = "1"
 jwalk = "0.8"
 rayon = "1"
 fastrand = "2"
+sha2 = "0.10"
+hex = "0.4"
 
 [[bin]]
 name = "kodegend"
