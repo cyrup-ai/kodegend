@@ -21,9 +21,8 @@ pub mod uninstall;
 pub mod windows;
 
 // Re-export key types and functions for backward compatibility
-pub use builder::{InstallerBuilder, CommandBuilder};
+pub use builder::InstallerBuilder;
 pub use error::InstallerError;
-pub use core::{InstallProgress, DownloadPhase};
 
 // All config and uninstall functions removed as unused
 

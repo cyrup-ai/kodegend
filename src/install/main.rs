@@ -1,6 +1,6 @@
 //! Kodegen installer binary
 //!
-//! This is a thin wrapper around the kodegen_bundler_install library.
+//! This is a thin wrapper around the kodegend::install module.
 //! The actual installation logic lives in lib.rs.
 //!
 //! This binary preserves the standalone installer behavior for users who
@@ -14,5 +14,5 @@ async fn main() -> Result<()> {
         .filter_level(log::LevelFilter::Info)
         .init();
 
-    kodegen_bundler_install::install_interactive().await
+    kodegend::install::install_interactive().await
 }

@@ -26,7 +26,7 @@ pub use environment::{is_cli_environment, is_desktop_environment};
 
 // Re-export installer types and modules for internal use
 pub use install::{InstallerBuilder, InstallerError};
-pub(crate) use install::{core, builder, config, uninstall};
+pub(crate) use install::{core, config, uninstall};
 
 use anyhow::Result;
 use cli::Cli;

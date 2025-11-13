@@ -1,6 +1,6 @@
 [package]
 name = "kodegend"
-version = "0.1.4"
+version = "0.2.0"
 edition = "2024"
 description = "KODEGEN.ᴀɪ: Memory-efficient, Blazing-Fast, MCP tools for code generation agents."
 authors = ["KODEGEN.ᴀɪ"]
@@ -24,24 +24,24 @@ macos = "public.app-category.developer-tools"
 
 [dependencies]
 
-kodegen_bundler_autoconfig = { version = "0.1" }
-kodegen_config_manager = { version = "0.1" }
-kodegen_utils = { version = "0.1" }
-kodegen_server_http = { version = "0.1" }
-kodegen_tools_filesystem = { version = "0.1" }
-kodegen_tools_terminal = { version = "0.1" }
-kodegen_tools_process = { version = "0.1" }
-kodegen_tools_sequential_thinking = { version = "0.1" }
-kodegen_tools_citescrape = { version = "0.1" }
-kodegen_tools_prompt = { version = "0.1" }
-kodegen_tools_introspection = { version = "0.1" }
-kodegen_tools_git = { version = "0.1" }
-kodegen_tools_github = { version = "0.1" }
-kodegen_tools_database = { version = "0.1" }
-kodegen_tools_browser = { version = "0.1" }
-kodegen_tools_reasoner = { version = "0.1" }
-kodegen_claude_agent = { version = "0.1" }
-kodegen_candle_agent = { version = "0.1" }
+kodegen_bundler_autoconfig = { version = "0.2" }
+kodegen_config_manager = { version = "0.2" }
+kodegen_utils = { version = "0.2" }
+kodegen_server_http = { version = "0.2" }
+kodegen_tools_filesystem = { version = "0.2" }
+kodegen_tools_terminal = { version = "0.2" }
+kodegen_tools_process = { version = "0.2" }
+kodegen_tools_sequential_thinking = { version = "0.2" }
+kodegen_tools_citescrape = { version = "0.2" }
+kodegen_tools_prompt = { version = "0.2" }
+kodegen_tools_introspection = { version = "0.2" }
+kodegen_tools_git = { version = "0.2" }
+kodegen_tools_github = { version = "0.2" }
+kodegen_tools_database = { version = "0.2" }
+kodegen_tools_browser = { version = "0.2" }
+kodegen_tools_reasoner = { version = "0.2" }
+kodegen_claude_agent = { version = "0.2" }
+kodegen_candle_agent = { version = "0.2" }
 
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
