@@ -15,6 +15,15 @@ use super::certificate::CertificateConfig;
 use super::progress::InstallProgress;
 use super::service::ServiceConfig;
 
+#[cfg(windows)]
+use windows::{
+    core::PCWSTR,
+    Win32::Foundation::{CloseHandle, GetLastError, HWND},
+    Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, INFINITE},
+    Win32::UI::Shell::{ShellExecuteExW, SHELLEXECUTEINFOW, SEE_MASK_NOCLOSEPROCESS},
+    Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
+};
+
 /// Installation context
 #[derive(Debug)]
 pub struct InstallContext {
@@ -480,5 +489,95 @@ impl InstallContext {
 
         // If we reach here, exec failed
         Err(anyhow::anyhow!("Failed to exec sudo: {err}"))
+    }
+
+    /// Escalate privileges using Windows UAC by re-executing with ShellExecuteEx
+    /// This mirrors the Unix sudo behavior but uses Windows UAC elevation
+    #[cfg(windows)]
+    #[allow(dead_code)]
+    fn escalate_with_uac() -> Result<()> {
+        use std::io::Write;
+
+        // Get the current executable path and arguments
+        let exe_path = std::env::current_exe()
+            .context("Failed to get current executable path")?;
+        let args: Vec<String> = std::env::args().collect();
+
+        eprintln!("   Current exe: {exe_path:?}");
+        eprintln!("   Args: {args:?}");
+
+        // Convert executable path to UTF-16 with null terminator
+        let exe_path_wide: Vec<u16> = exe_path
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+
+        // Build arguments string (skip program name, same as Unix version)
+        let args_string = args[1..].join(" ");
+        let args_wide: Vec<u16> = args_string
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+
+        // "runas" verb triggers UAC elevation prompt
+        let verb: Vec<u16> = "runas\0".encode_utf16().collect();
+
+        // Set up SHELLEXECUTEINFOW structure
+        let mut sei = SHELLEXECUTEINFOW {
+            cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+            fMask: SEE_MASK_NOCLOSEPROCESS,  // Keep process handle for waiting
+            hwnd: HWND::default(),
+            lpVerb: PCWSTR(verb.as_ptr()),
+            lpFile: PCWSTR(exe_path_wide.as_ptr()),
+            lpParameters: PCWSTR(args_wide.as_ptr()),
+            lpDirectory: PCWSTR::null(),
+            nShow: SW_SHOWNORMAL.0 as i32,  // Show window normally
+            hInstApp: Default::default(),
+            lpIDList: std::ptr::null_mut(),
+            lpClass: PCWSTR::null(),
+            hkeyClass: Default::default(),
+            dwHotKey: 0,
+            hMonitor: Default::default(),
+            hProcess: Default::default(),
+        };
+
+        eprintln!("   Executing elevated: {:?} {:?}", exe_path, &args[1..]);
+
+        // Flush stderr to ensure messages are visible before UAC prompt
+        let _ = std::io::stderr().flush();
+
+        // Launch elevated process
+        let elevation_result = unsafe { ShellExecuteExW(&mut sei) };
+
+        if elevation_result.is_err() || sei.hProcess.is_invalid() {
+            // Check if user cancelled UAC (ERROR_CANCELLED = 1223)
+            let error_code = unsafe { GetLastError() };
+            if error_code.0 == 1223 {
+                return Err(anyhow::anyhow!(
+                    "UAC elevation cancelled by user. Administrator privileges are required to install kodegen."
+                ));
+            }
+
+            return Err(anyhow::anyhow!(
+                "Failed to launch elevated installer process (error code: {})",
+                error_code.0
+            ));
+        }
+
+        // Wait for elevated process to complete
+        unsafe {
+            WaitForSingleObject(sei.hProcess, INFINITE);
+
+            // Get exit code from elevated process
+            let mut exit_code: u32 = 0;
+            let _ = GetExitCodeProcess(sei.hProcess, &mut exit_code);
+
+            // Clean up process handle
+            CloseHandle(sei.hProcess);
+
+            // Exit current (non-elevated) process with same exit code as elevated process
+            std::process::exit(exit_code as i32);
+        }
     }
 }
