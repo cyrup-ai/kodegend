@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use chrono::{DateTime, Utc};
 
 /// Commands sent *to* a worker thread.
@@ -16,7 +18,7 @@ pub enum Cmd {
 pub enum Evt {
     State {
         service: String,
-        kind: &'static str, // "running"|"stopped"|etc.
+        kind: Cow<'static, str>, // "running"|"stopped"|etc.
         ts: DateTime<Utc>,
         pid: Option<u32>,
     },
@@ -31,7 +33,7 @@ pub enum Evt {
     },
     Fatal {
         service: String,
-        msg: &'static str,
+        msg: Cow<'static, str>,
         ts: DateTime<Utc>,
     },
 }

@@ -114,11 +114,15 @@ fn convert_to_service_definition(
             .working_dir
             .as_ref()
             .map(|p| p.to_string_lossy().to_string()),
+        log_stdout: None,
+        log_stderr: None,
         env_vars,
         auto_restart: service.auto_restart,
+        restart_policy: crate::config::RestartPolicy::default(),
         user: service.user.clone(),
         group: service.group.clone(),
         restart_delay_s: Some(10),
+        shutdown_timeout_secs: Some(10),
         depends_on: service.dependencies.clone(),
         health_check,
         log_rotation: None,

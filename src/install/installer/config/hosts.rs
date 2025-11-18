@@ -191,7 +191,7 @@ fn get_hosts_file_path() -> PathBuf {
     }
     #[cfg(windows)]
     {
-        PathBuf::from("C:\\Windows\\System32\\drivers\\etc\\hosts")
+        super::super::windows::paths::hosts_file()
     }
     #[cfg(not(any(unix, windows)))]
     {

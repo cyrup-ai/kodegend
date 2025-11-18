@@ -64,6 +64,16 @@ pub async fn start_all_servers(
         
         log::info!("Starting {} server on {}", config.name, addr);
         
+        // Pre-startup port cleanup (best-effort)
+        if let Err(e) = super::port_cleanup::cleanup_port_if_needed(config.port).await {
+            log::warn!(
+                "Port cleanup for {} (port {}) failed: {}. Will attempt startup anyway.",
+                config.name,
+                config.port,
+                e
+            );
+        }
+        
         // Start server (non-blocking - returns ServerHandle immediately)
         match start_server(&config.name, addr, tls_cert.clone(), tls_key.clone()).await {
             Ok(server_handle) => {
@@ -113,6 +123,7 @@ async fn start_server(
         "reasoner" => kodegen_tools_reasoner::start_server(addr, tls_cert, tls_key).await,
         "claude-agent" => kodegen_claude_agent::start_server(addr, tls_cert, tls_key).await,
         "candle-agent" => kodegen_candle_agent::start_server(addr, tls_cert, tls_key).await,
+        "config" => kodegen_tools_config::start_server(addr, tls_cert, tls_key).await,
         _ => Err(anyhow::anyhow!("Unknown server category: {}", category)),
     }
 }

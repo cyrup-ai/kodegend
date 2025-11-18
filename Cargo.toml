@@ -24,37 +24,36 @@ macos = "public.app-category.developer-tools"
 
 [dependencies]
 
-kodegen_bundler_autoconfig = { version = "0.2" }
-kodegen_config_manager = { version = "0.2" }
-kodegen_utils = { version = "0.2" }
-kodegen_server_http = { version = "0.2" }
-kodegen_tools_filesystem = { version = "0.2" }
-kodegen_tools_terminal = { version = "0.2" }
-kodegen_tools_process = { version = "0.2" }
-kodegen_tools_sequential_thinking = { version = "0.2" }
-kodegen_tools_citescrape = { version = "0.2" }
-kodegen_tools_prompt = { version = "0.2" }
-kodegen_tools_introspection = { version = "0.2" }
-kodegen_tools_git = { version = "0.2" }
-kodegen_tools_github = { version = "0.2" }
-kodegen_tools_database = { version = "0.2" }
-kodegen_tools_browser = { version = "0.2" }
-kodegen_tools_reasoner = { version = "0.2" }
-kodegen_claude_agent = { version = "0.2" }
-kodegen_candle_agent = { version = "0.2" }
+kodegen_bundler_autoconfig = { version = "0.2", path = "../kodegen-bundler-autoconfig" }
+kodegen_config_manager = { version = "0.2", path = "../kodegen-config-manager" }
+kodegen_utils = { version = "0.2", path = "../kodegen-utils" }
+kodegen_server_http = { version = "0.2", path = "../kodegen-server-http" }
+kodegen_tools_filesystem = { version = "0.2", path = "../kodegen-tools-filesystem" }
+kodegen_tools_terminal = { version = "0.2", path = "../kodegen-tools-terminal" }
+kodegen_tools_process = { version = "0.2", path = "../kodegen-tools-process" }
+kodegen_tools_sequential_thinking = { version = "0.2", path = "../kodegen-tools-sequential-thinking" }
+kodegen_tools_citescrape = { version = "0.2", path = "../kodegen-tools-citescrape" }
+kodegen_tools_config = { version = "0.2", path = "../kodegen-tools-config" }
+kodegen_tools_prompt = { version = "0.2", path = "../kodegen-tools-prompt" }
+kodegen_tools_introspection = { version = "0.2", path = "../kodegen-tools-introspection" }
+kodegen_tools_git = { version = "0.2", path = "../kodegen-tools-git" }
+kodegen_tools_github = { version = "0.2", path = "../kodegen-tools-github" }
+kodegen_tools_database = { version = "0.2", path = "../kodegen-tools-database" }
+kodegen_tools_browser = { version = "0.2", path = "../kodegen-tools-browser" }
+kodegen_tools_reasoner = { version = "0.2", path = "../kodegen-tools-reasoner" }
+kodegen_claude_agent = { version = "0.2", path = "../kodegen-claude-agent" }
+kodegen_candle_agent = { version = "0.2", path = "../kodegen-candle-agent" }
 
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 crossbeam-channel = "0.5"
 env_logger = "0.11"
+parking_lot = "0.12"
 log = "0.4"
-nix = { version = "0.30", default-features = false, features = [
-  "fs",
-  "process",
-  "signal",
-  "user",
-] }
+multi_log = "0.1"  # Enables multiple simultaneous loggers
+sysinfo = "0.37"
 once_cell = "1" # one‑time global config
+scopeguard = "1.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.9"
@@ -107,7 +106,7 @@ reqwest = { version = "0.12", features = ["json"] }
 regex = { version = "1" }
 url = { version = "2" }
 uuid = { version = "1", features = ["v4"] }
-rmcp = { version = "0.8", features = [
+rmcp = { version = "0.9", features = [
   "server",
   "transport-streamable-http-server",
 ] }
@@ -155,7 +154,19 @@ gui = ["eframe", "egui", "image", "opener"]
 users = "0.11"
 systemd = { version = "0.10", optional = true }
 
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.30", default-features = false, features = [
+  "fs",
+  "process",
+  "resource",
+  "signal",
+  "user",
+] }
+
 [target.'cfg(target_os = "windows")'.dependencies]
+windows-service = "0.8"
+widestring = "1"
+eventlog = "0.3"  # Windows Event Log API wrapper
 winapi = { version = "0.3", features = [
   "processthreadsapi",
   "winnt",
@@ -169,6 +180,7 @@ windows = { version = "0.62", features = [
   "Win32_System_Services",
   "Win32_System_Console",
   "Win32_System_Threading",
+  "Win32_System_Diagnostics_ToolHelp",
   "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging",
 ] }

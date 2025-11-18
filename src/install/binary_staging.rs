@@ -116,11 +116,13 @@ pub async fn install_binaries_to_system(binary_paths: &[PathBuf]) -> Result<()> 
 
     #[cfg(windows)]
     {
-        let bin_dir = PathBuf::from(r"C:\Program Files\Kodegen");
+        use crate::install::installer::windows::paths::{self, InstallScope};
+        
+        let bin_dir = paths::install_dir(InstallScope::System);
 
         if !bin_dir.exists() {
             fs::create_dir_all(&bin_dir)
-                .context("Failed to create C:\\Program Files\\Kodegen directory")?;
+                .with_context(|| format!("Failed to create directory: {}", bin_dir.display()))?;
         }
 
         for binary_path in binary_paths {

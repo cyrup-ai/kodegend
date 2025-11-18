@@ -8,14 +8,14 @@ use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
-use super::core::InstallProgress;
-use super::wizard::InstallationResult;
+use crate::install::core::InstallProgress;
+use super::super::wizard::InstallationResult;
 
 use super::types::INSTALL_TIMEOUT;
 use super::window::InstallWindow;
 
 /// Run GUI installation with progress window
-pub async fn run_gui_installation(cli: &crate::Cli) -> anyhow::Result<InstallationResult> {
+pub async fn run_gui_installation(cli: &super::super::cli::Cli) -> anyhow::Result<InstallationResult> {
     let mut stdout = StandardStream::stdout(ColorChoice::Always);
     let _ = stdout.set_color(ColorSpec::new().set_fg(Some(Color::Cyan)));
     let _ = writeln!(stdout, "🎨 Launching GUI installer...");
@@ -31,7 +31,7 @@ pub async fn run_gui_installation(cli: &crate::Cli) -> anyhow::Result<Installati
     let cli_clone = cli.clone();
     tokio::spawn(async move {
         // Download all binaries from GitHub with progress reporting
-        let binary_paths = match crate::download::download_all_binaries(tx.clone()).await {
+        let binary_paths = match crate::install::download::download_all_binaries(tx.clone()).await {
             Ok(paths) => paths,
             Err(e) => {
                 let _ = tx.try_send(InstallProgress::error(
@@ -50,7 +50,7 @@ pub async fn run_gui_installation(cli: &crate::Cli) -> anyhow::Result<Installati
             format!("Installing {} binaries to system", binary_paths.len()),
         ));
 
-        if let Err(e) = crate::binary_staging::install_binaries_to_system(&binary_paths).await {
+        if let Err(e) = crate::install::binary_staging::install_binaries_to_system(&binary_paths).await {
             let _ = tx.try_send(InstallProgress::error(
                 "binary_install".to_string(),
                 format!("Failed to install binaries: {}", e),
@@ -70,7 +70,10 @@ pub async fn run_gui_installation(cli: &crate::Cli) -> anyhow::Result<Installati
         let kodegend_path = std::path::PathBuf::from("/usr/local/bin/kodegend");
 
         #[cfg(windows)]
-        let kodegend_path = std::path::PathBuf::from(r"C:\Program Files\Kodegen\kodegend.exe");
+        let kodegend_path = {
+            use crate::install::installer::windows::paths::{kodegend_exe, InstallScope};
+            kodegend_exe(InstallScope::System)
+        };
 
         #[cfg(not(any(unix, windows)))]
         {

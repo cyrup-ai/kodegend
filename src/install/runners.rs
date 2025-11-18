@@ -16,7 +16,7 @@ use crate::install;
 use super::privilege;
 
 #[cfg(feature = "gui")]
-use crate::gui;
+use crate::install::gui;
 
 /// Run installation in GUI mode
 #[cfg(feature = "gui")]
@@ -37,7 +37,7 @@ pub async fn run_gui_mode(cli: &Cli) -> Result<()> {
 /// Run installation in non-interactive CLI mode
 pub async fn run_install(cli: &Cli) -> Result<()> {
     use super::binaries::BINARY_COUNT;
-    use crate::install::install::core::DownloadPhase;
+    use crate::install::core::DownloadPhase;
 
     let mut stdout = StandardStream::stdout(ColorChoice::Always);
     let _ = stdout.set_color(ColorSpec::new().set_fg(Some(Color::Cyan)).set_bold(true));

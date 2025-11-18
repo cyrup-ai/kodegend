@@ -39,11 +39,12 @@ pub(super) fn create_service(
     str_to_wide(&builder.description, &mut display_name_buf)?;
 
     // Build binary path with arguments
+    // Always include --service flag so SCM invokes Windows service dispatcher
     let binary_path = if builder.args.is_empty() {
-        builder.program.to_string_lossy().to_string()
+        format!("\"{}\" --service", builder.program.display())
     } else {
         format!(
-            "\"{}\" {}",
+            "\"{}\" {} --service",
             builder.program.display(),
             builder.args.join(" ")
         )
@@ -272,7 +273,8 @@ pub(super) fn install_services(
         })?;
 
         // Create services directory
-        let services_dir = PathBuf::from(r"C:\ProgramData\kodegen\services");
+        use super::paths;
+        let services_dir = paths::services_dir();
         std::fs::create_dir_all(&services_dir).map_err(|e| {
             InstallerError::System(format!("Failed to create services directory: {}", e))
         })?;

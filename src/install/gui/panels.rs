@@ -2,7 +2,7 @@
 
 use eframe::egui;
 
-use super::binaries::BINARY_COUNT;
+use super::super::binaries::BINARY_COUNT;
 
 use super::types::BinaryStatus;
 use super::window::InstallWindow;

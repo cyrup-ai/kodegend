@@ -62,48 +62,18 @@ pub(super) fn create_registry_entries(builder: &InstallerBuilder) -> Result<(), 
 }
 
 /// Register Windows Event Log source
+///
+/// Uses the eventlog crate to register the service as an Event Log source.
+/// This creates the necessary registry entries at:
+/// HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\EventLog\Application\{service_name}
 pub(super) fn register_event_source(service_name: &str) -> Result<(), InstallerError> {
-    let event_key_path = format!(
-        "SYSTEM\\CurrentControlSet\\Services\\EventLog\\Application\\{}",
-        service_name
-    );
+    eventlog::register(service_name)
+        .map_err(|e| InstallerError::System(format!(
+            "Failed to register Windows Event Log source '{}': {}. This is expected if not running as Administrator.",
+            service_name, e
+        )))?;
 
-    let mut key_path_buf: [u16; 512] = [0; 512];
-    str_to_wide(&event_key_path, &mut key_path_buf)?;
-
-    let mut key_handle: HKEY = HKEY::default();
-
-    unsafe {
-        RegCreateKeyExW(
-            HKEY_LOCAL_MACHINE,
-            PCWSTR::from_raw(key_path_buf.as_ptr()),
-            0,
-            PCWSTR::null(),
-            0,
-            KEY_WRITE,
-            None,
-            &mut key_handle,
-            None,
-        )
-        .map_err(|e| {
-            InstallerError::System(format!("Failed to create event log registry key: {}", e))
-        })?;
-    }
-
-    let registry_handle = RegistryHandle(key_handle);
-
-    // Set event message file
-    let exe_path = std::env::current_exe().map_err(|e| {
-        InstallerError::System(format!("Failed to get current exe path: {}", e))
-    })?;
-
-    set_registry_string(
-        &registry_handle,
-        "EventMessageFile",
-        &exe_path.to_string_lossy(),
-    )?;
-    set_registry_dword(&registry_handle, "TypesSupported", 7)?; // Error, Warning, Information
-
+    log::info!("Windows Event Log source '{}' registered successfully", service_name);
     Ok(())
 }
 
@@ -115,9 +85,16 @@ pub(super) fn cleanup_registry_entries(service_name: &str) -> Result<(), Install
 }
 
 /// Unregister event source
+///
+/// Removes the Event Log source registry entries for the service.
 pub(super) fn unregister_event_source(service_name: &str) -> Result<(), InstallerError> {
-    // This would implement event source cleanup
-    // For brevity, we'll implement the registry key deletion
+    eventlog::deregister(service_name)
+        .map_err(|e| InstallerError::System(format!(
+            "Failed to deregister Windows Event Log source '{}': {}",
+            service_name, e
+        )))?;
+
+    log::info!("Windows Event Log source '{}' deregistered successfully", service_name);
     Ok(())
 }
 

@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use log::warn;
 
-use crate::install::install::core::{InstallProgress, DownloadPhase};
+use crate::install::core::{InstallProgress, DownloadPhase};
 use crate::install::binaries::{BINARIES, BINARY_COUNT};
 use super::platform::Platform;
 use super::github::get_latest_release;

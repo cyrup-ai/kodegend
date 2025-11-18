@@ -4,12 +4,14 @@ mod control;
 mod daemon;
 mod ipc;
 mod lifecycle;
+mod logging;
 mod manager;
+mod platform;
 mod service;
 mod state_machine;
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -17,22 +19,25 @@ use log::{error, info};
 use manager::ServiceManager;
 
 fn main() {
-    // Initialize logger with custom format for daemon
-    env_logger::Builder::from_default_env()
-        .format(|buf, record| {
-            use std::io::Write;
-            writeln!(
-                buf,
-                "[{} {} {}:{}] {}",
-                buf.timestamp_millis(),
-                record.level(),
-                record.file().unwrap_or("unknown"),
-                record.line().unwrap_or(0),
-                record.args()
-            )
-        })
-        .filter_level(log::LevelFilter::Info)
-        .init();
+    // Windows service mode detection
+    // When SCM starts the service, it passes --service argument
+    #[cfg(target_os = "windows")]
+    {
+        if std::env::args().any(|arg| arg == "--service" || arg == "--windows-service") {
+            // Running as Windows service - invoke service dispatcher
+            if let Err(e) = platform::start_windows_service() {
+                eprintln!("Windows service error: {}", e);
+                std::process::exit(1);
+            }
+            return;
+        }
+    }
+
+    // Initialize platform-appropriate logging (Unix or Windows)
+    if let Err(e) = logging::init_logging() {
+        eprintln!("Failed to initialize logging: {}", e);
+        std::process::exit(1);
+    }
 
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
@@ -73,10 +78,11 @@ async fn run_daemon(
     config_path: Option<String>,
     use_system: bool,
 ) -> Result<()> {
-    let should_stay_foreground = force_foreground || daemon::need_foreground();
+    let should_stay_foreground = force_foreground || platform::running_under_service_manager();
 
+    // Perform double-fork daemonization FIRST (if needed)
     if !should_stay_foreground {
-        daemon::daemonise(Path::new("/var/run/kodegend.pid"))?;
+        daemon::daemonise()?;
     }
 
     // Determine config path based on CLI arguments
@@ -93,27 +99,6 @@ async fn run_daemon(
             .join("kodegend");
         config_dir.join("kodegend.toml")
     };
-
-    // Check installation state before starting services
-    use kodegend::install::{check_installation_state, ensure_installed, InstallationState};
-    
-    info!("Checking Kodegen installation state...");
-    let install_state = check_installation_state();
-    
-    match install_state {
-        InstallationState::NotInstalled | InstallationState::PartiallyInstalled => {
-            info!("Installation required: {:?}", install_state);
-            info!("Running automatic installation...");
-            
-            ensure_installed().await
-                .context("Failed to install Kodegen binaries")?;
-            
-            info!("Installation completed successfully");
-        }
-        InstallationState::FullyInstalled => {
-            info!("Installation verified - all components present");
-        }
-    }
 
     // Auto-generate config file if it doesn't exist
     if !cfg_path.exists() {
@@ -142,16 +127,69 @@ async fn run_daemon(
 
     info!("Using config from: {}", cfg_path.display());
 
-    manager::install_signal_handlers()?;
-    let mut mgr = ServiceManager::new(&cfg)?;
+    // Create PID file AFTER daemonization and config loading
+    // Store in variable to keep it alive for entire daemon lifetime
+    let pid_file = daemon::PidFile::create(cfg.pid_file.clone())
+        .context("Failed to create PID file")?;
+    // PID file will be automatically cleaned up when pid_file is dropped
+
+    info!("kodegen daemon starting (pid {})", std::process::id());
+    info!("PID file location: {}", pid_file.path().display());
+    
+    // Create and run service manager
+    // Note: Signal handlers are now installed within ServiceManager::run()
+    let mut mgr = ServiceManager::new(cfg)?;
 
     // Start category HTTP servers
-    mgr.start_http_servers(&cfg).await?;
+    mgr.start_http_servers().await?;
+    
+    // Notify systemd we're ready (if running under systemd)
+    daemon::systemd_ready();
+    
+    info!("kodegen daemon started successfully");
 
-    daemon::systemd_ready(); // tell systemd we are ready
-    info!("kodegen daemon started (pid {})", std::process::id());
+    // Spawn background installation task (non-blocking)
+    tokio::spawn(async move {
+        use kodegend::install::{check_installation_state, ensure_installed, InstallationState};
+
+        info!("Checking Kodegen installation state in background...");
+        let install_state = check_installation_state();
+
+        match install_state {
+            InstallationState::NotInstalled | InstallationState::PartiallyInstalled => {
+                info!(
+                    "Installation required: {:?}, starting background download...",
+                    install_state
+                );
+
+                match ensure_installed().await {
+                    Ok(_) => {
+                        info!("Background installation completed successfully");
+                        info!("Kodegen CLI binary, certificates, and browser are now available");
+                    }
+                    Err(e) => {
+                        error!("Background installation failed: {:#}", e);
+                        error!("Daemon will continue running, but some features may be unavailable:");
+                        error!("  - kodegen CLI binary may not be installed");
+                        error!("  - TLS certificates may be missing");
+                        error!("  - Chromium browser for citescrape may be unavailable");
+                        error!("Run 'kodegend install' manually to complete installation");
+                        // Don't crash the daemon - just log the error
+                    }
+                }
+            }
+            InstallationState::FullyInstalled => {
+                info!("Installation verified - all components present");
+            }
+        }
+    });
+
+    // Run daemon main loop - blocks until shutdown signal
     mgr.run().await?;
-    info!("kodegen daemon exiting");
+    
+    info!("kodegen daemon exiting - PID file will be cleaned up automatically");
+    // _pid_file drops here, automatically removing the PID file
+    
     Ok(())
 }
 

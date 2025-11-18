@@ -21,7 +21,7 @@ use super::wizard;
 
 /// Run installation with wizard-collected options
 pub async fn run_install_with_options(options: &wizard::InstallOptions, _cli: &Cli) -> Result<()> {
-    use crate::install::install::core::DownloadPhase;
+    use crate::install::core::DownloadPhase;
 
     // Use termcolor for starting message
     let mut stdout = StandardStream::stdout(ColorChoice::Always);
@@ -142,7 +142,10 @@ pub async fn run_install_with_options(options: &wizard::InstallOptions, _cli: &C
         let path = PathBuf::from("/usr/local/bin/kodegend");
 
         #[cfg(windows)]
-        let path = PathBuf::from(r"C:\Program Files\Kodegen\kodegend.exe");
+        let path = {
+            use crate::install::installer::windows::paths::{kodegend_exe, InstallScope};
+            kodegend_exe(InstallScope::System)
+        };
 
         path
     };

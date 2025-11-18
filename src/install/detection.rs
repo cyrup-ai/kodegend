@@ -55,7 +55,10 @@ fn check_binaries_installed() -> usize {
     let bin_dir = Path::new("/usr/local/bin");
     
     #[cfg(windows)]
-    let bin_dir = Path::new(r"C:\Program Files\Kodegen");
+    let bin_dir = {
+        use crate::install::installer::windows::paths::{install_dir, InstallScope};
+        install_dir(InstallScope::System)
+    };
     
     BINARIES.iter()
         .filter(|name| bin_dir.join(name).exists())

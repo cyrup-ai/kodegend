@@ -4,8 +4,8 @@ use eframe::egui;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
-use super::binaries::BINARIES;
-use super::core::{DownloadPhase, InstallProgress};
+use super::super::binaries::BINARIES;
+use crate::install::core::{DownloadPhase, InstallProgress};
 
 use super::types::{BinaryDownloadStatus, BinaryStatus};
 
@@ -75,7 +75,7 @@ impl InstallWindow {
     /// Load KODEGEN banner from embedded assets
     fn load_banner(cc: &eframe::CreationContext<'_>) -> Option<egui::TextureHandle> {
         // Embedded at compile time (see GUI_1 asset setup)
-        let banner_bytes = include_bytes!("../../assets/banner.png");
+        let banner_bytes = include_bytes!("../../../assets/img/banner.png");
 
         // Decode PNG with image crate
         match image::load_from_memory(banner_bytes) {

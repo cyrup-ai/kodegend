@@ -24,4 +24,5 @@ mod types;
 mod window;
 
 // Re-export public API
+#[allow(unused_imports)]
 pub use runner::run_gui_installation;

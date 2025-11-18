@@ -10,6 +10,7 @@ pub mod install;
 pub mod ipc;
 pub mod lifecycle;
 pub mod manager;
+pub mod platform;
 pub mod security;
 pub mod service;
 pub mod state_machine;

@@ -13,7 +13,9 @@ mod context;
 
 // Re-export all public types
 pub use async_task::AsyncTask;
-pub use progress::{DownloadPhase, InstallProgress};
+pub use progress::InstallProgress;
+#[allow(unused_imports)]
+pub use progress::DownloadPhase;
 pub use certificate::CertificateConfig;
 pub use service::ServiceConfig;
 pub use context::InstallContext;

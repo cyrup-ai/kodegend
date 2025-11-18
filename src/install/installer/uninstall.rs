@@ -236,9 +236,15 @@ fn get_installation_directories() -> Vec<PathBuf> {
         #[cfg(target_os = "linux")]
         PathBuf::from("/etc/kodegen"),
         #[cfg(target_os = "windows")]
-        PathBuf::from("C:\\ProgramData\\Kodegen"),
+        {
+            use crate::install::installer::windows::paths;
+            paths::installer_data_dir()
+        },
         #[cfg(target_os = "windows")]
-        PathBuf::from("C:\\Program Files\\Kodegen"),
+        {
+            use crate::install::installer::windows::paths::{install_dir, InstallScope};
+            install_dir(InstallScope::System)
+        },
         // Common directories
         PathBuf::from("/opt/kodegen"),
         std::env::temp_dir().join("kodegen"),
@@ -249,9 +255,9 @@ fn get_installation_directories() -> Vec<PathBuf> {
 #[allow(dead_code)] // Library function for host file management operations
 fn add_kodegen_host_entries() -> Result<()> {
     let hosts_file = if cfg!(target_os = "windows") {
-        "C:\\Windows\\System32\\drivers\\etc\\hosts"
+        super::windows::paths::hosts_file()
     } else {
-        "/etc/hosts"
+        PathBuf::from("/etc/hosts")
     };
 
     // Read current hosts file
@@ -307,8 +313,9 @@ fn add_kodegen_host_entries() -> Result<()> {
 fn get_installed_daemon_path() -> PathBuf {
     #[cfg(target_os = "windows")]
     {
+        use crate::install::installer::windows::paths::{kodegend_exe, InstallScope};
         // Windows installs to Program Files or System32
-        PathBuf::from("C:\\Program Files\\kodegend\\kodegend.exe")
+        kodegend_exe(InstallScope::System)
     }
 
     #[cfg(target_os = "macos")]
@@ -409,9 +416,8 @@ fn get_config_directory() -> PathBuf {
 
     #[cfg(target_os = "windows")]
     {
-        std::env::var("ProgramData")
-            .map(|p| PathBuf::from(p).join("Kodegen"))
-            .unwrap_or_else(|_| PathBuf::from("C:\\ProgramData\\Kodegen"))
+        use crate::install::installer::windows::paths;
+        paths::installer_data_dir()
     }
 
     #[cfg(not(any(

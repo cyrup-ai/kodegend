@@ -15,6 +15,7 @@ use windows::core::PCWSTR;
 use super::{InstallerBuilder, InstallerError};
 
 mod handles;
+mod paths;
 mod privileges;
 mod registry;
 mod service_creation;
@@ -32,6 +33,9 @@ use service_creation::{
     start_service, stop_service, open_service, install_services,
 };
 use utils::{str_to_wide, MAX_SERVICE_NAME};
+
+// Re-export paths module for use in other modules
+pub use paths::{InstallScope, install_dir, kodegend_exe, installer_data_dir, hosts_file, temp_cert_path};
 
 pub(crate) struct PlatformExecutor;
 

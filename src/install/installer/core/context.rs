@@ -74,9 +74,8 @@ impl InstallContext {
 
         #[cfg(target_os = "windows")]
         {
-            std::env::var("ProgramData")
-                .map(|p| PathBuf::from(p).join("Kodegen"))
-                .unwrap_or_else(|_| PathBuf::from("C:\\ProgramData\\Kodegen"))
+            use crate::install::installer::windows::paths;
+            paths::installer_data_dir()
         }
 
         #[cfg(not(any(
@@ -323,6 +322,57 @@ impl InstallContext {
             }
         }
 
+        #[cfg(windows)]
+        {
+            // Check if process is elevated using Windows Security API
+            // Pattern: OpenProcessToken + GetTokenInformation with TokenElevation
+            // See: packages/kodegend/src/platform/windows.rs:41-71
+            // See: packages/kodegend/src/install/installer/windows/privileges.rs:24-51
+            
+            use std::mem;
+            use windows::Win32::Foundation::{CloseHandle, HANDLE};
+            use windows::Win32::Security::{
+                GetTokenInformation,
+                OpenProcessToken,
+                TokenElevation,
+                TOKEN_ELEVATION,
+                TOKEN_QUERY,
+            };
+            use windows::Win32::System::Threading::GetCurrentProcess;
+
+            let is_elevated = unsafe {
+                let mut token_handle: HANDLE = HANDLE::default();
+
+                // Open process token with query access
+                if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token_handle).is_err() {
+                    false
+                } else {
+                    // Query token elevation information
+                    let mut elevation: TOKEN_ELEVATION = mem::zeroed();
+                    let mut return_length: u32 = 0;
+
+                    let result = GetTokenInformation(
+                        token_handle,
+                        TokenElevation,
+                        Some(&mut elevation as *mut _ as *mut std::ffi::c_void),
+                        mem::size_of::<TOKEN_ELEVATION>() as u32,
+                        &mut return_length,
+                    );
+
+                    CloseHandle(token_handle);
+
+                    result.is_ok() && elevation.TokenIsElevated != 0
+                }
+            };
+
+            if !is_elevated {
+                return Err(anyhow::anyhow!(
+                    "Installation requires administrator privileges.\n\
+                     Please run this installer as Administrator (right-click → 'Run as administrator')."
+                ));
+            }
+        }
+
         // Check if executable exists and is executable
         if !self.exe_path.exists() {
             return Err(anyhow::anyhow!("Executable not found: {:?}", self.exe_path));
@@ -367,9 +417,17 @@ impl InstallContext {
         matches!(sudo_check, Ok(status) if status.success())
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     fn can_escalate() -> bool {
-        // On non-Unix platforms, assume elevation is available
+        // Windows uses UAC elevation via ShellExecuteExW with "runas" verb
+        // All users can trigger UAC elevation prompts
+        // See: packages/kodegend/src/install/privilege.rs:308-344
+        true
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn can_escalate() -> bool {
+        // On other platforms, assume elevation is available
         true
     }
 

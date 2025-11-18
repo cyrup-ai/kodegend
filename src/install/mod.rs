@@ -10,7 +10,7 @@ mod cli;
 mod download;
 #[cfg(feature = "gui")]
 mod gui;
-mod install;
+mod installer;
 mod orchestration;
 mod privilege;
 mod runners;
@@ -25,8 +25,8 @@ pub use detection::{InstallationState, check_installation_state};
 pub use environment::{is_cli_environment, is_desktop_environment};
 
 // Re-export installer types and modules for internal use
-pub use install::{InstallerBuilder, InstallerError};
-pub(crate) use install::{core, config, uninstall};
+pub use installer::{InstallerBuilder, InstallerError};
+pub(crate) use installer::{core, config, uninstall};
 
 use anyhow::Result;
 use cli::Cli;

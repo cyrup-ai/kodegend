@@ -16,10 +16,130 @@ use x509_parser;
 
 use super::super::core::InstallContext;
 
+#[cfg(windows)]
+use windows::Win32::Security::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW,
+    SECURITY_DESCRIPTOR,
+};
+#[cfg(windows)]
+use windows::Win32::Foundation::LocalFree;
+#[cfg(windows)]
+use windows::Win32::Storage::FileSystem::{
+    SetFileAttributesW, 
+    FILE_ATTRIBUTE_HIDDEN,
+    FILE_FLAGS_AND_ATTRIBUTES,
+};
+#[cfg(windows)]
+use windows::core::PCWSTR;
+
+/// Set Windows ACL permissions on certificate file
+/// 
+/// Security policy: Owner read/write only (equivalent to Unix 0o600)
+/// - SYSTEM: Full Control (allows Windows services to function)
+/// - Administrators: Full Control (allows admin maintenance)
+/// - Owner: Read + Write (current user can use certificate)
+/// - Everyone else: No access (deny all other users)
+///
+/// Uses SDDL (Security Descriptor Definition Language) for clarity and maintainability.
+#[cfg(windows)]
+fn set_windows_certificate_permissions(path: &Path) -> Result<()> {
+    use windows::Win32::Security::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW,
+        PSECURITY_DESCRIPTOR, SECURITY_DESCRIPTOR_REVISION,
+    };
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::core::PCWSTR;
+    
+    // SDDL string breakdown:
+    // D:           - DACL (Discretionary Access Control List)
+    // P            - Protected (don't inherit from parent)
+    // AI           - Auto-inherit enabled for children
+    // (A;;FA;;;SY) - Allow, Full Access, SYSTEM account
+    // (A;;FA;;;BA) - Allow, Full Access, Built-in Administrators
+    // (A;;FRFW;;;OW) - Allow, File Read + File Write, Owner
+    //
+    // This matches Unix 0o600: owner can read/write, nobody else
+    // SYSTEM and Administrators are Windows equivalents of root
+    let sddl = "D:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFW;;;OW)";
+    
+    // Convert to UTF-16 (Windows native string format)
+    let sddl_wide = super::super::windows::utils::to_wide_string(sddl);
+    
+    // Convert SDDL string to security descriptor
+    let mut sd_ptr: PSECURITY_DESCRIPTOR = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+    let mut sd_size: u32 = 0;
+    
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(sddl_wide.as_ptr()),
+            SECURITY_DESCRIPTOR_REVISION,
+            &mut sd_ptr,
+            Some(&mut sd_size),
+        )
+        .context("Failed to convert SDDL string to security descriptor")?;
+    }
+    
+    // Ensure we free the allocated security descriptor
+    let _guard = scopeguard::guard(sd_ptr, |sd| {
+        if !sd.0.is_null() {
+            unsafe { LocalFree(HLOCAL(sd.0 as _)) };
+        }
+    });
+    
+    // Apply security descriptor to file
+    let path_wide = super::super::windows::utils::to_wide_string(
+        path.to_str()
+            .ok_or_else(|| anyhow::anyhow!("Invalid path: non-UTF8 characters"))?,
+    );
+    
+    use windows::Win32::Security::Authorization::SetNamedSecurityInfoW;
+    use windows::Win32::Security::{
+        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+        SE_FILE_OBJECT,
+    };
+    
+    unsafe {
+        SetNamedSecurityInfoW(
+            PCWSTR(path_wide.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            None,  // Don't change owner
+            None,  // Don't change group
+            Some(std::mem::transmute(sd_ptr)),  // Set DACL from security descriptor
+            None,  // Don't change SACL
+        )
+        .context("Failed to apply ACL to certificate file")?;
+    }
+    
+    // Defense-in-depth: Mark file as hidden
+    // This makes it less likely to be accidentally accessed
+    let attributes = FILE_FLAGS_AND_ATTRIBUTES(FILE_ATTRIBUTE_HIDDEN.0);
+    unsafe {
+        SetFileAttributesW(PCWSTR(path_wide.as_ptr()), attributes)
+            .context("Failed to set hidden attribute on certificate file")?;
+    }
+    
+    info!("Applied Windows ACL permissions to certificate file: {:?}", path);
+    Ok(())
+}
+
 /// Generate wildcard certificate without importing (runs as unprivileged user)
+///
+/// Creates a self-signed certificate with Subject Alternative Names (SANs) for:
+/// - mcp.kodegen.ai
+/// - *.kodegen.dev
+/// - Other Kodegen domains
 ///
 /// Certificate import to system trust store is deferred to install_with_elevated_privileges()
 /// in main.rs, which executes privileged operations at the end of installation.
+///
+/// # Security
+///
+/// Certificate private key files are protected with restrictive permissions:
+/// - Unix: 0o600 (owner read/write only)
+/// - Windows: ACL with owner read/write, SYSTEM/Administrators full control
+///
+/// # Returns
 ///
 /// Returns the validated certificate content to eliminate TOCTOU vulnerability.
 pub async fn generate_wildcard_certificate_only() -> Result<String> {
@@ -85,7 +205,7 @@ pub async fn generate_wildcard_certificate_only() -> Result<String> {
         .await
         .context("Failed to write wildcard certificate")?;
 
-    // Set secure permissions on certificate file
+    // Set secure permissions on certificate file (owner read/write only)
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -97,7 +217,13 @@ pub async fn generate_wildcard_certificate_only() -> Result<String> {
         perms.set_mode(0o600); // Owner read/write only
         tokio::fs::set_permissions(&wildcard_cert_path, perms)
             .await
-            .context("Failed to set file permissions")?;
+            .context("Failed to set Unix file permissions on certificate")?;
+    }
+
+    #[cfg(windows)]
+    {
+        set_windows_certificate_permissions(&wildcard_cert_path)
+            .context("Failed to set Windows ACL permissions on certificate")?;
     }
 
     info!(

@@ -50,7 +50,7 @@ impl AutoConfigService {
                 // Notify daemon we're starting
                 let _ = bus.send(Evt::State {
                     service: service_name.clone(),
-                    kind: "running",
+                    kind: "running".into(),
                     ts: chrono::Utc::now(),
                     pid: Some(std::process::id()),
                 });
@@ -62,7 +62,7 @@ impl AutoConfigService {
                             error!("Auto-config watcher failed: {e}");
                             let _ = bus.send(Evt::Fatal {
                                 service: service_name.clone(),
-                                msg: "Watcher error occurred",
+                                msg: "Watcher error occurred".into(),
                                 ts: chrono::Utc::now(),
                             });
                         }
@@ -71,7 +71,7 @@ impl AutoConfigService {
                         info!("Auto-config watcher cancelled gracefully");
                         let _ = bus.send(Evt::State {
                             service: service_name.clone(),
-                            kind: "stopped",
+                            kind: "stopped-clean".into(),
                             ts: chrono::Utc::now(),
                             pid: Some(std::process::id()),
                         });
