@@ -9,7 +9,7 @@ use log::{error, info};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::ServiceDefinition;
-use crate::ipc::{Cmd, Evt};
+use crate::ipc::{Cmd, Evt, ServiceState};
 
 /// Auto-configuration service that watches for MCP client installations
 pub struct AutoConfigService {
@@ -50,7 +50,7 @@ impl AutoConfigService {
                 // Notify daemon we're starting
                 let _ = bus.send(Evt::State {
                     service: service_name.clone(),
-                    kind: "running".into(),
+                    state: ServiceState::Running,
                     ts: chrono::Utc::now(),
                     pid: Some(std::process::id()),
                 });
@@ -71,7 +71,7 @@ impl AutoConfigService {
                         info!("Auto-config watcher cancelled gracefully");
                         let _ = bus.send(Evt::State {
                             service: service_name.clone(),
-                            kind: "stopped-clean".into(),
+                            state: ServiceState::StoppedClean,
                             ts: chrono::Utc::now(),
                             pid: Some(std::process::id()),
                         });
@@ -91,70 +91,76 @@ impl AutoConfigService {
                 }
                 Cmd::Stop => {
                     info!("Stopping auto-config service");
-
-                    // Trigger graceful cancellation
-                    cancel_token.cancel();
-
-                    // Wait for shutdown completion with timeout
-                    let shutdown_timeout = std::time::Duration::from_secs(5);
-                    let start_time = std::time::Instant::now();
-
-                    // Spin-wait with exponential backoff for shutdown completion
-                    let mut backoff_ms = 1;
-                    while !shutdown_complete.load(Ordering::Acquire) {
-                        if start_time.elapsed() > shutdown_timeout {
-                            info!("Graceful shutdown timeout, aborting task");
-                            watcher_handle.abort();
-                            break;
-                        }
-
-                        // Lock-free backoff using thread sleep
-                        std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
-                        backoff_ms = (backoff_ms * 2).min(100); // Cap at 100ms
+                    let did_abort = perform_graceful_shutdown(&cancel_token, &watcher_handle, &shutdown_complete);
+                    
+                    // Ensure task is fully cleaned up
+                    // Only abort if we didn't already abort in the timeout loop
+                    if !did_abort && !shutdown_complete.load(Ordering::Acquire) {
+                        watcher_handle.abort();
                     }
-
+                    
+                    // Wait for final task completion
+                    let _ = rt.block_on(watcher_handle);
                     break;
                 }
                 Cmd::Shutdown => {
                     info!("Shutting down auto-config service");
-
-                    // Trigger graceful cancellation
-                    cancel_token.cancel();
-
-                    // Wait for shutdown completion with timeout
-                    let shutdown_timeout = std::time::Duration::from_secs(5);
-                    let start_time = std::time::Instant::now();
-
-                    // Spin-wait with exponential backoff for shutdown completion
-                    let mut backoff_ms = 1;
-                    while !shutdown_complete.load(Ordering::Acquire) {
-                        if start_time.elapsed() > shutdown_timeout {
-                            info!("Graceful shutdown timeout, aborting task");
-                            watcher_handle.abort();
-                            break;
-                        }
-
-                        // Lock-free backoff using thread sleep
-                        std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
-                        backoff_ms = (backoff_ms * 2).min(100); // Cap at 100ms
+                    let did_abort = perform_graceful_shutdown(&cancel_token, &watcher_handle, &shutdown_complete);
+                    
+                    // Ensure task is fully cleaned up
+                    // Only abort if we didn't already abort in the timeout loop
+                    if !did_abort && !shutdown_complete.load(Ordering::Acquire) {
+                        watcher_handle.abort();
                     }
-
+                    
+                    // Wait for final task completion
+                    let _ = rt.block_on(watcher_handle);
                     break;
                 }
                 _ => {}
             }
         }
 
-        // Ensure task is fully cleaned up
-        if !shutdown_complete.load(Ordering::Acquire) {
-            watcher_handle.abort();
-        }
-
-        // Wait for final task completion
-        let _ = rt.block_on(watcher_handle);
-
         Ok(())
     }
+}
+
+/// Performs graceful shutdown with exponential backoff and timeout
+///
+/// Cancels the watcher task, then waits up to 5 seconds for clean shutdown.
+/// Uses exponential backoff (1ms → 2ms → 4ms → ... → 100ms) to avoid busy-waiting.
+/// If timeout expires, forcefully aborts the task.
+///
+/// Returns `true` if the task was aborted due to timeout, `false` otherwise.
+fn perform_graceful_shutdown(
+    cancel_token: &CancellationToken,
+    watcher_handle: &tokio::task::JoinHandle<()>,
+    shutdown_complete: &Arc<AtomicBool>,
+) -> bool {
+    // Trigger graceful cancellation
+    cancel_token.cancel();
+
+    // Wait for shutdown completion with timeout
+    let shutdown_timeout = std::time::Duration::from_secs(5);
+    let start_time = std::time::Instant::now();
+
+    // Spin-wait with exponential backoff for shutdown completion
+    let mut backoff_ms = 1;
+    let mut did_abort = false;
+    while !shutdown_complete.load(Ordering::Acquire) {
+        if start_time.elapsed() > shutdown_timeout {
+            info!("Graceful shutdown timeout, aborting task");
+            watcher_handle.abort();
+            did_abort = true;
+            break;
+        }
+
+        // Lock-free backoff using thread sleep
+        std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+        backoff_ms = (backoff_ms * 2).min(100); // Cap at 100ms
+    }
+    
+    did_abort
 }
 
 /// Spawn the auto-configuration service thread

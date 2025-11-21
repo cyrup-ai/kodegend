@@ -100,7 +100,7 @@ pub async fn start_all_servers(
 }
 
 /// Route to appropriate tool package's start_server() function
-async fn start_server(
+pub async fn start_server(
     category: &str,
     addr: SocketAddr,
     tls_cert: Option<PathBuf>,

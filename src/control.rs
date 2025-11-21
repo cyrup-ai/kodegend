@@ -18,6 +18,32 @@ cfg_if::cfg_if! {
     } else if #[cfg(target_os = "windows")] {
         mod windows_control;
         use windows_control as platform;
+    } else {
+        compile_error!(
+            "kodegend daemon control is not supported on this platform.\n\
+             \n\
+             Daemon control (start/stop/restart/status) requires platform-specific \n\
+             service manager integration:\n\
+             \n\
+             - macOS: launchd (launchctl)\n\
+             - Linux: systemd (systemctl)\n\
+             - Windows: Service Control Manager (SCM)\n\
+             \n\
+             Your platform is not yet supported for service manager integration.\n\
+             \n\
+             ALTERNATIVES:\n\
+             \n\
+             1. Run the daemon directly in foreground mode:\n\
+                   kodegend run --foreground\n\
+             \n\
+             2. Request platform support by opening an issue:\n\
+                   https://github.com/kodegen-ai/kodegen/issues\n\
+             \n\
+             3. Contribute platform support for your system:\n\
+                   See packages/kodegend/src/control/ for reference implementations\n\
+             \n\
+             Supported platforms: macOS, Linux, Windows"
+        );
     }
 }
 

@@ -1,13 +1,14 @@
 //! Binary download and orchestration with progress tracking
 
 use anyhow::{anyhow, Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use log::warn;
+use sha2::{Sha256, Digest};
 
 use crate::install::core::{InstallProgress, DownloadPhase};
 use crate::install::binaries::{BINARIES, BINARY_COUNT};
@@ -19,6 +20,114 @@ use super::extract::extract_binary_from_package;
 // (see apple_api.rs:239-241, fluent_voice.rs:9, main.rs:15)
 const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);  // Initial connection
 const DOWNLOAD_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(300); // 5 min no data
+
+/// Verify package integrity using SHA256 checksums
+///
+/// Downloads checksums.txt from the GitHub release and verifies the package
+/// matches its expected checksum. This protects against:
+/// - Man-in-the-middle attacks
+/// - Compromised GitHub accounts
+/// - DNS poisoning / BGP hijacking
+/// - Supply chain attacks
+async fn verify_package_checksum(
+    client: &reqwest::Client,
+    repo: &str,
+    release_tag: &str,
+    asset_name: &str,
+    package_path: &Path,
+) -> Result<()> {
+    // Download checksums.txt from the same release
+    let checksums_url = format!(
+        "https://github.com/{}/releases/download/{}/checksums.txt",
+        repo, release_tag
+    );
+
+    let checksums_response = client
+        .get(&checksums_url)
+        .send()
+        .await
+        .context(format!(
+            "Failed to download checksums.txt from release {}. \
+             This file is required for security verification. \
+             The release may be incomplete or corrupted.",
+            release_tag
+        ))?;
+
+    if !checksums_response.status().is_success() {
+        return Err(anyhow!(
+            "Checksums file not found for release {} (HTTP {}). \
+             Cannot verify package integrity. This may indicate an incomplete \
+             release or a security issue.",
+            release_tag,
+            checksums_response.status()
+        ));
+    }
+
+    let checksums_text = checksums_response
+        .text()
+        .await
+        .context("Failed to read checksums.txt content")?;
+
+    // Parse expected checksum for this asset
+    // Format: "checksum  filename" (two spaces or tab separator)
+    let expected_checksum = checksums_text
+        .lines()
+        .find(|line| {
+            // Match lines containing the asset name
+            // Handle both "checksum  filename" and "checksum filename" formats
+            line.contains(asset_name)
+        })
+        .and_then(|line| {
+            // Extract checksum (first whitespace-separated token)
+            line.split_whitespace().next()
+        })
+        .ok_or_else(|| {
+            anyhow!(
+                "Checksum not found for {} in checksums.txt. \
+                 Available checksums:\n{}",
+                asset_name,
+                checksums_text
+                    .lines()
+                    .take(10)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        })?;
+
+    // Calculate actual SHA256 checksum of downloaded file
+    let file_contents = tokio::fs::read(package_path)
+        .await
+        .context("Failed to read downloaded package for checksum verification")?;
+
+    let mut hasher = Sha256::new();
+    hasher.update(&file_contents);
+    let actual_checksum = format!("{:x}", hasher.finalize());
+
+    // Verify checksums match
+    if actual_checksum != expected_checksum {
+        return Err(anyhow!(
+            "SECURITY WARNING: Checksum mismatch for {}!\n\
+             Expected: {}\n\
+             Got:      {}\n\
+             \n\
+             The downloaded file does not match the expected checksum.\n\
+             This may indicate:\n\
+             - A man-in-the-middle attack\n\
+             - File corruption during download\n\
+             - A compromised release\n\
+             \n\
+             DO NOT proceed with installation. Delete the downloaded file and:\n\
+             1. Verify your network connection is secure\n\
+             2. Check if the GitHub repository has been compromised\n\
+             3. Contact the maintainers if this persists",
+            asset_name,
+            expected_checksum,
+            actual_checksum
+        ));
+    }
+
+    Ok(())
+}
 
 /// Download a single binary from its GitHub repository with progress reporting
 async fn download_binary(
@@ -160,6 +269,22 @@ async fn download_binary(
             version.clone(),
         ));
     }
+
+    // CRITICAL SECURITY: Verify package integrity before extraction
+    // This protects against MITM attacks, compromised releases, and supply chain attacks
+    verify_package_checksum(
+        &client,
+        repo,
+        &release.tag_name,
+        &asset.name,
+        &package_path,
+    )
+    .await
+    .context(format!(
+        "Failed to verify integrity of downloaded package {}. \
+         Installation aborted for security reasons.",
+        asset.name
+    ))?;
 
     // Phase 3: Extract binary
     send_critical(InstallProgress::download(

@@ -17,6 +17,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use log::{error, info};
 use manager::ServiceManager;
+use kodegend::install::ensure_installed;
 
 fn main() {
     // Windows service mode detection
@@ -74,16 +75,11 @@ async fn real_main() -> Result<()> {
 }
 
 async fn run_daemon(
-    force_foreground: bool,
+    force_foreground: bool,  // NOTE: Parameter kept for API compatibility but unused
     config_path: Option<String>,
     use_system: bool,
 ) -> Result<()> {
-    let should_stay_foreground = force_foreground || platform::running_under_service_manager();
-
-    // Perform double-fork daemonization FIRST (if needed)
-    if !should_stay_foreground {
-        daemon::daemonise()?;
-    }
+    // Main process always stays in foreground - service managers handle daemonization
 
     // Determine config path based on CLI arguments
     let cfg_path = if let Some(path) = config_path {
@@ -136,53 +132,19 @@ async fn run_daemon(
     info!("kodegen daemon starting (pid {})", std::process::id());
     info!("PID file location: {}", pid_file.path().display());
     
+    // Installation must complete before starting services
+    // This creates TLS certificates and installs required components
+    ensure_installed().await?;
+    
     // Create and run service manager
     // Note: Signal handlers are now installed within ServiceManager::run()
+    // HTTP servers will be started gracefully inside the service loop
     let mut mgr = ServiceManager::new(cfg)?;
-
-    // Start category HTTP servers
-    mgr.start_http_servers().await?;
     
     // Notify systemd we're ready (if running under systemd)
     daemon::systemd_ready();
     
     info!("kodegen daemon started successfully");
-
-    // Spawn background installation task (non-blocking)
-    tokio::spawn(async move {
-        use kodegend::install::{check_installation_state, ensure_installed, InstallationState};
-
-        info!("Checking Kodegen installation state in background...");
-        let install_state = check_installation_state();
-
-        match install_state {
-            InstallationState::NotInstalled | InstallationState::PartiallyInstalled => {
-                info!(
-                    "Installation required: {:?}, starting background download...",
-                    install_state
-                );
-
-                match ensure_installed().await {
-                    Ok(_) => {
-                        info!("Background installation completed successfully");
-                        info!("Kodegen CLI binary, certificates, and browser are now available");
-                    }
-                    Err(e) => {
-                        error!("Background installation failed: {:#}", e);
-                        error!("Daemon will continue running, but some features may be unavailable:");
-                        error!("  - kodegen CLI binary may not be installed");
-                        error!("  - TLS certificates may be missing");
-                        error!("  - Chromium browser for citescrape may be unavailable");
-                        error!("Run 'kodegend install' manually to complete installation");
-                        // Don't crash the daemon - just log the error
-                    }
-                }
-            }
-            InstallationState::FullyInstalled => {
-                info!("Installation verified - all components present");
-            }
-        }
-    });
 
     // Run daemon main loop - blocks until shutdown signal
     mgr.run().await?;

@@ -1,5 +1,5 @@
 mod autoconfig;
-mod port_cleanup;
+pub mod port_cleanup;
 
 pub mod embedded_servers;
 
@@ -14,7 +14,12 @@ use log::{error, info, warn};
 use thiserror::Error;
 
 use crate::config::ServiceDefinition;
-use crate::ipc::{Cmd, Evt};
+use crate::ipc::{Cmd, Evt, ServiceState};
+
+/// Maximum iterations when cleaning up old numbered log files.
+/// This prevents unbounded loops while being generous enough for any realistic scenario.
+/// Industry standard tools like logrotate typically keep 4-7 rotated files.
+const MAX_LOG_CLEANUP_ITERATIONS: u32 = 100;
 
 /// Service worker errors
 #[derive(Error, Debug)]
@@ -77,21 +82,35 @@ impl ServiceWorker {
         loop {
             select! {
                 recv(self.rx) -> msg => match msg? {
-                    Cmd::Start    => self.start(&mut child)?,
-                    Cmd::Stop     => self.stop(&mut child)?,
-                    Cmd::Restart  => { self.stop(&mut child)?; self.start(&mut child)?; },
-                    Cmd::Shutdown => { self.stop(&mut child)?; break; },
-                    Cmd::TickHealth   => self.health_check(&mut child)?,
-                    Cmd::TickLogRotate=> self.rotate_logs()?,
+                    Cmd::Start { correlation_id }    => self.start(&mut child, Some(correlation_id))?,
+                    Cmd::Stop { correlation_id }     => self.stop(&mut child, Some(correlation_id))?,
+                    Cmd::Restart { correlation_id }  => {
+                        self.stop(&mut child, Some(correlation_id))?;
+                        self.start(&mut child, Some(correlation_id))?;
+                    },
+                    Cmd::Shutdown => {
+                        self.stop(&mut child, None)?;
+                        break;
+                    },
+                    Cmd::TickHealth { correlation_id }   => self.health_check(&mut child, correlation_id)?,
+                    Cmd::TickLogRotate { correlation_id }=> self.rotate_logs(correlation_id)?,
                 },
-                recv(health_tick) -> _ => self.health_check(&mut child)?,
-                recv(rotate_tick) -> _ => self.rotate_logs()?,
+                recv(health_tick) -> _ => {
+                    // Spontaneous health check (not triggered by command)
+                    let correlation_id = 0;
+                    self.health_check(&mut child, correlation_id)?;
+                },
+                recv(rotate_tick) -> _ => {
+                    // Spontaneous log rotation (not triggered by command)
+                    let correlation_id = 0;
+                    self.rotate_logs(correlation_id)?;
+                },
             }
         }
         Ok(())
     }
 
-    fn start(&self, child: &mut Option<Child>) -> Result<()> {
+    fn start(&self, child: &mut Option<Child>, correlation_id: Option<u64>) -> Result<()> {
         if child.is_some() {
             warn!("{} already running", self.name);
             return Ok(());
@@ -172,16 +191,17 @@ impl ServiceWorker {
         // Send state event
         self.bus.send(Evt::State {
             service: self.name.to_string(),
-            kind: "running".into(),
+            state: ServiceState::Running,
             ts: Utc::now(),
             pid: Some(pid),
+            correlation_id,
         })?;
         
         info!("{} started (pid {})", self.name, pid);
         Ok(())
     }
 
-    fn stop(&self, child: &mut Option<Child>) -> Result<()> {
+    fn stop(&self, child: &mut Option<Child>, correlation_id: Option<u64>) -> Result<()> {
         if let Some(mut ch) = child.take() {
             let pid = ch.id();
             
@@ -213,7 +233,7 @@ impl ServiceWorker {
                                         start.elapsed().as_secs_f64(),
                                         status
                                     );
-                                    self.send_stopped_event(pid)?;
+                                    self.send_stopped_event(pid, correlation_id)?;
                                     return Ok(());
                                 }
                                 Ok(None) => {
@@ -246,37 +266,63 @@ impl ServiceWorker {
                     }
                 }
             }
-            
-            // Force kill (after timeout, SIGTERM failure, or on non-Unix)
+
+            // Windows: TerminateProcess via Child::kill() (no graceful shutdown available)
+            #[cfg(windows)]
+            {
+                info!(
+                    "{} terminating process (pid {}) - Windows uses forceful TerminateProcess",
+                    self.name, pid
+                );
+
+                // Note: Child::kill() internally uses TerminateProcess on Windows
+                // There is no graceful shutdown mechanism for background processes on Windows
+                // (unlike Unix SIGTERM, Windows TerminateProcess is always forceful)
+            }
+
+            // Force kill (Unix: after SIGTERM timeout/failure, Windows: only option)
+            #[cfg(unix)]
             ch.kill().context("SIGKILL failed")?;
+
+            #[cfg(windows)]
+            ch.kill().context("TerminateProcess failed")?;
             
             // Wait for process to fully terminate
             match ch.wait() {
                 Ok(status) => {
+                    #[cfg(unix)]
                     info!("{} terminated with SIGKILL: {:?}", self.name, status);
+
+                    #[cfg(windows)]
+                    info!("{} terminated with TerminateProcess: {:?}", self.name, status);
                 }
                 Err(e) => {
+                    #[cfg(unix)]
                     warn!("{} wait() failed after SIGKILL: {}", self.name, e);
+
+                    #[cfg(windows)]
+                    warn!("{} wait() failed after TerminateProcess: {}", self.name, e);
                 }
             }
             
-            self.send_stopped_event(pid)?;
+            self.send_stopped_event(pid, correlation_id)?;
         }
         Ok(())
     }
 
     /// Helper to send stopped event on the bus
-    fn send_stopped_event(&self, pid: u32) -> Result<()> {
+    fn send_stopped_event(&self, pid: u32, correlation_id: Option<u64>) -> Result<()> {
         self.bus.send(Evt::State {
             service: self.name.to_string(),
-            kind: "stopped-clean".into(),
+            state: ServiceState::StoppedClean,
             ts: Utc::now(),
             pid: Some(pid),
+            correlation_id,
         })?;
         Ok(())
     }
 
-    fn health_check(&self, child: &mut Option<Child>) -> Result<()> {
+    fn health_check(&self, child: &mut Option<Child>, correlation_id: u64) -> Result<()> {
         // Track if this is a crash (unexpected exit) vs just not running
         let mut is_crash = false;
         
@@ -317,9 +363,10 @@ impl ServiceWorker {
             warn!("{} crashed, sending stopped-crash event", self.name);
             self.bus.send(Evt::State {
                 service: self.name.to_string(),
-                kind: "stopped-crash".into(),  // Unexpected exit = crash
+                state: ServiceState::StoppedCrash,  // Unexpected exit = crash
                 ts: Utc::now(),
                 pid: None,
+                correlation_id: None,  // Crashes are spontaneous
             })?;
             *child = None;  // Clear the child reference
         }
@@ -329,24 +376,27 @@ impl ServiceWorker {
             service: self.name.to_string(),
             healthy,
             ts: Utc::now(),
+            correlation_id,
         })?;
         
         // If unhealthy and auto_restart enabled, trigger restart via self-loop
         if !healthy && self.def.auto_restart {
             warn!("{} unhealthy → restart", self.name);
-            self.tx.send(Cmd::Restart).ok();  // Send to self via crossbeam channel
+            // Self-restart doesn't have a correlation ID from manager
+            self.tx.send(Cmd::Restart { correlation_id: 0 }).ok();  // Send to self via crossbeam channel
         }
         
         Ok(())
     }
 
-    fn rotate_logs(&self) -> Result<()> {
+    fn rotate_logs(&self, correlation_id: u64) -> Result<()> {
         // Only rotate if log_rotation config exists
         let Some(ref rotation_config) = self.def.log_rotation else {
             // No rotation configured - just send event and return
             self.bus.send(Evt::LogRotate {
                 service: self.name.to_string(),
                 ts: Utc::now(),
+                correlation_id,
             })?;
             return Ok(());
         };
@@ -377,6 +427,7 @@ impl ServiceWorker {
         self.bus.send(Evt::LogRotate {
             service: self.name.to_string(),
             ts: Utc::now(),
+            correlation_id,
         })?;
         
         Ok(())
@@ -469,7 +520,7 @@ fn rotate_single_log(
     // Clean up old rotated files beyond max_files limit
     if !timestamp {
         // For numbered rotation, delete files beyond max_files
-        for i in (max_files + 1).. {
+        for i in (max_files + 1)..(max_files + 1 + MAX_LOG_CLEANUP_ITERATIONS) {
             let old_file = format!("{}.{}", log_path, i);
             let old_gz = format!("{}.gz", old_file);
             

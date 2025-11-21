@@ -5,36 +5,68 @@ use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 
 /// Print success message (green checkmark)
 pub fn success(message: &str) {
-    let mut stdout = StandardStream::stdout(ColorChoice::Auto);
-    let _ = stdout.set_color(ColorSpec::new().set_fg(Some(Color::Green)));
-    let _ = writeln!(&mut stdout, "✓ {message}");
-    let _ = stdout.reset();
+    let stdout = StandardStream::stdout(ColorChoice::Auto);
+    let mut locked = stdout.lock();
+    
+    // Attempt colored output, fallback to plain if any step fails
+    if locked.set_color(ColorSpec::new().set_fg(Some(Color::Green))).is_err()
+        || writeln!(&mut locked, "✓ {message}").is_err()
+        || locked.reset().is_err()
+    {
+        // Fallback to plain stdout if colored output fails
+        println!("✓ {message}");
+    }
+    
     log::info!("{message}");
 }
 
 /// Print error message (red X)
 pub fn error(message: &str) {
-    let mut stderr = StandardStream::stderr(ColorChoice::Auto);
-    let _ = stderr.set_color(ColorSpec::new().set_fg(Some(Color::Red)).set_bold(true));
-    let _ = writeln!(&mut stderr, "✗ {message}");
-    let _ = stderr.reset();
+    let stderr = StandardStream::stderr(ColorChoice::Auto);
+    let mut locked = stderr.lock();
+    
+    // Attempt colored output, fallback to plain if any step fails
+    if locked.set_color(ColorSpec::new().set_fg(Some(Color::Red)).set_bold(true)).is_err()
+        || writeln!(&mut locked, "✗ {message}").is_err()
+        || locked.reset().is_err()
+    {
+        // Fallback to plain stderr if colored output fails
+        eprintln!("✗ {message}");
+    }
+    
     log::error!("{message}");
 }
 
 /// Print warning message (yellow)
 pub fn warning(message: &str) {
-    let mut stderr = StandardStream::stderr(ColorChoice::Auto);
-    let _ = stderr.set_color(ColorSpec::new().set_fg(Some(Color::Yellow)));
-    let _ = writeln!(&mut stderr, "⚠ {message}");
-    let _ = stderr.reset();
+    let stderr = StandardStream::stderr(ColorChoice::Auto);
+    let mut locked = stderr.lock();
+    
+    // Attempt colored output, fallback to plain if any step fails
+    if locked.set_color(ColorSpec::new().set_fg(Some(Color::Yellow))).is_err()
+        || writeln!(&mut locked, "⚠ {message}").is_err()
+        || locked.reset().is_err()
+    {
+        // Fallback to plain stderr if colored output fails
+        eprintln!("⚠ {message}");
+    }
+    
     log::warn!("{message}");
 }
 
 /// Print info message (cyan)
 pub fn info(message: &str) {
-    let mut stdout = StandardStream::stdout(ColorChoice::Auto);
-    let _ = stdout.set_color(ColorSpec::new().set_fg(Some(Color::Cyan)));
-    let _ = writeln!(&mut stdout, "ℹ {message}");
-    let _ = stdout.reset();
+    let stdout = StandardStream::stdout(ColorChoice::Auto);
+    let mut locked = stdout.lock();
+    
+    // Attempt colored output, fallback to plain if any step fails
+    if locked.set_color(ColorSpec::new().set_fg(Some(Color::Cyan))).is_err()
+        || writeln!(&mut locked, "ℹ {message}").is_err()
+        || locked.reset().is_err()
+    {
+        // Fallback to plain stdout if colored output fails
+        println!("ℹ {message}");
+    }
+    
     log::info!("{message}");
 }

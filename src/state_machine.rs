@@ -103,8 +103,6 @@ impl Transition {
             // ── Restarting ─────────────────────────────────────────────────────
             (Restarting, StopDone) => (Starting, SpawnProcess),
             (Restarting, ProcExit) => (Starting, SpawnProcess),
-            (Restarting, StartedOk) => (Running, NotifyHealthy),
-            (Restarting, StartErr) => (Failed, NotifyUnhealthy),
             (Restarting, _) => (Restarting, Noop),
 
             // ── Failed ─────────────────────────────────────────────────────────

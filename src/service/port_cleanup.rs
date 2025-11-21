@@ -171,6 +171,91 @@ pub async fn kill_process_graceful(pid: u32) -> Result<()> {
     .await?
 }
 
+/// Force-kill process with SIGKILL (Unix) or TerminateProcess (Windows)
+///
+/// Used as last resort when graceful shutdown (SIGTERM) fails.
+/// SIGKILL cannot be caught or ignored - guaranteed process termination.
+///
+/// Waits up to 1 second for process to actually die, then verifies.
+///
+/// # Platform Implementation
+/// - Unix: Uses nix::sys::signal::kill() with SIGKILL
+/// - Windows: Uses Windows API TerminateProcess()
+///
+/// # Arguments
+/// * `pid` - Process ID to force-kill
+///
+/// # Returns
+/// - Ok(()) if process was successfully killed and confirmed dead
+/// - Err() if kill failed or process still exists after 1 second
+async fn force_kill_process(pid: u32) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use nix::sys::signal::{kill, Signal};
+        use nix::unistd::Pid;
+
+        let nix_pid = Pid::from_raw(pid as i32);
+
+        // Send SIGKILL (signal 9 - cannot be caught, blocked, or ignored)
+        kill(nix_pid, Signal::SIGKILL)
+            .map_err(|e| anyhow::anyhow!("Failed to send SIGKILL to process {}: {}", pid, e))?;
+        
+        log::debug!("Sent SIGKILL to process {}, waiting for termination", pid);
+
+        // Wait for process to actually die (up to 1 second with 10 checks)
+        for attempt in 1..=10 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            // Check if process is gone (kill with signal 0 = existence check, no actual signal)
+            match kill(nix_pid, None) {
+                Err(_) => {
+                    // ESRCH error means process is dead
+                    log::info!("✓ Process {} successfully force-killed (confirmed dead after {}ms)", pid, attempt * 100);
+                    return Ok(());
+                }
+                Ok(_) => {
+                    // Process still exists, keep waiting
+                    log::trace!("Process {} still exists after {}ms, continuing to wait", pid, attempt * 100);
+                    continue;
+                }
+            }
+        }
+
+        // Process still exists after 1 second - this should never happen with SIGKILL
+        Err(anyhow::anyhow!(
+            "Process {} still exists 1 second after SIGKILL. \
+             This indicates a kernel-level issue (zombie process or unkillable kernel thread).",
+            pid
+        ))
+    }
+
+    #[cfg(windows)]
+    {
+        use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+        use windows::Win32::Foundation::{CloseHandle, HANDLE};
+
+        unsafe {
+            // Open process with TERMINATE permission
+            let handle: HANDLE = OpenProcess(PROCESS_TERMINATE, false, pid)
+                .map_err(|e| anyhow::anyhow!("Failed to open process {} for termination: {}", pid, e))?;
+
+            // Terminate process with exit code 1
+            let result = TerminateProcess(handle, 1)
+                .map_err(|e| anyhow::anyhow!("Failed to terminate process {}: {}", pid, e));
+
+            // Always close handle (even if TerminateProcess failed)
+            CloseHandle(handle).ok();
+
+            result?;
+        }
+
+        log::info!("✓ Process {} successfully terminated (Windows TerminateProcess)", pid);
+        
+        // Windows TerminateProcess is synchronous - process is dead when it returns
+        Ok(())
+    }
+}
+
 /// Wait for port to be released with timeout
 ///
 /// Polls port availability every 100ms until timeout.
@@ -191,16 +276,86 @@ pub async fn wait_for_port_release(port: u16, timeout: Duration) -> Result<()> {
     ))
 }
 
-/// Main cleanup orchestrator - attempts to free up a port if occupied
+/// Bulletproof port cleanup with retry logic and force-kill fallback
 ///
-/// Steps:
-/// 1. Check if port is available
-/// 2. If not, find process using the port
-/// 3. Kill the process (gracefully, then forcefully)
-/// 4. Wait for port to be released
+/// Guarantees port is available or returns error only for truly impossible situations.
+/// Uses proven exponential backoff pattern from kodegen-bundler-release/retry.rs:99-103
+/// Formula: delay = initial_delay * 2^(attempts-1), capped at max_delay
 ///
-/// This is a best-effort operation - failures are logged but not propagated.
+/// # Retry Strategy
+/// - Max retries: 5 attempts
+/// - Initial delay: 100ms
+/// - Backoff multiplier: 2x (exponential)
+/// - Max delay: 5 seconds
+/// - Total max time: ~10 seconds (100ms + 200ms + 400ms + 800ms + 1600ms + ...)
+///
+/// # Returns
+/// - Ok(()) if port is available after cleanup
+/// - Err() only if cleanup fails after all retries (port permanently blocked)
 pub async fn cleanup_port_if_needed(port: u16) -> Result<()> {
+    const MAX_RETRIES: u32 = 5;
+    const INITIAL_DELAY_MS: u64 = 100;
+    const MAX_DELAY_MS: u64 = 5000;
+
+    let mut attempt = 0;
+    let mut delay_ms = INITIAL_DELAY_MS;
+
+    loop {
+        attempt += 1;
+
+        match try_cleanup_port_once(port).await {
+            Ok(()) => {
+                if attempt > 1 {
+                    log::info!("✓ Port {} cleanup succeeded after {} attempts", port, attempt);
+                }
+                return Ok(());
+            }
+            Err(e) if attempt >= MAX_RETRIES => {
+                log::error!(
+                    "✗ Port {} cleanup failed after {} attempts ({}s total): {:#}",
+                    port,
+                    MAX_RETRIES,
+                    (INITIAL_DELAY_MS * ((1 << MAX_RETRIES) - 1)) / 1000,  // Geometric series sum
+                    e
+                );
+                return Err(e);
+            }
+            Err(e) => {
+                log::warn!(
+                    "Port {} cleanup attempt {}/{} failed: {}. Retrying in {}ms...",
+                    port,
+                    attempt,
+                    MAX_RETRIES,
+                    e,
+                    delay_ms
+                );
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                
+                // Exponential backoff: 100ms, 200ms, 400ms, 800ms, 1600ms, capped at 5000ms
+                // Formula from kodegen-bundler-release/retry.rs:99-103
+                delay_ms = (delay_ms * 2).min(MAX_DELAY_MS);
+            }
+        }
+    }
+}
+
+/// Single attempt at port cleanup with graceful-then-force kill strategy
+///
+/// Used internally by cleanup_port_if_needed() retry loop.
+/// Attempts graceful shutdown (SIGTERM) first, falls back to force-kill (SIGKILL) if needed.
+///
+/// # Process
+/// 1. Quick check: Is port already free? → Return Ok()
+/// 2. Find process using port (lsof on Unix, netstat on Windows)
+/// 3. Try graceful kill (SIGTERM) with 2-second wait
+/// 4. If process still alive, force-kill (SIGKILL)
+/// 5. Wait for port release (up to 3 seconds)
+/// 6. Final verification: Port must be available
+///
+/// # Returns
+/// - Ok(()) if port is confirmed available
+/// - Err() if cleanup failed (process unkillable, port stuck in kernel)
+async fn try_cleanup_port_once(port: u16) -> Result<()> {
     // Quick check: is port already free?
     if check_port_available(port).await {
         log::debug!("Port {} is already available", port);
@@ -209,35 +364,56 @@ pub async fn cleanup_port_if_needed(port: u16) -> Result<()> {
 
     log::warn!("Port {} is in use, attempting cleanup", port);
 
-    // Find process using the port
+    // Find process using the port (existing function works perfectly)
     let pid = match find_process_by_port(port).await? {
         Some(pid) => pid,
         None => {
-            // Race condition: port was in use but we can't find the process
-            // Try binding one more time
+            // Race condition: port shows as used but no process found
+            // Possible causes: TIME_WAIT state, kernel holding port
+            log::warn!("Port {} in use but no process found - possible TIME_WAIT state", port);
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            
+            // Verify port actually became available
             if check_port_available(port).await {
-                log::info!("Port {} became available during lookup", port);
+                log::info!("Port {} became available after wait (TIME_WAIT cleared)", port);
                 return Ok(());
             }
+            
             return Err(anyhow::anyhow!(
-                "Port {} in use but no process found (system command may have failed)",
+                "Port {} appears in use but no process found (may be in TIME_WAIT or held by kernel)",
                 port
             ));
         }
     };
 
-    log::warn!("Terminating process {} using port {}", pid, port);
+    log::info!("Found process {} using port {}, attempting graceful shutdown (SIGTERM)", pid, port);
 
-    // Kill the process
-    kill_process_graceful(pid)
-        .await
-        .context(format!("Failed to kill process {}", pid))?;
+    // Try graceful shutdown first (existing function)
+    let graceful_result = kill_process_graceful(pid).await;
+    
+    if graceful_result.is_err() {
+        log::warn!("Graceful kill of process {} failed, attempting force kill (SIGKILL)", pid);
+        
+        // Force kill with SIGKILL (NEW - add this function below)
+        force_kill_process(pid).await?;
+    }
 
-    // Wait for port to be released
+    // Wait for port to be released (existing function - works great)
+    log::debug!("Waiting for port {} to be released after killing PID {}", port, pid);
     wait_for_port_release(port, Duration::from_secs(3))
         .await
         .context(format!("Port {} still in use after killing process {}", port, pid))?;
 
-    log::info!("Successfully freed port {} (terminated PID {})", port, pid);
+    // CRITICAL: Final verification - port MUST be available now
+    if !check_port_available(port).await {
+        return Err(anyhow::anyhow!(
+            "Port {} still not available after cleanup - kernel may be holding it. \
+             This indicates a low-level system issue (socket stuck in kernel, \
+             permissions problem, or resource exhaustion).",
+            port
+        ));
+    }
+
+    log::info!("✓ Successfully cleaned up port {} (terminated PID {})", port, pid);
     Ok(())
 }

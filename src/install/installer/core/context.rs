@@ -410,8 +410,12 @@ impl InstallContext {
         Ok(())
     }
 
-    /// Check if privilege escalation is possible (sudo is available)
-    /// Does NOT actually escalate - just validates that escalation would be possible
+    /// Check if privilege escalation is available on this platform.
+    ///
+    /// - Unix: Returns true if `sudo` command is available
+    /// - Windows: Always returns true (UAC built into OS)
+    ///
+    /// Does NOT actually escalate - just validates that escalation would be possible.
     #[cfg(unix)]
     fn can_escalate() -> bool {
         use std::process::Command;

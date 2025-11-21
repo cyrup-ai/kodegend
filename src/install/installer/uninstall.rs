@@ -254,14 +254,14 @@ fn get_installation_directories() -> Vec<PathBuf> {
 /// Add Kodegen host entries with optimized host file modification
 #[allow(dead_code)] // Library function for host file management operations
 fn add_kodegen_host_entries() -> Result<()> {
-    let hosts_file = if cfg!(target_os = "windows") {
-        super::windows::paths::hosts_file()
-    } else {
-        PathBuf::from("/etc/hosts")
-    };
+    #[cfg(target_os = "windows")]
+    let hosts_file = super::windows::paths::hosts_file();
+
+    #[cfg(not(target_os = "windows"))]
+    let hosts_file = PathBuf::from("/etc/hosts");
 
     // Read current hosts file
-    let current_hosts = fs::read_to_string(hosts_file).context("Failed to read hosts file")?;
+    let current_hosts = fs::read_to_string(&hosts_file).context("Failed to read hosts file")?;
 
     let kodegen_domains = [
         "kodegen.kodegen.dev",
