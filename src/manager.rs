@@ -270,11 +270,10 @@ impl ServiceManager {
         for name in old_services.keys() {
             if !new_services.contains_key(name) {
                 info!("Stopping removed service: {}", name);
-                if let Some(tx) = self.workers.get(name) {
-                    if let Err(e) = tx.send(Cmd::Shutdown) {
+                if let Some(tx) = self.workers.get(name)
+                    && let Err(e) = tx.send(Cmd::Shutdown) {
                         error!("Failed to send shutdown to service {}: {}", name, e);
                     }
-                }
                 self.workers.remove(name);
                 self.restart_policies.remove(name);
             }
@@ -304,11 +303,10 @@ impl ServiceManager {
                     info!("Restarting modified service: {}", name);
                     
                     // Stop old version
-                    if let Some(tx) = self.workers.get(name) {
-                        if let Err(e) = tx.send(Cmd::Shutdown) {
+                    if let Some(tx) = self.workers.get(name)
+                        && let Err(e) = tx.send(Cmd::Shutdown) {
                             error!("Failed to send shutdown to service {}: {}", name, e);
                         }
-                    }
                     
                     // Start new version
                     match crate::service::spawn(new_def.clone(), self.bus_tx.clone()) {
@@ -542,11 +540,10 @@ impl ServiceManager {
                 log::info!("Lifecycle action: KillProcess - shutting down workers");
                 
                 // Shutdown embedded HTTP servers if running
-                if let Some(servers) = self.embedded_servers.take() {
-                    if let Err(e) = shutdown_all_servers(servers).await {
+                if let Some(servers) = self.embedded_servers.take()
+                    && let Err(e) = shutdown_all_servers(servers).await {
                         log::error!("Error shutting down embedded servers: {}", e);
                     }
-                }
                 
                 // Send shutdown command to all workers
                 for (name, tx) in &self.workers {

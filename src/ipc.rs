@@ -96,6 +96,6 @@ pub enum Evt {
         service: String,
         msg: Cow<'static, str>,
         ts: DateTime<Utc>,
-        /// No correlation_id: Fatal events are always spontaneous
+        // No correlation_id: Fatal events are always spontaneous
     },
 }

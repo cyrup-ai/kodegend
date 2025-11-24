@@ -7,6 +7,7 @@
 #[path = "src/build/mod.rs"]
 mod build;
 
-fn main() {
-    build::main();
+#[tokio::main]
+async fn main() {
+    build::main().await;
 }

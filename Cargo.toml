@@ -1,6 +1,6 @@
 [package]
 name = "kodegend"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 description = "KODEGEN.ᴀɪ: Memory-efficient, Blazing-Fast, MCP tools for code generation agents."
 authors = ["KODEGEN.ᴀɪ"]
@@ -24,25 +24,25 @@ macos = "public.app-category.developer-tools"
 
 [dependencies]
 
-kodegen_bundler_autoconfig = { version = "0.3", path = "../kodegen-bundler-autoconfig" }
-kodegen_config_manager = { version = "0.3", path = "../kodegen-config-manager" }
-kodegen_utils = { version = "0.3", path = "../kodegen-utils" }
-kodegen_server_http = { version = "0.3", path = "../kodegen-server-http" }
-kodegen_tools_filesystem = { version = "0.3", path = "../kodegen-tools-filesystem" }
-kodegen_tools_terminal = { version = "0.3", path = "../kodegen-tools-terminal" }
-kodegen_tools_process = { version = "0.3", path = "../kodegen-tools-process" }
-kodegen_tools_sequential_thinking = { version = "0.3", path = "../kodegen-tools-sequential-thinking" }
-kodegen_tools_citescrape = { version = "0.3", path = "../kodegen-tools-citescrape" }
-kodegen_tools_config = { version = "0.3", path = "../kodegen-tools-config" }
-kodegen_tools_prompt = { version = "0.3", path = "../kodegen-tools-prompt" }
-kodegen_tools_introspection = { version = "0.3", path = "../kodegen-tools-introspection" }
-kodegen_tools_git = { version = "0.3", path = "../kodegen-tools-git" }
-kodegen_tools_github = { version = "0.3", path = "../kodegen-tools-github" }
-kodegen_tools_database = { version = "0.3", path = "../kodegen-tools-database" }
-kodegen_tools_browser = { version = "0.3", path = "../kodegen-tools-browser" }
-kodegen_tools_reasoner = { version = "0.3", path = "../kodegen-tools-reasoner" }
-kodegen_claude_agent = { version = "0.3", path = "../kodegen-claude-agent" }
-kodegen_candle_agent = { version = "0.3", path = "../kodegen-candle-agent" }
+kodegen_bundler_autoconfig = { version = "0.3" }
+kodegen_config_manager = { version = "0.3" }
+kodegen_utils = { version = "0.3" }
+kodegen_server_http = { version = "0.3" }
+kodegen_tools_filesystem = { version = "0.3" }
+kodegen_tools_terminal = { version = "0.3" }
+kodegen_tools_process = { version = "0.3" }
+kodegen_tools_sequential_thinking = { version = "0.3" }
+kodegen_tools_citescrape = { version = "0.3" }
+kodegen_tools_config = { version = "0.3" }
+kodegen_tools_prompt = { version = "0.3" }
+kodegen_tools_introspection = { version = "0.3" }
+kodegen_tools_git = { version = "0.3" }
+kodegen_tools_github = { version = "0.3" }
+kodegen_tools_database = { version = "0.3" }
+kodegen_tools_browser = { version = "0.3" }
+kodegen_tools_reasoner = { version = "0.3" }
+kodegen_claude_agent = { version = "0.3" }
+kodegen_candle_agent = { version = "0.3" }
 
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
@@ -72,6 +72,7 @@ cc = "1"
 tempfile = "3"
 libc = "0.2"
 hex = "0.4"
+shlex = "1.3"  # POSIX shell escaping (MUST be >= 1.2.1 to avoid RUSTSEC-2024-0006)
 
 # Archive extraction (for installer binary downloads)
 zip = { version = "6", default-features = false, features = ["deflate"] }
@@ -216,6 +217,10 @@ rayon = "1"
 fastrand = "2"
 sha2 = "0.10"
 hex = "0.4"
+
+# Code signing with proven library
+kodegen_bundler_sign = { version = "0.3" }
+tokio = { version = "1", features = ["full"] }
 
 [[bin]]
 name = "kodegend"

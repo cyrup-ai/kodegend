@@ -3,9 +3,9 @@ use extism::convert::Json;
 use extism::{PluginBuilder, UserData, ValType, host_fn};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::process::{Command, Stdio};
+use tokio::process::Command;
+use std::process::Stdio;
 use std::time::Duration;
-use tokio::time::timeout;
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ShellExecuteRequest {
@@ -106,7 +106,7 @@ impl ShellExecutor {
             .stderr(Stdio::piped())
             .spawn();
 
-        let child = match child {
+        let mut child = match child {
             Ok(c) => c,
             Err(e) => {
                 return ShellExecuteResponse {
@@ -118,19 +118,24 @@ impl ShellExecutor {
             }
         };
 
-        let wait_future = async { child.wait_with_output() };
-
-        let output = match timeout(self.timeout_duration, wait_future).await {
-            Ok(Ok(output)) => output,
-            Ok(Err(e)) => {
-                return ShellExecuteResponse {
-                    stdout: String::new(),
-                    stderr: format!("Process execution failed: {e}"),
-                    exit_code: Some(1),
-                    is_error: true,
-                };
+        // Wait with timeout using select! (allows killing on timeout)
+        let status = tokio::select! {
+            result = child.wait() => {
+                match result {
+                    Ok(status) => status,
+                    Err(e) => {
+                        return ShellExecuteResponse {
+                            stdout: String::new(),
+                            stderr: format!("Process execution failed: {e}"),
+                            exit_code: Some(1),
+                            is_error: true,
+                        };
+                    }
+                }
             }
-            Err(_) => {
+            _ = tokio::time::sleep(self.timeout_duration) => {
+                // Timeout - kill the child process
+                let _ = child.kill().await;
                 return ShellExecuteResponse {
                     stdout: String::new(),
                     stderr: "Command execution timeout (30s)".to_string(),
@@ -140,11 +145,23 @@ impl ShellExecutor {
             }
         };
 
+        // Read stdout and stderr after process completes
+        use tokio::io::AsyncReadExt;
+        let mut stdout_data = Vec::new();
+        let mut stderr_data = Vec::new();
+
+        if let Some(mut stdout) = child.stdout.take() {
+            let _ = stdout.read_to_end(&mut stdout_data).await;
+        }
+        if let Some(mut stderr) = child.stderr.take() {
+            let _ = stderr.read_to_end(&mut stderr_data).await;
+        }
+
         ShellExecuteResponse {
-            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-            exit_code: output.status.code(),
-            is_error: !output.status.success(),
+            stdout: String::from_utf8_lossy(&stdout_data).to_string(),
+            stderr: String::from_utf8_lossy(&stderr_data).to_string(),
+            exit_code: status.code(),
+            is_error: !status.success(),
         }
     }
 }

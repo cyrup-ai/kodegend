@@ -171,7 +171,7 @@ fn check_chromium_installed() -> bool {
             false
         }
     }
-    
+
     #[cfg(target_os = "linux")]
     {
         if let Some(cache) = dirs::cache_dir() {
@@ -181,7 +181,7 @@ fn check_chromium_installed() -> bool {
             false
         }
     }
-    
+
     #[cfg(target_os = "windows")]
     {
         if let Some(local_data) = dirs::data_local_dir() {
@@ -191,9 +191,113 @@ fn check_chromium_installed() -> bool {
             false
         }
     }
-    
+
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         false
+    }
+}
+
+/// Get the version of an installed binary by running `binary --version`
+///
+/// Returns Some(version) if the binary exists and returns a valid version,
+/// None otherwise.
+pub fn get_installed_binary_version(binary_name: &str) -> Option<String> {
+    let output = std::process::Command::new(binary_name)
+        .arg("--version")
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Parse version from output like "kodegen 0.3.1" or "kodegen-v0.3.1"
+    // Extract the version number (digits and dots)
+    for word in stdout.split_whitespace() {
+        if word.chars().next().map_or(false, |c| c.is_ascii_digit())
+            || word.starts_with('v') && word.len() > 1 && word.chars().nth(1).map_or(false, |c| c.is_ascii_digit())
+        {
+            let version = word.trim_start_matches('v');
+            if version.chars().any(|c| c == '.') {
+                return Some(version.to_string());
+            }
+        }
+    }
+
+    None
+}
+
+/// Get the latest version of a crate from crates.io using `cargo search`
+///
+/// Returns Some(version) if the crate is found, None otherwise.
+pub fn get_crates_io_version(crate_name: &str) -> Option<String> {
+    let output = std::process::Command::new("cargo")
+        .args(["search", crate_name, "--limit", "1"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Parse output like: `kodegen = "0.3.1"    # Description`
+    // Look for the exact crate name followed by = "version"
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix(crate_name) {
+            if let Some(version_part) = rest.trim().strip_prefix('=') {
+                // Extract version between quotes, stop at first quote closing
+                let version_with_quote = version_part.trim().trim_start_matches('"');
+                if let Some(end_quote_idx) = version_with_quote.find('"') {
+                    let version_str = &version_with_quote[..end_quote_idx];
+                    if !version_str.is_empty() {
+                        return Some(version_str.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Check if a binary needs installation by comparing installed version with crates.io version
+///
+/// Returns true if:
+/// - Binary is not installed (command not found)
+/// - Installed version doesn't match latest crates.io version
+/// - Version information cannot be determined
+///
+/// Returns false if installed version matches latest crates.io version
+pub fn binary_needs_installation(binary_name: &str) -> bool {
+    // Get installed version
+    let installed_version = match get_installed_binary_version(binary_name) {
+        Some(v) => v,
+        None => {
+            log::info!("{} not found or version unavailable, needs installation", binary_name);
+            return true; // Binary not installed
+        }
+    };
+
+    // Get latest version from crates.io
+    let latest_version = match get_crates_io_version(binary_name) {
+        Some(v) => v,
+        None => {
+            log::warn!("Could not determine latest version for {} from crates.io, skipping version check", binary_name);
+            return false; // Can't determine latest, assume installed version is OK
+        }
+    };
+
+    // Compare versions
+    if installed_version == latest_version {
+        log::info!("{} {} is up to date", binary_name, installed_version);
+        false
+    } else {
+        log::info!("{} version mismatch: installed={}, latest={}", binary_name, installed_version, latest_version);
+        true
     }
 }

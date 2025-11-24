@@ -18,31 +18,32 @@ cfg_if::cfg_if! {
     } else if #[cfg(target_os = "windows")] {
         mod windows_control;
         use windows_control as platform;
+    } else if #[cfg(unix)] {
+        // Generic Unix fallback for BSD and other Unix-like systems
+        // Provides basic PID-based control without service manager integration
+        //
+        // Supported platforms: FreeBSD, OpenBSD, NetBSD, DragonFly BSD, Solaris, etc.
+        //
+        // Capabilities:
+        // - ✅ check_status() - via PID file and process existence
+        // - ✅ stop_daemon() - via SIGTERM signal
+        // - ❌ start_daemon() - returns helpful error
+        // - ❌ restart_daemon() - returns helpful error
+        mod generic_control;
+        use generic_control as platform;
     } else {
+        // Non-Unix, non-Windows platform (extremely rare)
         compile_error!(
-            "kodegend daemon control is not supported on this platform.\n\
+            "kodegend is only supported on Unix-like systems and Windows.\n\
              \n\
-             Daemon control (start/stop/restart/status) requires platform-specific \n\
-             service manager integration:\n\
+             Your platform does not appear to be Unix or Windows.\n\
              \n\
-             - macOS: launchd (launchctl)\n\
-             - Linux: systemd (systemctl)\n\
-             - Windows: Service Control Manager (SCM)\n\
+             Supported platforms:\n\
+             - Unix: macOS, Linux, FreeBSD, OpenBSD, NetBSD, DragonFly BSD, Solaris\n\
+             - Windows: Windows 7+\n\
              \n\
-             Your platform is not yet supported for service manager integration.\n\
-             \n\
-             ALTERNATIVES:\n\
-             \n\
-             1. Run the daemon directly in foreground mode:\n\
-                   kodegend run --foreground\n\
-             \n\
-             2. Request platform support by opening an issue:\n\
-                   https://github.com/kodegen-ai/kodegen/issues\n\
-             \n\
-             3. Contribute platform support for your system:\n\
-                   See packages/kodegend/src/control/ for reference implementations\n\
-             \n\
-             Supported platforms: macOS, Linux, Windows"
+             If you believe this is an error, please report an issue:\n\
+             https://github.com/kodegen-ai/kodegen/issues"
         );
     }
 }

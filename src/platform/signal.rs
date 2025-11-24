@@ -18,8 +18,9 @@ pub enum SignalKind {
     /// Hangup signal (SIGHUP on Unix, CTRL+BREAK on Windows)
     /// Used for configuration reload
     Hangup,
-    
+
     /// Shutdown signal (Windows CTRL+SHUTDOWN only, never fires on Unix)
+    #[allow(dead_code)]
     Shutdown,
 }
 

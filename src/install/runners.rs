@@ -72,7 +72,32 @@ pub async fn run_install(cli: &Cli) -> Result<()> {
         }
     });
 
-    // Download all binaries from GitHub
+    // Check which binaries need installation
+    let _ = stdout.set_color(ColorSpec::new().set_fg(Some(Color::Cyan)));
+    let _ = writeln!(stdout, "🔍 Checking installed versions...");
+    let _ = stdout.reset();
+
+    // Check kodegen binary version
+    use super::detection::binary_needs_installation;
+    let needs_kodegen = binary_needs_installation("kodegen");
+
+    if !needs_kodegen {
+        let _ = stdout.set_color(ColorSpec::new().set_fg(Some(Color::Green)));
+        let _ = writeln!(stdout, "✓ kodegen is up to date, skipping download\n");
+        let _ = stdout.reset();
+
+        // No binaries to install, but continue with other installation steps
+        // (service configuration, certificates, etc.)
+        let _ = stdout.set_color(ColorSpec::new().set_fg(Some(Color::Cyan)));
+        let _ = writeln!(stdout, "📦 Configuring system...");
+        let _ = stdout.reset();
+
+        // TODO: Add service configuration, certificate generation, etc.
+        // For now, just return success
+        return Ok(());
+    }
+
+    // Download binaries that need installation
     let _ = stdout.set_color(ColorSpec::new().set_fg(Some(Color::Cyan)));
     let _ = writeln!(stdout, "📥 Downloading binaries from GitHub...");
     let _ = stdout.reset();

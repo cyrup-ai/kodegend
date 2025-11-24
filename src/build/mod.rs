@@ -3,10 +3,10 @@
 //! This module provides comprehensive build functionality including macOS
 //! helper app creation, code signing, and packaging with zero allocation
 //! patterns and blazing-fast performance.
+//!
+//! Uses proven kodegen_bundler_sign for reliable code signing.
 
-pub mod macos_helper;
 pub mod packaging;
-pub mod signing;
 
 #[cfg(target_os = "windows")]
 pub mod windows_helper;
@@ -15,7 +15,7 @@ pub mod windows_helper;
 pub mod linux_helper;
 
 /// Main build function orchestrating platform-specific tasks
-pub fn main() {
+pub async fn main() {
     // Check for systemd on Linux
     #[cfg(target_os = "linux")]
     {
@@ -38,7 +38,7 @@ pub fn main() {
         };
         let zip_path = out_dir.join("KodegenHelper.app.zip");
 
-        if let Err(e) = packaging::create_functional_zip(&zip_path) {
+        if let Err(e) = packaging::create_functional_zip(&zip_path).await {
             eprintln!("Error: Failed to build macOS helper app: {e}");
             eprintln!("Build failed - macOS helper is required for proper installation");
             std::process::exit(1);
@@ -144,7 +144,7 @@ pub fn validate_build_environment() -> Result<(), Box<dyn std::error::Error>> {
     // Platform-specific validation
     #[cfg(target_os = "macos")]
     {
-        signing::validate_signing_requirements()?;
+        // Validation is handled by kodegen_bundler_sign during build
     }
 
     #[cfg(target_os = "linux")]

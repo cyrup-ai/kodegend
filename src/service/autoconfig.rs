@@ -53,6 +53,7 @@ impl AutoConfigService {
                     state: ServiceState::Running,
                     ts: chrono::Utc::now(),
                     pid: Some(std::process::id()),
+                    correlation_id: None,
                 });
 
                 // Run watcher with cancellation support
@@ -74,6 +75,7 @@ impl AutoConfigService {
                             state: ServiceState::StoppedClean,
                             ts: chrono::Utc::now(),
                             pid: Some(std::process::id()),
+                            correlation_id: None,
                         });
                     }
                 }
@@ -86,10 +88,10 @@ impl AutoConfigService {
         // Handle control commands with lock-free coordination
         loop {
             match cmd_rx.recv()? {
-                Cmd::Start => {
+                Cmd::Start { correlation_id: _ } => {
                     info!("Auto-config service already started");
                 }
-                Cmd::Stop => {
+                Cmd::Stop { correlation_id: _ } => {
                     info!("Stopping auto-config service");
                     let did_abort = perform_graceful_shutdown(&cancel_token, &watcher_handle, &shutdown_complete);
                     

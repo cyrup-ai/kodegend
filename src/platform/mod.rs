@@ -47,9 +47,11 @@ pub type ProcessId = i32; // Unix PIDs are signed 32-bit
 pub type ProcessId = u32; // Windows process IDs are DWORD (u32)
 
 #[cfg(unix)]
+#[allow(dead_code)]
 pub type FileHandle = std::os::unix::io::RawFd;
 
 #[cfg(windows)]
+#[allow(dead_code)]
 pub type FileHandle = std::os::windows::io::RawHandle;
 
 /// Privilege level check (root/admin)
@@ -66,6 +68,7 @@ pub fn is_elevated() -> bool {
 /// Returns true if launched by system service manager:
 /// - Unix: systemd (INVOCATION_ID env var) or launchd (macOS)
 /// - Windows: Running as Windows Service (no console window)
+#[allow(dead_code)]
 pub fn running_under_service_manager() -> bool {
     platform_running_under_service_manager()
 }
@@ -74,6 +77,7 @@ pub fn running_under_service_manager() -> bool {
 ///
 /// - Unix: getpid()
 /// - Windows: GetCurrentProcessId()
+#[allow(dead_code)]
 pub fn current_process_id() -> ProcessId {
     platform_current_process_id()
 }

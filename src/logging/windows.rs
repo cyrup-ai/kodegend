@@ -43,16 +43,19 @@ pub(super) fn platform_init_logging() -> Result<()> {
         .filter_level(LevelFilter::Info)
         .build();
 
-    // Initialize eventlog for Windows Event Log
-    // Note: eventlog::init() will gracefully handle missing registration
+    // Create EventLog instance for Windows Event Log
+    // Note: EventLog::new() will gracefully handle missing registration
     // If not registered, events may appear under generic "Application" source
-    eventlog::init("kodegend", log::Level::Info)
-        .context("Failed to initialize Windows Event Log")?;
+    let event_logger = eventlog::EventLog::new("kodegend", log::Level::Info)
+        .context("Failed to create Windows Event Log logger")?;
 
-    // Combine both loggers using multi_log
+    // Combine BOTH loggers using multi_log
     // This enables simultaneous output to console AND Event Viewer
     multi_log::MultiLogger::init(
-        vec![Box::new(env_logger)],
+        vec![
+            Box::new(env_logger),
+            Box::new(event_logger),
+        ],
         log::Level::Info
     ).context("Failed to initialize multi-logger")?;
 

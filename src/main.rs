@@ -75,7 +75,7 @@ async fn real_main() -> Result<()> {
 }
 
 async fn run_daemon(
-    force_foreground: bool,  // NOTE: Parameter kept for API compatibility but unused
+    _force_foreground: bool,  // NOTE: Parameter kept for API compatibility but unused
     config_path: Option<String>,
     use_system: bool,
 ) -> Result<()> {
@@ -139,7 +139,7 @@ async fn run_daemon(
     // Create and run service manager
     // Note: Signal handlers are now installed within ServiceManager::run()
     // HTTP servers will be started gracefully inside the service loop
-    let mut mgr = ServiceManager::new(cfg)?;
+    let mgr = ServiceManager::new(cfg)?;
     
     // Notify systemd we're ready (if running under systemd)
     daemon::systemd_ready();

@@ -1,3 +1,7 @@
+<div align="center">
+  <img src="assets/img/banner.png" alt="Kodegen AI Banner" width="100%" />
+</div>
+
 # kodegen Daemon
 
 A high-performance Unix daemon library with crossbeam-based service management.
@@ -5,7 +9,8 @@ A high-performance Unix daemon library with crossbeam-based service management.
 ## Features
 
 - **Zero-allocation hot paths**: Uses crossbeam channels and fixed-size enums
-- **True Unix daemon**: Double-fork daemonization with systemd auto-detection  
+- **True Unix daemon**: OS 
+Service daemonization with systemd auto-detection  
 - **Service management**: Supervise processes with automatic restart and health monitoring
 - **System integration**: Self-installation with systemd/launchd support
 - **Async compatible**: Can manage async applications while using sync internals

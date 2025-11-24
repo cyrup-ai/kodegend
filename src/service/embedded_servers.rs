@@ -43,6 +43,7 @@ impl EmbeddedServer {
 ///
 /// Fails fast: if any server fails to start, all previously started servers
 /// are shutdown gracefully and an error is returned.
+#[allow(dead_code)]
 pub async fn start_all_servers(
     configs: Vec<CategoryServerConfig>,
     tls_cert: Option<PathBuf>,
@@ -129,6 +130,7 @@ pub async fn start_server(
 }
 
 /// Rollback: gracefully shutdown all servers that were started
+#[allow(dead_code)]
 async fn rollback_servers(servers: Vec<EmbeddedServer>) {
     let count = servers.len();
     log::warn!("Rolling back {} previously started servers", count);

@@ -19,40 +19,155 @@ use windows::{
     core::PCWSTR,
 };
 
-/// Build platform-specific certificate import command
-pub fn get_cert_import_command(cert_path: &std::path::Path) -> String {
+/// Escape a path for safe use in POSIX shell scripts.
+///
+/// Uses the `shlex` crate to properly quote paths containing shell metacharacters.
+/// This prevents command injection by ensuring paths are treated as literal strings.
+///
+/// # Security
+/// - Handles all POSIX shell metacharacters: ', ", $, `, ;, |, &, <, >, (, ), etc.
+/// - Returns Err for paths that cannot be safely escaped (non-UTF8, control characters)
+/// - MUST be used for ALL user-controlled paths in shell scripts
+///
+/// # Example
+/// ```rust
+/// let path = Path::new("/tmp/file'; rm -rf / #.bin");
+/// let escaped = shell_escape(path)?;
+/// // Result: "'/tmp/file'\'' rm -rf / #.bin'"
+/// //                    ^^^^
+/// //              Single quote escaped as '\''
+/// ```
+fn shell_escape(path: &std::path::Path) -> Result<String> {
+    // Convert path to string (reject non-UTF8 paths)
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!(
+            "Path contains invalid UTF-8: {}. This may be a security issue.",
+            path.display()
+        ))?;
+
+    // Reject paths with control characters (potential terminal injection)
+    if path_str.chars().any(|c| c.is_control() && c != '\n' && c != '\t') {
+        return Err(anyhow::anyhow!(
+            "Path contains control characters: {}. Possible attack attempt.",
+            path.display()
+        ));
+    }
+
+    // Use shlex to properly escape for POSIX shells
+    // shlex::try_quote() returns Cow<str>:
+    //   - Borrowed if no escaping needed
+    //   - Owned if escaping applied
+    match shlex::try_quote(path_str) {
+        Ok(quoted) => Ok(quoted.to_string()),
+        Err(e) => Err(anyhow::anyhow!(
+            "Failed to escape path '{}': {}. This should never happen.",
+            path.display(),
+            e
+        )),
+    }
+}
+
+/// Validate that a filename is safe (alphanumeric + limited special chars).
+///
+/// This is a DEFENSE-IN-DEPTH measure in addition to shell escaping.
+/// Even with proper escaping, we enforce strict filename rules for binaries.
+///
+/// # Allowed Characters
+/// - Alphanumeric: a-z, A-Z, 0-9
+/// - Special: dash (-), underscore (_), dot (.)
+///
+/// # Rejected
+/// - Shell metacharacters: ', ", $, `, ;, |, &, etc.
+/// - Path separators: / (slash), \ (backslash)
+/// - Whitespace (except already validated above)
+/// - Control characters
+///
+/// # Security Rationale
+/// Binary filenames should NEVER contain shell metacharacters. If they do,
+/// it's either a mistake or an attack. Rejecting them early prevents exploitation
+/// even if shell escaping has bugs.
+fn validate_binary_filename(path: &std::path::Path) -> Result<()> {
+    let filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| anyhow::anyhow!(
+            "Invalid filename in path: {}",
+            path.display()
+        ))?;
+
+    // Check for safe characters only
+    let is_safe = filename
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.');
+
+    if !is_safe {
+        return Err(anyhow::anyhow!(
+            "Unsafe binary filename detected: '{}'\n\
+             Binary filenames must contain only: a-z, A-Z, 0-9, dash, underscore, dot\n\
+             This restriction prevents command injection attacks.\n\
+             If this is a legitimate file, please rename it and try again.",
+            filename
+        ));
+    }
+
+    // Additional check: reject hidden files (start with .)
+    if filename.starts_with('.') {
+        return Err(anyhow::anyhow!(
+            "Hidden files not allowed as binaries: '{}'",
+            filename
+        ));
+    }
+
+    // Additional check: reject files without extension or with suspicious extensions
+    if !filename.contains('.') || filename.ends_with(".sh") || filename.ends_with(".bash") {
+        return Err(anyhow::anyhow!(
+            "Invalid binary filename: '{}'\n\
+             Expected executable binaries (e.g., kodegend, kodegen), not shell scripts.",
+            filename
+        ));
+    }
+
+    Ok(())
+}
+
+/// Build platform-specific certificate import command.
+///
+/// # Security
+/// The `escaped_cert_path` parameter MUST be pre-escaped using `shell_escape()`.
+/// This function does NOT perform escaping itself.
+///
+/// # Arguments
+/// * `escaped_cert_path` - Shell-escaped certificate path (output of `shell_escape()`)
+pub fn get_cert_import_command_escaped(escaped_cert_path: &str) -> String {
     #[cfg(target_os = "macos")]
     {
         format!(
-            "security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain '{}'",
-            cert_path.display()
+            "security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain {}",
+            escaped_cert_path
         )
     }
 
     #[cfg(target_os = "linux")]
     {
-        let cert_name = cert_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("kodegen-mcp.crt");
+        // Use a safe static filename instead of parsing escaped string
         format!(
-            "cp '{}' /usr/local/share/ca-certificates/{} && update-ca-certificates",
-            cert_path.display(),
-            cert_name
+            "cp {} /usr/local/share/ca-certificates/kodegen-mcp.crt && update-ca-certificates",
+            escaped_cert_path
         )
     }
 
     #[cfg(target_os = "windows")]
     {
         format!(
-            "certutil -addstore -f Root '{}'",
-            cert_path.display()
+            "certutil -addstore -f Root {}",
+            escaped_cert_path
         )
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
-        format!("echo 'Certificate import not supported on this platform: {}'", cert_path.display())
+        format!("echo 'Certificate import not supported on this platform'")
     }
 }
 
@@ -106,8 +221,18 @@ pub async fn install_with_elevated_privileges(
     #[cfg(unix)]
     {
         script.push_str("mkdir -p /usr/local/bin\n");
+        
         for file in &staged_files {
-            script.push_str(&format!("cp -f '{}' /usr/local/bin/\n", file));
+            let path = std::path::Path::new(file);
+            
+            // LAYER 1: Validate filename (reject malicious names)
+            validate_binary_filename(path)?;
+            
+            // LAYER 2: Escape for shell safety (handle remaining edge cases)
+            let escaped_path = shell_escape(path)?;
+            
+            // Now safe to use in shell script
+            script.push_str(&format!("cp -f {} /usr/local/bin/\n", escaped_path));
         }
 
         // Set ownership and permissions
@@ -218,12 +343,14 @@ if errorlevel 1 (
         }
 
         // Add import command to script
-        script.push_str(&get_cert_import_command(&temp_cert_path));
+        // Escape certificate path before passing to command builder
+        let escaped_cert_path = shell_escape(&temp_cert_path)?;
+        script.push_str(&get_cert_import_command_escaped(&escaped_cert_path));
         script.push('\n');
 
         // Clean up temp file in script (after import completes)
         #[cfg(unix)]
-        script.push_str(&format!("rm -f '{}'\n", temp_cert_path.display()));
+        script.push_str(&format!("rm -f {}\n", escaped_cert_path));
 
         #[cfg(windows)]
         {
@@ -238,11 +365,15 @@ if errorlevel 1 (
     {
         let plist_src = data_dir.join("com.kodegen.daemon.plist");
         if plist_src.exists() {
+            // Validate and escape service file path
+            validate_binary_filename(&plist_src)?;
+            let escaped_plist = shell_escape(&plist_src)?;
+            
             script.push_str("\n# Install launchd service\n");
             script.push_str("echo 'Installing service...'\n");
             script.push_str(&format!(
-                "cp '{}' /Library/LaunchDaemons/com.kodegen.daemon.plist\n",
-                plist_src.display()
+                "cp {} /Library/LaunchDaemons/com.kodegen.daemon.plist\n",
+                escaped_plist
             ));
             script.push_str("launchctl load /Library/LaunchDaemons/com.kodegen.daemon.plist 2>/dev/null || true\n");
         }
@@ -252,11 +383,15 @@ if errorlevel 1 (
     {
         let service_src = data_dir.join("kodegend.service");
         if service_src.exists() {
+            // Validate and escape service file path
+            validate_binary_filename(&service_src)?;
+            let escaped_service = shell_escape(&service_src)?;
+            
             script.push_str("\n# Install systemd service\n");
             script.push_str("echo 'Installing service...'\n");
             script.push_str(&format!(
-                "cp '{}' /etc/systemd/system/kodegend.service\n",
-                service_src.display()
+                "cp {} /etc/systemd/system/kodegend.service\n",
+                escaped_service
             ));
             script.push_str("systemctl daemon-reload\n");
             script.push_str("systemctl enable kodegend 2>/dev/null || true\n");
@@ -277,13 +412,38 @@ if errorlevel 1 (
     // Execute ONLY this minimal script with sudo
     #[cfg(unix)]
     {
+        // Write script to secure temporary file
+        let script_path = std::env::temp_dir()
+            .join(format!("kodegen_install_script_{}.sh", std::process::id()));
+        
+        // Write script content
+        tokio::fs::write(&script_path, &script)
+            .await
+            .context("Failed to write installation script")?;
+        
+        // Set restrictive permissions: owner read/execute only (mode 0700)
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = tokio::fs::metadata(&script_path)
+                .await
+                .context("Failed to get script metadata")?
+                .permissions();
+            perms.set_mode(0o700);  // rwx------ (owner only)
+            tokio::fs::set_permissions(&script_path, perms)
+                .await
+                .context("Failed to set script permissions")?;
+        }
+        
+        // Execute script file (NOT via sh -c)
         let status = Command::new("sudo")
             .arg("sh")
-            .arg("-c")
-            .arg(&script)
+            .arg(&script_path)
             .status()
             .context("Failed to execute sudo")?;
-
+        
+        // Cleanup script file (even if execution failed)
+        let _ = tokio::fs::remove_file(&script_path).await;
+        
         if !status.success() {
             return Err(anyhow::anyhow!(
                 "Privileged installation failed with exit code: {}",

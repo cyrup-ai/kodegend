@@ -8,7 +8,7 @@
 use anyhow::Result;
 use log::LevelFilter;
 
-pub(super) fn platform_init_logging() -> Result<()> {
+pub fn platform_init_logging() -> Result<()> {
     // Preserve exact format from src/main.rs:36-50
     env_logger::Builder::from_default_env()
         .format(|buf, record| {

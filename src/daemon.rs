@@ -8,6 +8,8 @@ use systemd::daemon;
 
 #[cfg(unix)]
 use nix::fcntl::{Flock, FlockArg};
+#[cfg(unix)]
+use std::os::fd::IntoRawFd;
 
 use crate::platform;
 
@@ -65,6 +67,7 @@ impl PidFile {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(true)
             .open(&path)
             .with_context(|| format!("Opening PID file: {}", path.display()))?;
         
@@ -103,8 +106,8 @@ impl PidFile {
             .context("Reading existing PID file content")?;
         
         // If there's existing content, validate it's a stale PID
-        if !existing_content.trim().is_empty() {
-            if let Ok(existing_pid) = existing_content.trim().parse::<platform::ProcessId>() {
+        if !existing_content.trim().is_empty()
+            && let Ok(existing_pid) = existing_content.trim().parse::<platform::ProcessId>() {
                 match platform::is_process_running(existing_pid) {
                     Ok(true) => {
                         // This should never happen since we hold the lock
@@ -132,7 +135,6 @@ impl PidFile {
                     }
                 }
             }
-        }
         
         // Write our PID to the file (lock is held, so this is safe)
         let our_pid = std::process::id();
@@ -224,6 +226,7 @@ impl Drop for PidFile {
 ///
 /// On Unix: Performs double-fork daemonization for classic init systems
 /// On Windows: No-op because SCM handles process management
+#[allow(dead_code)]
 pub fn daemonise() -> Result<()> {
     #[cfg(unix)]
     {
@@ -240,6 +243,7 @@ pub fn daemonise() -> Result<()> {
 }
 
 #[cfg(unix)]
+#[allow(dead_code)]
 fn unix_daemonise() -> Result<()> {
     use std::os::unix::io::{AsRawFd, RawFd};
     use nix::sys::resource::{getrlimit, Resource};
@@ -257,6 +261,8 @@ fn unix_daemonise() -> Result<()> {
     // ═══════════════════════════════════════════════════════════════
     let (read_fd, write_fd) = pipe()
         .context("Failed to create readiness notification pipe")?;
+    let read_fd = read_fd.into_raw_fd();
+    let write_fd = write_fd.into_raw_fd();
 
     // ═══════════════════════════════════════════════════════════════
     // STEP 2: First fork - create intermediate process
@@ -270,7 +276,7 @@ fn unix_daemonise() -> Result<()> {
             
             // Block until grandchild signals readiness or pipe closes
             let mut buf = [0u8; 2];
-            match read(read_fd, &mut buf) {
+            match read(unsafe { std::os::fd::BorrowedFd::borrow_raw(read_fd) }, &mut buf) {
                 Ok(2) if &buf == b"OK" => {
                     // ✅ Grandchild is ready and initialized
                     close(read_fd).ok(); // Best effort cleanup
@@ -379,7 +385,7 @@ fn unix_daemonise() -> Result<()> {
     
     // At this point, daemon is initialized and ready
     // Signal parent by writing "OK" and closing pipe
-    match write(write_fd, b"OK") {
+    match write(unsafe { std::os::fd::BorrowedFd::borrow_raw(write_fd) }, b"OK") {
         Ok(2) => {
             // Successfully wrote 2 bytes
             close(write_fd).context("close write_fd after signaling")?;
