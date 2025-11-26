@@ -35,7 +35,7 @@ use service_creation::{
 use utils::{str_to_wide, MAX_SERVICE_NAME};
 
 // Re-export paths module for use in other modules
-pub use paths::{InstallScope, install_dir, kodegend_exe, installer_data_dir, hosts_file, temp_cert_path};
+pub use paths::{InstallScope, install_dir, kodegend_exe, installer_data_dir, hosts_file, temp_cert_file};
 
 pub(crate) struct PlatformExecutor;
 

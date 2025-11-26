@@ -175,7 +175,7 @@ pub async fn fix_kodegen_version(executor: &mut PrivilegedExecutor) -> Component
     log::info!("Fixing kodegen version...");
 
     // Check current status
-    let status = super::detection::check_kodegen_version_status();
+    let status = super::detection::check_kodegen_version_status().await;
 
     match status {
         ComponentStatus::Ok => {
@@ -303,7 +303,7 @@ pub async fn fix_kodegen_version(executor: &mut PrivilegedExecutor) -> Component
 /// Uses fail-fast behavior: stops on first failure.
 #[cfg(unix)]
 pub async fn fix_all_components() -> Result<super::detection::InstallationFixReport> {
-    let status = super::detection::check_all_components();
+    let status = super::detection::check_all_components().await;
 
     if status.all_ok() {
         log::info!("All installation components verified OK");

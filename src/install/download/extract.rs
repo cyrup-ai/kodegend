@@ -100,7 +100,7 @@ pub async fn extract_from_rpm(
     let binary_name_clone = binary_name.to_string();
     let extract_dir_clone = extract_dir.clone();
 
-    tokio::task::spawn_blocking(move || -> Result<PathBuf> {
+    let binary_path = tokio::task::spawn_blocking(move || -> Result<PathBuf> {
         use rpm::{Package, CompressionType};
         use flate2::read::GzDecoder;
         use std::io::{BufReader, Seek, SeekFrom};
@@ -164,17 +164,12 @@ pub async fn extract_from_rpm(
         use std::io::Cursor;
         let mut cpio_reader = Cursor::new(decompressed_cpio);
 
-        loop {
-            let reader = match cpio::NewcReader::new(cpio_reader) {
-                Ok(r) => r,
-                Err(_) => break, // End of archive
-            };
-
+        while let Ok(reader) = cpio::NewcReader::new(cpio_reader) {
             if reader.entry().is_trailer() {
                 break;
             }
 
-            let entry_name = reader.entry().name();
+            let entry_name = reader.entry().name().to_string();
             let file_size = reader.entry().file_size();
 
             // Build output path (remove leading ./)
@@ -188,7 +183,7 @@ pub async fn extract_from_rpm(
 
             // Extract file content (skip directories and zero-length files)
             if file_size > 0 {
-                let mut output_file = std::fs::File::create(&output_path)
+                let output_file = std::fs::File::create(&output_path)
                     .context(format!("Failed to create {}", output_path.display()))?;
 
                 cpio_reader = reader.to_writer(output_file)
@@ -199,7 +194,7 @@ pub async fn extract_from_rpm(
             }
         }
 
-        // Step 6: Return path to extracted binary
+        // Step 6: Locate extracted binary
         let binary_path = extract_dir_clone.join("usr/bin").join(&binary_name_clone);
 
         if !binary_path.exists() {
@@ -210,7 +205,13 @@ pub async fn extract_from_rpm(
         }
 
         Ok(binary_path)
-    }).await?
+    }).await??;
+
+    // Copy to persistent output directory before temp_dir is dropped
+    let final_path = output_dir.join(binary_name);
+    tokio::fs::copy(&binary_path, &final_path).await?;
+
+    Ok(final_path)
 }
 
 /// Extract binary from macOS .dmg (pure Rust implementation)

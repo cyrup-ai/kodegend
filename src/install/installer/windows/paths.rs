@@ -127,9 +127,18 @@ pub fn temp_dir() -> PathBuf {
     std::env::temp_dir()
 }
 
-/// Get a unique temp file path for certificate import
-pub fn temp_cert_path() -> PathBuf {
-    temp_dir().join(format!("kodegen_cert_import_{}.crt", std::process::id()))
+/// Create a unique temp file for certificate import
+/// 
+/// Returns a NamedTempFile that will be automatically cleaned up when dropped.
+/// The caller can write certificate content to it and use .path() to get the path.
+pub fn temp_cert_file() -> Result<tempfile::NamedTempFile> {
+    use tempfile::Builder;
+    
+    Builder::new()
+        .prefix("kodegen_cert_")
+        .suffix(".crt")
+        .tempfile()
+        .context("Failed to create temp certificate file")
 }
 
 /// Create all standard installer directories
@@ -191,9 +200,10 @@ mod tests {
 
     #[test]
     fn test_temp_paths() {
-        let temp_cert = temp_cert_path();
-        assert!(temp_cert.to_string_lossy().contains("kodegen_cert_import_"));
-        assert!(temp_cert.extension().and_then(|s| s.to_str()) == Some("crt"));
+        let temp_cert = temp_cert_file().expect("Failed to create temp cert file");
+        let path = temp_cert.path();
+        assert!(path.to_string_lossy().contains("kodegen_cert_"));
+        assert!(path.extension().and_then(|s| s.to_str()) == Some("crt"));
     }
 
     #[test]

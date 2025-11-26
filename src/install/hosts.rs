@@ -34,7 +34,7 @@ pub fn hosts_entry_exists() -> bool {
             let reader = BufReader::new(file);
             reader
                 .lines()
-                .filter_map(Result::ok)
+                .map_while(Result::ok)
                 .any(|line| line.contains(HOSTS_ENTRY))
         }
         Err(_) => false,
@@ -81,29 +81,48 @@ fi
 "#
         .to_string();
 
-        // Write script to temp file
-        let script_path = format!("/tmp/kodegen_hosts_setup_{}.sh", std::process::id());
-        std::fs::write(&script_path, script)
+        // Write script to temp file using tempfile for security
+        use tempfile::Builder;
+        use std::io::Write;
+
+        let mut script_file = Builder::new()
+            .prefix("kodegen_hosts_")
+            .suffix(".sh")
+            .tempfile()
+            .context("Failed to create temp script file")?;
+
+        script_file
+            .write_all(script.as_bytes())
             .context("Failed to write hosts setup script")?;
+        script_file
+            .flush()
+            .context("Failed to flush script data")?;
 
         // Make executable
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&script_path)?.permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&script_path, perms)?;
+            let mut perms = script_file
+                .as_file()
+                .metadata()
+                .context("Failed to get script metadata")?
+                .permissions();
+            perms.set_mode(0o700);
+            script_file
+                .as_file()
+                .set_permissions(perms)
+                .context("Failed to set script permissions")?;
         }
 
         // Execute with sudo
         let status = Command::new("sudo")
             .arg("sh")
-            .arg(&script_path)
+            .arg(script_file.path())
             .status()
             .context("Failed to execute hosts setup script with sudo")?;
 
-        // Clean up
-        let _ = std::fs::remove_file(&script_path);
+        // Auto-cleanup via drop
+        drop(script_file);
 
         if !status.success() {
             anyhow::bail!("Hosts file configuration failed");

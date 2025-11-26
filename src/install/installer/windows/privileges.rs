@@ -62,15 +62,28 @@ pub(super) fn ensure_helper_path() -> Result<(), InstallerError> {
         return Ok(());
     }
 
-    // Create unique helper path in temp directory
-    let temp_dir = std::env::temp_dir();
-    let helper_name = format!("KodegenHelper_{}.exe", std::process::id());
-    let helper_path = temp_dir.join(helper_name);
+    // Create unique helper path in temp directory using tempfile for security
+    use std::io::Write;
+    use tempfile::Builder;
+
+    let mut helper_file = Builder::new()
+        .prefix("KodegenHelper_")
+        .suffix(".exe")
+        .tempfile()
+        .map_err(|e| InstallerError::System(format!("Failed to create temp helper file: {}", e)))?;
 
     // Extract embedded helper executable
-    std::fs::write(&helper_path, HELPER_EXE_DATA).map_err(|e| {
-        InstallerError::System(format!("Failed to extract helper executable: {}", e))
-    })?;
+    helper_file
+        .write_all(HELPER_EXE_DATA)
+        .map_err(|e| InstallerError::System(format!("Failed to write helper executable: {}", e)))?;
+    helper_file
+        .flush()
+        .map_err(|e| InstallerError::System(format!("Failed to flush helper data: {}", e)))?;
+
+    // Persist the temp file and get the path
+    let (_file, helper_path) = helper_file
+        .keep()
+        .map_err(|e| InstallerError::System(format!("Failed to persist helper executable: {}", e)))?;
 
     // Verify the helper is properly signed
     verify_helper_signature(&helper_path)?;

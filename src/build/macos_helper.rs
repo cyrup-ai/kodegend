@@ -168,23 +168,34 @@ int main(int argc, char *argv[]) {
     let c_source_path = temp_dir.join("kodegend_helper.c");
     fs::write(&c_source_path, helper_code)?;
 
-    // Compile with cc
-    let output = Command::new("cc")
-        .args([
-            "-o",
-            path.to_str().ok_or("Invalid path")?,
-            c_source_path.to_str().ok_or("Invalid temp path")?,
-            "-framework",
-            "CoreFoundation",
-        ])
-        .output()?;
-
+    // Compile with cc crate (cross-platform compiler detection)
+    let mut build = cc::Build::new();
+    build.file(&c_source_path);
+    
+    // Get the compiler to invoke it manually for full control over output path
+    let compiler = build.try_get_compiler().map_err(|e| {
+        format!("Failed to find C compiler for macOS helper compilation: {}", e)
+    })?;
+    
+    // Build the compile command with explicit output path and macOS frameworks
+    let mut cmd = compiler.to_command();
+    cmd.arg("-o");
+    cmd.arg(path);
+    cmd.arg(&c_source_path);
+    cmd.arg("-framework");
+    cmd.arg("CoreFoundation");
+    
+    // Execute compilation
+    let output = cmd.output().map_err(|e| {
+        format!("Failed to execute C compiler: {}", e)
+    })?;
+    
     if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
-            "Failed to compile helper: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )
-        .into());
+            "Failed to compile macOS helper: {}",
+            stderr
+        ).into());
     }
 
     // Clean up temporary C source

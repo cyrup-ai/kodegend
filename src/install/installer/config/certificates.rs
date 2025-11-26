@@ -266,155 +266,299 @@ pub async fn import_certificate_to_system(cert_path: &Path) -> Result<()> {
     }
 }
 
-/// Import certificate to macOS System keychain
+/// Import certificate to macOS System keychain using Security.framework
 #[cfg(target_os = "macos")]
 async fn import_certificate_macos(cert_path: &Path) -> Result<()> {
-    info!("Importing certificate to macOS System keychain...");
+    use security_framework::certificate::SecCertificate;
+    use security_framework::trust_settings::{TrustSettings, Domain};
 
-    // Extract just the certificate part (not private key) for system trust
+    info!("Importing certificate to macOS keychain via Security.framework...");
+
+    // Read certificate file
     let combined_pem = tokio::fs::read_to_string(cert_path)
         .await
         .context("Failed to read certificate file")?;
 
-    // Find the certificate part (everything before the private key)
+    // Extract certificate-only part (remove private key if present)
     let cert_only = if let Some(key_start) = combined_pem.find("-----BEGIN PRIVATE KEY-----") {
         &combined_pem[..key_start]
     } else {
         &combined_pem
     };
 
-    // Write certificate-only file to temp location (use PID for uniqueness)
-    let temp_cert =
-        std::env::temp_dir().join(format!("kodegen_mcp_cert_{}.crt", std::process::id()));
-    tokio::fs::write(&temp_cert, cert_only)
-        .await
-        .context("Failed to write temp certificate")?;
+    // Parse PEM to DER format (reusing existing pem crate)
+    let cert_pem_parsed = pem::parse(cert_only)
+        .context("Failed to parse certificate PEM format")?;
 
-    // Import to System keychain (requires elevated privileges)
-    let output = tokio::process::Command::new("security")
-        .args([
-            "add-trusted-cert",
-            "-d", // Add to admin trust settings
-            "-r",
-            "trustRoot", // Trust as root certificate
-            "-k",
-            "/Library/Keychains/System.keychain",
-            temp_cert
-                .to_str()
-                .ok_or_else(|| anyhow::anyhow!("Invalid temp cert path"))?,
-        ])
-        .output()
-        .await
-        .context("Failed to execute security command")?;
-
-    // Clean up temp file
-    let _ = tokio::fs::remove_file(&temp_cert).await;
-
-    if output.status.success() {
-        info!("Successfully imported certificate to macOS System keychain");
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(anyhow::anyhow!(
-            "Failed to import certificate to macOS keychain: {stderr}"
-        ))
+    if cert_pem_parsed.tag() != "CERTIFICATE" {
+        return Err(anyhow::anyhow!("Invalid PEM tag: expected CERTIFICATE, got {}", cert_pem_parsed.tag()));
     }
+
+    let cert_der = cert_pem_parsed.contents();
+
+    // Perform Security.framework operations in blocking task (sync FFI)
+    let cert_der_owned = cert_der.to_vec();
+    tokio::task::spawn_blocking(move || {
+        // Create SecCertificate from DER bytes
+        let certificate = SecCertificate::from_der(&cert_der_owned)
+            .map_err(|e| anyhow::anyhow!("Failed to parse certificate DER: {}", e))?;
+
+        // Import to Admin domain with trust-for-all-purposes
+        // Using Admin domain (not System) because it's for locally-administered certificates
+        // System domain is reserved for Apple's root certificates
+        let trust_settings = TrustSettings::new(Domain::Admin);
+
+        // Verified API from trust_settings.rs:115-139
+        // When trust_settings parameter is null, it means "always trust"
+        trust_settings
+            .set_trust_settings_always(&certificate)
+            .map_err(|e| anyhow::anyhow!("Failed to set trust settings: {} (code: {})", e, e.code()))?;
+
+        info!("✓ Certificate imported to macOS Admin trust domain (accessible system-wide)");
+        Ok(())
+    })
+    .await
+    .context("Task panicked during certificate import")?
 }
 
 /// Import certificate to Linux system trust store
+///
+/// Uses filesystem operations + update-ca-certificates (Debian/Ubuntu) or
+/// update-ca-trust (RHEL/Fedora/Arch). This is the official method as Linux
+/// has no standard certificate management API.
 #[cfg(target_os = "linux")]
 async fn import_certificate_linux(cert_path: &Path) -> Result<()> {
     info!("Importing certificate to Linux system trust store...");
 
-    // Extract just the certificate part (not private key)
+    // Read certificate file
     let combined_pem = tokio::fs::read_to_string(cert_path)
         .await
         .context("Failed to read certificate file")?;
 
+    // Extract certificate-only part (remove private key)
     let cert_only = if let Some(key_start) = combined_pem.find("-----BEGIN PRIVATE KEY-----") {
         &combined_pem[..key_start]
     } else {
         &combined_pem
     };
 
-    // Copy to system CA certificates directory
-    let system_cert_path = "/usr/local/share/ca-certificates/kodegen-mcp.crt";
+    // Validate PEM format before copying to system directory (using existing pem crate)
+    let cert_pem_parsed = pem::parse(cert_only)
+        .context("Failed to parse certificate PEM - file may be corrupted")?;
 
-    // Ensure directory exists
-    tokio::fs::create_dir_all("/usr/local/share/ca-certificates")
+    if cert_pem_parsed.tag() != "CERTIFICATE" {
+        return Err(anyhow::anyhow!(
+            "Invalid certificate format: expected CERTIFICATE block, found {}",
+            cert_pem_parsed.tag()
+        ));
+    }
+
+    // Validate X.509 structure (using existing x509-parser crate)
+    let (_remainder, x509_cert) = x509_parser::parse_x509_certificate(cert_pem_parsed.contents())
+        .map_err(|e| anyhow::anyhow!("Invalid X.509 certificate structure: {}", e))?;
+
+    // Log certificate details for troubleshooting
+    info!("Certificate subject: {}", x509_cert.subject());
+    info!("Certificate issuer: {}", x509_cert.issuer());
+    info!("Certificate valid until: {:?}", x509_cert.validity().not_after);
+
+    // Determine the correct CA update command for this distribution
+    let (ca_dir, ca_update_cmd, ca_update_args) = detect_linux_ca_tool().await?;
+
+    // Construct destination path
+    let dest_path = ca_dir.join("kodegen-mcp.crt");
+
+    // Ensure CA certificates directory exists
+    tokio::fs::create_dir_all(&ca_dir)
         .await
-        .context("Failed to create ca-certificates directory")?;
+        .with_context(|| format!("Failed to create directory: {}", ca_dir.display()))?;
 
-    tokio::fs::write(system_cert_path, cert_only)
+    // Write certificate to CA directory (requires root)
+    tokio::fs::write(&dest_path, cert_only)
         .await
-        .context("Failed to write certificate to system trust store")?;
+        .with_context(|| format!("Failed to write certificate to {}", dest_path.display()))?;
 
-    // Update certificate trust store
-    let output = tokio::process::Command::new("update-ca-certificates")
+    // Set correct permissions (644 = rw-r--r--)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o644);
+        tokio::fs::set_permissions(&dest_path, perms)
+            .await
+            .context("Failed to set certificate permissions to 644")?;
+    }
+
+    info!("Certificate written to: {}", dest_path.display());
+    info!("Running {} to update trust store...", ca_update_cmd);
+
+    // Run distribution-specific CA update command
+    let output = tokio::process::Command::new(ca_update_cmd)
+        .args(ca_update_args)
         .output()
         .await
-        .context("Failed to execute update-ca-certificates")?;
+        .with_context(|| format!("Failed to execute {}", ca_update_cmd))?;
 
     if output.status.success() {
-        info!("Successfully imported certificate to Linux system trust store");
+        info!("✓ Certificate imported to Linux system trust store");
+
+        // Log stdout for debugging
+        if !output.stdout.is_empty() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            info!("CA update output: {}", stdout.trim());
+        }
+
         Ok(())
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
         Err(anyhow::anyhow!(
-            "Failed to update certificate trust store: {stderr}"
+            "{} failed (exit code {}):\nstdout: {}\nstderr: {}",
+            ca_update_cmd,
+            output.status.code().unwrap_or(-1),
+            stdout.trim(),
+            stderr.trim()
         ))
     }
 }
 
-/// Import certificate to Windows certificate store
+/// Detect Linux distribution and return appropriate CA directory and update command
+#[cfg(target_os = "linux")]
+async fn detect_linux_ca_tool() -> Result<(PathBuf, &'static str, Vec<&'static str>)> {
+    use std::path::PathBuf;
+
+    // Debian/Ubuntu: /usr/local/share/ca-certificates + update-ca-certificates
+    if tokio::fs::metadata("/etc/debian_version").await.is_ok() {
+        return Ok((
+            PathBuf::from("/usr/local/share/ca-certificates"),
+            "update-ca-certificates",
+            vec![]  // No additional args
+        ));
+    }
+
+    // RHEL/Fedora/CentOS: /etc/pki/ca-trust/source/anchors + update-ca-trust
+    if tokio::fs::metadata("/etc/redhat-release").await.is_ok()
+        || tokio::fs::metadata("/etc/fedora-release").await.is_ok() {
+        return Ok((
+            PathBuf::from("/etc/pki/ca-trust/source/anchors"),
+            "update-ca-trust",
+            vec![]  // No additional args
+        ));
+    }
+
+    // Arch Linux: /etc/ca-certificates/trust-source/anchors + trust extract-compat
+    if tokio::fs::metadata("/etc/arch-release").await.is_ok() {
+        return Ok((
+            PathBuf::from("/etc/ca-certificates/trust-source/anchors"),
+            "trust",
+            vec!["extract-compat"]  // Arch requires this argument
+        ));
+    }
+
+    // Fallback to Debian/Ubuntu method (most common)
+    warn!("Unknown Linux distribution, using Debian/Ubuntu CA method as fallback");
+    Ok((
+        PathBuf::from("/usr/local/share/ca-certificates"),
+        "update-ca-certificates",
+        vec![]
+    ))
+}
+
+/// Import certificate to Windows Root certificate store using CryptoAPI
 #[cfg(target_os = "windows")]
 async fn import_certificate_windows(cert_path: &Path) -> Result<()> {
-    info!("Importing certificate to Windows certificate store...");
+    use windows::Win32::Security::Cryptography::{
+        CertOpenStore, CertAddEncodedCertificateToStore, CertCloseStore,
+        CERT_STORE_ADD_REPLACE_EXISTING, CERT_STORE_PROV_SYSTEM_W,
+        CERT_SYSTEM_STORE_LOCAL_MACHINE, X509_ASN_ENCODING, PKCS_7_ASN_ENCODING,
+        HCERTSTORE,
+    };
+    use windows::core::{PCWSTR, HSTRING};
 
-    // Extract just the certificate part (not private key)
+    info!("Importing certificate to Windows Root certificate store via CryptoAPI...");
+
+    // Read certificate file
     let combined_pem = tokio::fs::read_to_string(cert_path)
         .await
         .context("Failed to read certificate file")?;
 
+    // Extract certificate-only part (remove private key)
     let cert_only = if let Some(key_start) = combined_pem.find("-----BEGIN PRIVATE KEY-----") {
         &combined_pem[..key_start]
     } else {
         &combined_pem
     };
 
-    // Write certificate-only file to temp location (use PID for uniqueness)
-    let temp_cert =
-        std::env::temp_dir().join(format!("kodegen_mcp_cert_{}.crt", std::process::id()));
-    tokio::fs::write(&temp_cert, cert_only)
-        .await
-        .context("Failed to write temp certificate")?;
+    // Parse PEM and validate structure (using existing pem crate)
+    let cert_pem_parsed = pem::parse(cert_only)
+        .context("Failed to parse certificate PEM format")?;
 
-    // Import to Trusted Root Certification Authorities store
-    let output = tokio::process::Command::new("certutil")
-        .args([
-            "-addstore",
-            "-f",
-            "Root",
-            temp_cert
-                .to_str()
-                .ok_or_else(|| anyhow::anyhow!("Invalid temp cert path"))?,
-        ])
-        .output()
-        .await
-        .context("Failed to execute certutil command")?;
-
-    // Clean up temp file
-    let _ = tokio::fs::remove_file(&temp_cert).await;
-
-    if output.status.success() {
-        info!("Successfully imported certificate to Windows certificate store");
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(anyhow::anyhow!(
-            "Failed to import certificate to Windows store: {stderr}"
-        ))
+    if cert_pem_parsed.tag() != "CERTIFICATE" {
+        return Err(anyhow::anyhow!(
+            "Invalid certificate: expected CERTIFICATE block, found {}",
+            cert_pem_parsed.tag()
+        ));
     }
+
+    let cert_der = cert_pem_parsed.contents().to_vec();
+
+    // Validate X.509 structure before importing (using existing x509-parser crate)
+    let (_remainder, x509_cert) = x509_parser::parse_x509_certificate(&cert_der)
+        .map_err(|e| anyhow::anyhow!("Invalid X.509 certificate: {}", e))?;
+
+    info!("Certificate subject: {}", x509_cert.subject());
+    info!("Certificate issuer: {}", x509_cert.issuer());
+
+    // Perform CryptoAPI operations in blocking task (sync Win32 API)
+    tokio::task::spawn_blocking(move || {
+        unsafe {
+            // Open the Root certificate store for LOCAL_MACHINE
+            // CERT_SYSTEM_STORE_LOCAL_MACHINE = system-wide trust (all users)
+            let store_name = HSTRING::from("Root");
+
+            let store_handle = CertOpenStore(
+                CERT_STORE_PROV_SYSTEM_W,
+                0,  // No encoding flags
+                None,  // No cryptographic provider
+                CERT_SYSTEM_STORE_LOCAL_MACHINE,
+                Some(PCWSTR(store_name.as_ptr())),
+            )
+            .map_err(|e| anyhow::anyhow!(
+                "Failed to open Root certificate store (error: {}). Ensure running with Administrator privileges.",
+                e
+            ))?;
+
+            // Ensure store is always closed (using existing scopeguard crate)
+            let _store_guard = scopeguard::guard(store_handle, |handle| {
+                let _ = CertCloseStore(handle, 0);
+            });
+
+            // Add certificate to Root store
+            // Verified from Microsoft docs: CERT_STORE_ADD_REPLACE_EXISTING
+            // "If a matching certificate exists, it is deleted and a new certificate is created"
+            let result = CertAddEncodedCertificateToStore(
+                store_handle,
+                X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,  // Standard encoding
+                &cert_der,
+                CERT_STORE_ADD_REPLACE_EXISTING,  // Replace if exists
+                None,  // Don't return certificate context
+            );
+
+            match result {
+                Ok(_) => {
+                    info!("✓ Certificate imported to Windows Root certificate store (LOCAL_MACHINE)");
+                    Ok(())
+                }
+                Err(e) => {
+                    Err(anyhow::anyhow!(
+                        "Failed to add certificate to Root store: {}. The certificate may already exist or be invalid.",
+                        e
+                    ))
+                }
+            }
+        }
+    })
+    .await
+    .context("Task panicked during certificate import")?
 }
 
 /// Get certificate directory path with platform-specific logic

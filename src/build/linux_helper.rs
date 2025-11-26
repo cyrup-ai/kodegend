@@ -5,7 +5,6 @@
 
 use std::env;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// Build and sign Linux helper executable
 pub fn build_and_sign_helper() -> Result<(), Box<dyn std::error::Error>> {
@@ -205,30 +204,36 @@ int main(int argc, char *argv[]) {
     let c_path = exe_path.with_extension("c");
     std::fs::write(&c_path, helper_code)?;
 
-    // Compile with gcc (standard Linux compiler)
-    let output = Command::new("gcc")
-        .args(&[
-            "-std=c99",
-            "-D_GNU_SOURCE",
-            "-o",
-            &exe_path.to_string_lossy(),
-            &c_path.to_string_lossy(),
-        ])
-        .output();
-
-    match output {
-        Ok(output) => {
-            if !output.status.success() {
-                return Err(format!(
-                    "Failed to compile Linux helper with GCC: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                )
-                .into());
-            }
-        }
-        Err(_) => {
-            return Err("GCC compiler not found - required for Linux helper compilation".into());
-        }
+    // Compile with cc crate (cross-platform compiler detection)
+    let mut build = cc::Build::new();
+    build.file(&c_path);
+    build.flag("-std=c99");
+    build.define("_GNU_SOURCE", None);
+    
+    // Get the compiler to invoke it manually for full control over output path
+    let compiler = build.try_get_compiler().map_err(|e| {
+        format!("Failed to find C compiler for Linux helper compilation: {}", e)
+    })?;
+    
+    // Build the compile command with explicit output path
+    let mut cmd = compiler.to_command();
+    cmd.arg("-std=c99");
+    cmd.arg("-D_GNU_SOURCE");
+    cmd.arg("-o");
+    cmd.arg(&exe_path);
+    cmd.arg(&c_path);
+    
+    // Execute compilation
+    let output = cmd.output().map_err(|e| {
+        format!("Failed to execute C compiler: {}", e)
+    })?;
+    
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "Failed to compile Linux helper: {}",
+            stderr
+        ).into());
     }
 
     // Clean up temporary C file

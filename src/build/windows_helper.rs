@@ -272,23 +272,48 @@ int main(int argc, char *argv[]) {
     let c_path = exe_path.with_extension("c");
     std::fs::write(&c_path, helper_code)?;
 
-    // Try to compile with available compiler - include required libraries
-    if let Ok(output) = Command::new("cl")
-        .args(&[
-            "/Fe:",
-            &exe_path.to_string_lossy(),
-            &c_path.to_string_lossy(),
-            "kernel32.lib",
-            "psapi.lib",
-            "shlwapi.lib",
-        ])
-        .output()
-    {
-        if !output.status.success() {
-            compile_with_mingw_c(&c_path, exe_path)?;
-        }
+    // Compile with cc crate (cross-platform compiler detection)
+    let mut build = cc::Build::new();
+    build.file(&c_path);
+    
+    // Get the compiler to invoke it manually for full control over output path
+    let compiler = build.try_get_compiler().map_err(|e| {
+        format!("Failed to find C compiler for Windows helper compilation: {}", e)
+    })?;
+    
+    // Build the compile command with explicit output path and Windows libraries
+    let mut cmd = compiler.to_command();
+    
+    // Check if this is MSVC or MinGW and set appropriate flags
+    if compiler.is_like_msvc() {
+        // MSVC compiler flags
+        cmd.arg(format!("/Fe:{}", exe_path.display()));
+        cmd.arg(&c_path);
+        cmd.arg("kernel32.lib");
+        cmd.arg("psapi.lib");
+        cmd.arg("shlwapi.lib");
     } else {
-        compile_with_mingw_c(&c_path, exe_path)?;
+        // MinGW/GCC compiler flags
+        cmd.arg("-std=c99");
+        cmd.arg("-o");
+        cmd.arg(&exe_path);
+        cmd.arg(&c_path);
+        cmd.arg("-lkernel32");
+        cmd.arg("-lpsapi");
+        cmd.arg("-lshlwapi");
+    }
+    
+    // Execute compilation
+    let output = cmd.output().map_err(|e| {
+        format!("Failed to execute C compiler: {}", e)
+    })?;
+    
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "Failed to compile Windows helper: {}",
+            stderr
+        ).into());
     }
 
     // Clean up temporary C file
@@ -297,43 +322,8 @@ int main(int argc, char *argv[]) {
     // Verify the executable was created - FAIL BUILD if not
     if !exe_path.exists() {
         return Err(
-            "Failed to create Windows helper executable - no suitable compiler found".into(),
+            "Failed to create Windows helper executable - compilation failed".into(),
         );
-    }
-
-    Ok(())
-}
-
-/// Compile with MinGW for C code
-fn compile_with_mingw_c(
-    c_path: &PathBuf,
-    exe_path: &PathBuf,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let output = Command::new("gcc")
-        .args(&[
-            "-std=c99",
-            "-o",
-            &exe_path.to_string_lossy(),
-            &c_path.to_string_lossy(),
-            "-lkernel32",
-            "-lpsapi",
-            "-lshlwapi",
-        ])
-        .output();
-
-    match output {
-        Ok(output) => {
-            if !output.status.success() {
-                return Err(format!(
-                    "Failed to compile Windows helper with GCC: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                )
-                .into());
-            }
-        }
-        Err(_) => {
-            return Err("No suitable C compiler found (tried cl.exe and gcc)".into());
-        }
     }
 
     Ok(())

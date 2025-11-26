@@ -16,20 +16,17 @@ use std::path::PathBuf;
 pub async fn stage_binaries_for_install(binary_paths: &[PathBuf]) -> Result<PathBuf> {
     use std::fs;
     
-    // Create staging directory with SECURE, RANDOM name to prevent race conditions
-    // Using PID alone is predictable; add random component
-    let random_suffix = fastrand::u64(..);
-    let staging_dir = std::env::temp_dir()
-        .join(format!("kodegen_install_{}_{:x}", std::process::id(), random_suffix));
-
-    // SECURITY: Use create_dir() instead of create_dir_all() to fail if directory exists
-    // This prevents symlink attacks where attacker pre-creates the directory
-    fs::create_dir(&staging_dir)
-        .with_context(|| format!(
-            "Failed to create staging directory: {}\n\
-             If this directory already exists, it may be a security issue.",
-            staging_dir.display()
-        ))?;
+    // Create staging directory with SECURE, CRYPTOGRAPHICALLY RANDOM name
+    // tempfile::TempDir provides atomic creation with O_EXCL and 128+ bits of entropy
+    use tempfile::Builder;
+    
+    let temp_dir = Builder::new()
+        .prefix("kodegen_install_")
+        .tempdir()
+        .context("Failed to create staging directory")?;
+    
+    // Persist the directory (prevent auto-cleanup) and get the path
+    let staging_dir = temp_dir.into_path();
 
     #[cfg(unix)]
     {

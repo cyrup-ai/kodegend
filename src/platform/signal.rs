@@ -24,20 +24,109 @@ pub enum SignalKind {
     Shutdown,
 }
 
-/// Start platform-specific signal watchers and return channel receiving signals
+/// Cross-platform signal watcher with automatic thread cleanup
+/// 
+/// Spawns a background thread to monitor OS signals and forwards them
+/// to a crossbeam channel. The thread is automatically joined when
+/// the watcher is dropped, providing proper RAII resource management.
+/// 
+/// # Example
+/// ```
+/// let watcher = watch_signals()?;
+/// 
+/// loop {
+///     select! {
+///         recv(watcher.receiver()) -> sig => {
+///             match sig? {
+///                 SignalKind::Terminate => break,
+///                 // ... handle other signals
+///             }
+///         }
+///     }
+/// }
+/// // watcher.drop() automatically joins thread here
+/// ```
+pub struct SignalWatcher {
+    rx: Option<Receiver<SignalKind>>,
+    thread_handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SignalWatcher {
+    /// Get a reference to the signal receiver channel
+    /// 
+    /// Use this with crossbeam's select! macro to receive signals
+    /// in the daemon's main event loop.
+    pub fn receiver(&self) -> &Receiver<SignalKind> {
+        self.rx.as_ref().expect("SignalWatcher receiver already taken")
+    }
+}
+
+impl Drop for SignalWatcher {
+    /// Automatically clean up signal watcher thread on drop
+    /// 
+    /// This runs during:
+    /// - Normal function return
+    /// - Early return (?)  
+    /// - Panic unwinding
+    /// 
+    /// Does NOT run during:
+    /// - SIGKILL (kill -9) - immediate termination
+    /// - Process::abort() - immediate termination
+    /// - std::process::exit() - bypasses destructors
+    fn drop(&mut self) {
+        // Step 1: Drop the receiver, which closes the channel
+        // This signals the thread to exit (it checks tx.send().is_err())
+        if let Some(rx) = self.rx.take() {
+            drop(rx);
+        }
+        
+        // Step 2: Join the thread and wait for it to finish
+        if let Some(handle) = self.thread_handle.take() {
+            match handle.join() {
+                Ok(()) => {
+                    log::info!("Signal watcher thread exited cleanly");
+                }
+                Err(e) => {
+                    // Thread panicked - log but don't panic in Drop
+                    // Following the pattern from daemon.rs PidFile (line 189)
+                    log::error!("Signal watcher thread panicked: {:?}", e);
+                }
+            }
+        }
+    }
+}
+
+/// Start platform-specific signal watchers and return watcher with cleanup
 ///
 /// Spawns background thread that listens for OS signals and forwards them
-/// to the returned channel. Non-blocking.
-pub fn watch_signals() -> Result<Receiver<SignalKind>> {
+/// to the returned channel. The thread is automatically joined when the
+/// SignalWatcher is dropped, providing proper RAII cleanup.
+/// 
+/// # Example
+/// ```
+/// let watcher = watch_signals()?;
+/// 
+/// loop {
+///     select! {
+///         recv(watcher.receiver()) -> sig => {
+///             // Handle signals
+///         }
+///     }
+/// }
+/// ```
+pub fn watch_signals() -> Result<SignalWatcher> {
     let (tx, rx) = bounded::<SignalKind>(16);
     
     #[cfg(unix)]
-    spawn_unix_watcher(tx)?;
+    let handle = spawn_unix_watcher(tx)?;
     
     #[cfg(windows)]
-    spawn_windows_watcher(tx)?;
+    let handle = spawn_windows_watcher(tx)?;
     
-    Ok(rx)
+    Ok(SignalWatcher {
+        rx: Some(rx),
+        thread_handle: Some(handle),
+    })
 }
 
 // ============================================================================
@@ -45,8 +134,8 @@ pub fn watch_signals() -> Result<Receiver<SignalKind>> {
 // ============================================================================
 
 #[cfg(unix)]
-fn spawn_unix_watcher(tx: Sender<SignalKind>) -> Result<()> {
-    thread::Builder::new()
+fn spawn_unix_watcher(tx: Sender<SignalKind>) -> Result<std::thread::JoinHandle<()>> {
+    let handle = thread::Builder::new()
         .name("signal-watcher-unix".to_string())
         .spawn(move || {
             // Create tokio runtime for signal handling
@@ -111,7 +200,7 @@ fn spawn_unix_watcher(tx: Sender<SignalKind>) -> Result<()> {
         })
         .context("Failed to spawn Unix signal watcher thread")?;
     
-    Ok(())
+    Ok(handle)
 }
 
 // ============================================================================
@@ -119,8 +208,8 @@ fn spawn_unix_watcher(tx: Sender<SignalKind>) -> Result<()> {
 // ============================================================================
 
 #[cfg(windows)]
-fn spawn_windows_watcher(tx: Sender<SignalKind>) -> Result<()> {
-    thread::Builder::new()
+fn spawn_windows_watcher(tx: Sender<SignalKind>) -> Result<std::thread::JoinHandle<()>> {
+    let handle = thread::Builder::new()
         .name("signal-watcher-windows".to_string())
         .spawn(move || {
             // Create tokio runtime for signal handling
@@ -198,5 +287,5 @@ fn spawn_windows_watcher(tx: Sender<SignalKind>) -> Result<()> {
         })
         .context("Failed to spawn Windows signal watcher thread")?;
     
-    Ok(())
+    Ok(handle)
 }

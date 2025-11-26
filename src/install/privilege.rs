@@ -5,6 +5,7 @@
 //! to system directories.
 
 use anyhow::{Context, Result};
+use log::info;
 
 // Windows-specific imports for UAC elevation
 #[cfg(windows)]
@@ -119,11 +120,14 @@ fn validate_binary_filename(path: &std::path::Path) -> Result<()> {
         ));
     }
 
-    // Additional check: reject files without extension or with suspicious extensions
-    if !filename.contains('.') || filename.ends_with(".sh") || filename.ends_with(".bash") {
+    // Additional check: reject shell script extensions only
+    // NOTE: Unix executables typically have NO extension (e.g., kodegend, ls, bash)
+    // File extensions are a Windows convention. POSIX systems use permissions (chmod +x).
+    if filename.ends_with(".sh") || filename.ends_with(".bash") {
         return Err(anyhow::anyhow!(
-            "Invalid binary filename: '{}'\n\
-             Expected executable binaries (e.g., kodegend, kodegen), not shell scripts.",
+            "Shell scripts not allowed as binaries: '{}'\n\
+             This restriction prevents command injection via script execution.\n\
+             Compile to a native binary instead.",
             filename
         ));
     }
@@ -136,41 +140,6 @@ fn validate_binary_filename(path: &std::path::Path) -> Result<()> {
 /// # Security
 /// The `escaped_cert_path` parameter MUST be pre-escaped using `shell_escape()`.
 /// This function does NOT perform escaping itself.
-///
-/// # Arguments
-/// * `escaped_cert_path` - Shell-escaped certificate path (output of `shell_escape()`)
-pub fn get_cert_import_command_escaped(escaped_cert_path: &str) -> String {
-    #[cfg(target_os = "macos")]
-    {
-        format!(
-            "security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain {}",
-            escaped_cert_path
-        )
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        // Use a safe static filename instead of parsing escaped string
-        format!(
-            "cp {} /usr/local/share/ca-certificates/kodegen-mcp.crt && update-ca-certificates",
-            escaped_cert_path
-        )
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        format!(
-            "certutil -addstore -f Root {}",
-            escaped_cert_path
-        )
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    {
-        format!("echo 'Certificate import not supported on this platform'")
-    }
-}
-
 /// Execute ONLY the privileged operations using a minimal sudo script (Phase 3)
 ///
 /// This function is called AFTER all unprivileged operations (downloads, extraction, staging)
@@ -308,8 +277,12 @@ if errorlevel 1 (
 
     // Import certificate to system trust store (if provided)
     if let Some(cert_content) = cert_content {
-        script.push_str("\n# Import certificate\n");
-        script.push_str("echo 'Importing certificate...'\n");
+        // Note in script that certificate import happens via native API
+        script.push_str("\n# Certificate import handled by native platform API (not shell command)\n");
+        script.push_str("echo 'Certificate import: native API...'\n");
+
+        // Certificate import happens OUTSIDE the shell script using native APIs
+        // This eliminates shell command injection risk entirely
 
         // Extract certificate-only part (remove private key)
         let cert_only = if let Some(key_start) = cert_content.find("-----BEGIN PRIVATE KEY-----") {
@@ -318,51 +291,60 @@ if errorlevel 1 (
             cert_content
         };
 
-        // Create secure temp file with process ID for uniqueness
+        // Create temp file for certificate (still needed as input to native API)
+        // SECURITY FIX: Use tempfile crate for atomic, unpredictable temp file creation
+        // This prevents TOCTOU attacks where attacker pre-creates files at predicted paths
         #[cfg(windows)]
-        let temp_cert_path = {
+        let (temp_cert_file, temp_cert_path) = {
             use crate::install::installer::windows::paths;
-            paths::temp_cert_path()
+            let temp_cert = paths::temp_cert_file()
+                .context("Failed to create temp certificate file")?;
+            let path = temp_cert.path().to_path_buf();
+            (Some(temp_cert), path)
         };
 
         #[cfg(unix)]
-        let temp_cert_path = std::path::PathBuf::from(format!("/tmp/kodegen_cert_import_{}.crt", std::process::id()));
+        let (temp_cert_file, temp_cert_path) = {
+            use tempfile::Builder;
+            use std::io::Write;
 
-        // Write certificate to secure temp location
-        tokio::fs::write(&temp_cert_path, cert_only)
-            .await
-            .context("Failed to write temp certificate")?;
+            let mut temp_cert = Builder::new()
+                .prefix("kodegen_cert_")
+                .suffix(".crt")
+                .tempfile()
+                .context("Failed to create temp certificate file")?;
 
-        // Set restrictive permissions immediately (owner-only read/write)
-        #[cfg(unix)]
-        {
+            // Write certificate content using synchronous I/O
+            temp_cert.write_all(cert_only.as_bytes())
+                .context("Failed to write certificate content")?;
+            temp_cert.flush()
+                .context("Failed to flush certificate data")?;
+
+            // Set restrictive permissions atomically (owner-only read/write)
             use std::os::unix::fs::PermissionsExt;
-            let mut perms = tokio::fs::metadata(&temp_cert_path)
-                .await
+            let mut perms = temp_cert.as_file().metadata()
                 .context("Failed to get temp cert metadata")?
                 .permissions();
-            perms.set_mode(0o600); // Owner read/write only
-            tokio::fs::set_permissions(&temp_cert_path, perms)
-                .await
+            perms.set_mode(0o600); // rw------- (owner only)
+            temp_cert.as_file().set_permissions(perms)
                 .context("Failed to set temp cert permissions")?;
-        }
 
-        // Add import command to script
-        // Escape certificate path before passing to command builder
-        let escaped_cert_path = shell_escape(&temp_cert_path)?;
-        script.push_str(&get_cert_import_command_escaped(&escaped_cert_path));
-        script.push('\n');
+            let path = temp_cert.path().to_path_buf();
+            (Some(temp_cert), path)
+        };
 
-        // Clean up temp file in script (after import completes)
-        #[cfg(unix)]
-        script.push_str(&format!("rm -f {}\n", escaped_cert_path));
+        // CRITICAL CHANGE: Call native API instead of shell command
+        // This function is in install/installer/config/certificates.rs
+        use crate::install::installer::config::certificates::import_certificate_to_system;
 
-        #[cfg(windows)]
-        {
-            use crate::install::installer::windows::paths;
-            script.push_str(&paths::delete_file_command(&temp_cert_path));
-            script.push_str("\n");
-        }
+        import_certificate_to_system(&temp_cert_path)
+            .await
+            .context("Failed to import certificate via native API")?;
+
+        // Temp file auto-deleted when temp_cert_file drops
+        drop(temp_cert_file);
+
+        info!("✓ Certificate imported successfully via native platform API");
     }
 
     // Install service files (use data_dir for service file location)
@@ -417,38 +399,42 @@ if errorlevel 1 (
     // Execute ONLY this minimal script with sudo
     #[cfg(unix)]
     {
-        // Write script to secure temporary file
-        let script_path = std::env::temp_dir()
-            .join(format!("kodegen_install_script_{}.sh", std::process::id()));
-        
-        // Write script content
-        tokio::fs::write(&script_path, &script)
-            .await
+        // SECURITY FIX: Use tempfile crate for atomic, unpredictable temp file creation
+        // This prevents TOCTOU attacks where attacker pre-creates malicious scripts
+        use tempfile::Builder;
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut script_file = Builder::new()
+            .prefix("kodegen_install_")
+            .suffix(".sh")
+            .tempfile()
+            .context("Failed to create temp script file")?;
+
+        // Write script content using synchronous I/O
+        script_file.write_all(script.as_bytes())
             .context("Failed to write installation script")?;
-        
-        // Set restrictive permissions: owner read/execute only (mode 0700)
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = tokio::fs::metadata(&script_path)
-                .await
-                .context("Failed to get script metadata")?
-                .permissions();
-            perms.set_mode(0o700);  // rwx------ (owner only)
-            tokio::fs::set_permissions(&script_path, perms)
-                .await
-                .context("Failed to set script permissions")?;
-        }
-        
+        script_file.flush()
+            .context("Failed to flush script data")?;
+
+        // Set executable permissions atomically (owner read/execute only)
+        let mut perms = script_file.as_file().metadata()
+            .context("Failed to get script metadata")?
+            .permissions();
+        perms.set_mode(0o700);  // rwx------ (owner only)
+        script_file.as_file().set_permissions(perms)
+            .context("Failed to set script permissions")?;
+
         // Execute script file (NOT via sh -c)
         let status = Command::new("sudo")
             .arg("sh")
-            .arg(&script_path)
+            .arg(script_file.path())
             .status()
             .context("Failed to execute sudo")?;
-        
-        // Cleanup script file (even if execution failed)
-        let _ = tokio::fs::remove_file(&script_path).await;
-        
+
+        // Temp file auto-deleted when script_file drops
+        drop(script_file);
+
         if !status.success() {
             return Err(anyhow::anyhow!(
                 "Privileged installation failed with exit code: {}",

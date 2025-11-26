@@ -33,30 +33,44 @@ pub(super) fn ensure_helper_path() -> Result<(), InstallerError> {
         return Ok(());
     }
 
-    // Create unique helper path in temp directory
-    let temp_dir = std::env::temp_dir();
-    let helper_name = format!("kodegen-helper-{}", std::process::id());
-    let helper_path = temp_dir.join(helper_name);
+    // Create unique helper path in temp directory using tempfile for security
+    use std::io::Write;
+    use tempfile::Builder;
+
+    let mut helper_file = Builder::new()
+        .prefix("kodegen-helper-")
+        .suffix("")
+        .tempfile()
+        .map_err(|e| InstallerError::System(format!("Failed to create temp helper file: {}", e)))?;
 
     // Extract embedded helper executable
-    fs::write(&helper_path, HELPER_BINARY_DATA).map_err(|e| {
-        InstallerError::System(format!("Failed to extract helper executable: {}", e))
-    })?;
+    helper_file
+        .write_all(HELPER_BINARY_DATA)
+        .map_err(|e| InstallerError::System(format!("Failed to write helper executable: {}", e)))?;
+    helper_file
+        .flush()
+        .map_err(|e| InstallerError::System(format!("Failed to flush helper data: {}", e)))?;
 
-    // Make helper executable
+    // Make helper executable with restrictive permissions
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&helper_path)
-            .map_err(|e| {
-                InstallerError::System(format!("Failed to get helper metadata: {}", e))
-            })?
+        let mut perms = helper_file
+            .as_file()
+            .metadata()
+            .map_err(|e| InstallerError::System(format!("Failed to get helper metadata: {}", e)))?
             .permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&helper_path, perms).map_err(|e| {
-            InstallerError::System(format!("Failed to set helper permissions: {}", e))
-        })?;
+        perms.set_mode(0o700);
+        helper_file
+            .as_file()
+            .set_permissions(perms)
+            .map_err(|e| InstallerError::System(format!("Failed to set helper permissions: {}", e)))?;
     }
+
+    // Persist the temp file and get the path
+    let (_file, helper_path) = helper_file
+        .keep()
+        .map_err(|e| InstallerError::System(format!("Failed to persist helper executable: {}", e)))?;
 
     // Verify the helper is properly signed (if signing is available)
     #[cfg(target_os = "macos")]

@@ -79,7 +79,7 @@ pub async fn run_install(cli: &Cli) -> Result<()> {
 
     // Check kodegen binary version
     use super::detection::binary_needs_installation;
-    let needs_kodegen = binary_needs_installation("kodegen");
+    let needs_kodegen = binary_needs_installation("kodegen").await;
 
     // Download binaries that need installation
     let binary_paths = if needs_kodegen {

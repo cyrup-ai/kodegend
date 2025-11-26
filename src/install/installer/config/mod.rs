@@ -4,7 +4,7 @@
 //! installation logic with zero allocation fast paths and blazing-fast performance.
 
 mod toolchain;
-mod certificates;
+pub mod certificates;
 mod services;
 mod hosts;
 mod installer;

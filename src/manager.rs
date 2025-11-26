@@ -372,7 +372,7 @@ impl ServiceManager {
         self.handle_lifecycle_action(action).await;
 
         // Setup cross-platform signal watcher
-        let signal_rx = watch_signals()?;
+        let signal_watcher = watch_signals()?;
         
         let health_tick = tick(Duration::from_secs(30));
         let log_rotate_tick = tick(Duration::from_secs(3600));
@@ -381,7 +381,7 @@ impl ServiceManager {
         loop {
             select! {
                 recv(self.bus_rx) -> evt => self.handle_event(evt?)?,
-                recv(signal_rx) -> sig => {
+                recv(signal_watcher.receiver()) -> sig => {
                     match sig {
                         Ok(SignalKind::Terminate) | Ok(SignalKind::Interrupt) => {
                             info!("Received shutdown signal: {:?}", sig);

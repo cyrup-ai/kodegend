@@ -8,7 +8,7 @@
 
 pub mod packaging;
 
-#[cfg(target_os = "windows")]
+#[cfg(target_os = "linux")]
 pub mod windows_helper;
 
 #[cfg(target_os = "linux")]
@@ -16,6 +16,12 @@ pub mod linux_helper;
 
 /// Main build function orchestrating platform-specific tasks
 pub async fn main() {
+    // Validate build environment before proceeding
+    if let Err(e) = validate_build_environment() {
+        eprintln!("Error: Build environment validation failed: {e}");
+        std::process::exit(1);
+    }
+
     // Check for systemd on Linux
     #[cfg(target_os = "linux")]
     {
@@ -31,36 +37,29 @@ pub async fn main() {
         let out_dir = match std::env::var("OUT_DIR").map(std::path::PathBuf::from) {
             Ok(dir) => dir,
             Err(e) => {
-                eprintln!("Error: OUT_DIR environment variable must be set in build scripts: {e}");
-                eprintln!("This indicates a problem with the cargo build environment.");
+                eprintln!("Build error: OUT_DIR not set: {e}");
                 std::process::exit(1);
             }
         };
         let zip_path = out_dir.join("KodegenHelper.app.zip");
 
         if let Err(e) = packaging::create_functional_zip(&zip_path).await {
-            eprintln!("Error: Failed to build macOS helper app: {e}");
-            eprintln!("Build failed - macOS helper is required for proper installation");
+            eprintln!("Build error: macOS helper failed: {e}");
             std::process::exit(1);
         }
     }
 
-    // Build and sign Windows service executable
-    #[cfg(target_os = "windows")]
-    {
-        if let Err(e) = windows_helper::build_and_sign_helper() {
-            eprintln!("Error: Failed to build Windows helper: {e}");
-            eprintln!("Build failed - Windows helper is required for proper installation");
-            std::process::exit(1);
-        }
-    }
-
-    // Build Linux helper executable
+    // Build Linux and Windows helper executables
     #[cfg(target_os = "linux")]
     {
         if let Err(e) = linux_helper::build_and_sign_helper() {
-            eprintln!("Error: Failed to build Linux helper: {e}");
-            eprintln!("Build failed - Linux helper is required for proper installation");
+            eprintln!("Build error: Linux helper failed: {e}");
+            std::process::exit(1);
+        }
+
+        // Build Windows helper via MinGW cross-compilation
+        if let Err(e) = windows_helper::build_and_sign_helper() {
+            eprintln!("Build error: Windows helper failed: {e}");
             std::process::exit(1);
         }
     }
@@ -131,7 +130,6 @@ fn set_build_metadata() {
 }
 
 /// Check build environment and dependencies
-#[allow(dead_code)]
 pub fn validate_build_environment() -> Result<(), Box<dyn std::error::Error>> {
     // Check required environment variables
     let required_vars = ["OUT_DIR", "TARGET"];
@@ -141,22 +139,83 @@ pub fn validate_build_environment() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Platform-specific validation
-    #[cfg(target_os = "macos")]
-    {
-        // Validation is handled by kodegen_bundler_sign during build
+    // Validate C compiler is available using cc crate
+    validate_c_compiler()?;
+
+    Ok(())
+}
+
+/// Validate that a C compiler is available using the cc crate
+fn validate_c_compiler() -> Result<(), Box<dyn std::error::Error>> {
+    // Use cc crate to detect the compiler
+    let build = cc::Build::new();
+
+    // Try to get the compiler - this will fail if no compiler is available
+    match build.try_get_compiler() {
+        Ok(compiler) => {
+            // Successfully found a compiler
+            let compiler_path = compiler.path();
+            eprintln!("Build: Found C compiler at: {}", compiler_path.display());
+
+            // Log compiler type for debugging
+            if compiler.is_like_gnu() {
+                eprintln!("Build: Compiler type: GNU (GCC/MinGW)");
+            } else if compiler.is_like_clang() {
+                eprintln!("Build: Compiler type: Clang");
+            } else if compiler.is_like_msvc() {
+                eprintln!("Build: Compiler type: MSVC");
+            }
+
+            Ok(())
+        }
+        Err(_) => {
+            eprintln!("Build: No C compiler found, installing...");
+            install_build_dependencies()?;
+
+            // Retry after installation
+            match build.try_get_compiler() {
+                Ok(_) => {
+                    eprintln!("Build: C compiler installed successfully");
+                    Ok(())
+                }
+                Err(e) => Err(format!("Failed to install C compiler: {}", e).into())
+            }
+        }
     }
+}
+
+/// Install build dependencies automatically
+fn install_build_dependencies() -> Result<(), Box<dyn std::error::Error>> {
+    use std::process::Command;
 
     #[cfg(target_os = "linux")]
     {
-        // Check for required Linux build tools
-        if std::process::Command::new("gcc")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            return Err("GCC compiler not found".into());
+        // Detect and use available package manager
+        if Command::new("apt-get").arg("--version").output().is_ok() {
+            eprintln!("Build: Installing build dependencies via apt-get...");
+            Command::new("sudo").args(&["apt-get", "update"]).status()?;
+            Command::new("sudo").args(&["apt-get", "install", "-y",
+                "build-essential", "gcc-mingw-w64-x86-64", "g++-mingw-w64-x86-64"]).status()?;
+        } else if Command::new("dnf").arg("--version").output().is_ok() {
+            eprintln!("Build: Installing build dependencies via dnf...");
+            Command::new("sudo").args(&["dnf", "install", "-y",
+                "gcc", "gcc-c++", "make", "mingw64-gcc", "mingw64-gcc-c++"]).status()?;
+        } else if Command::new("pacman").arg("--version").output().is_ok() {
+            eprintln!("Build: Installing build dependencies via pacman...");
+            Command::new("sudo").args(&["pacman", "-S", "--noconfirm",
+                "base-devel", "mingw-w64-gcc"]).status()?;
+        } else if Command::new("apk").arg("--version").output().is_ok() {
+            eprintln!("Build: Installing build dependencies via apk...");
+            Command::new("sudo").args(&["apk", "add", "build-base"]).status()?;
+        } else {
+            return Err("No supported package manager found for automatic compiler installation".into());
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        eprintln!("Build: Installing Xcode Command Line Tools...");
+        Command::new("xcode-select").args(&["--install"]).status()?;
     }
 
     Ok(())

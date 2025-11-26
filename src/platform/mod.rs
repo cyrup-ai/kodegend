@@ -130,4 +130,4 @@ pub fn log_dir(is_elevated: bool) -> PathBuf {
 
 // Signal handling abstraction
 pub mod signal;
-pub use signal::{SignalKind, watch_signals};
+pub use signal::{SignalKind, SignalWatcher, watch_signals};
