@@ -263,11 +263,16 @@ pub async fn install_with_elevated_privileges(
     // Update hosts file (idempotent)
     #[cfg(unix)]
     {
-        script.push_str("\n# Update /etc/hosts\n");
-        script.push_str("echo 'Updating /etc/hosts...'\n");
-        script.push_str("if ! grep -q '127.0.0.1 mcp.kodegen.ai' /etc/hosts 2>/dev/null; then\n");
-        script.push_str("    echo '127.0.0.1 mcp.kodegen.ai' >> /etc/hosts\n");
-        script.push_str("fi\n");
+        // Check if hosts entry exists BEFORE escalating privileges
+        // (Anyone can READ /etc/hosts, only root can WRITE)
+        if !crate::install::hosts::hosts_entry_exists() {
+            script.push_str("\n# Update /etc/hosts (pre-checked, entry missing)\n");
+            script.push_str("echo 'Updating /etc/hosts...'\n");
+            script.push_str("echo '127.0.0.1 mcp.kodegen.ai' >> /etc/hosts\n");
+        } else {
+            log::debug!("Hosts entry already exists, skipping privileged operation");
+            // Don't add any script lines - no modification needed
+        }
     }
 
     // Update hosts file (idempotent)
@@ -623,3 +628,283 @@ async fn register_windows_service(binary_path: &std::path::Path) -> Result<()> {
 
     Ok(())
 }
+
+// ============================================================================
+// PRIVILEGED EXECUTOR - Type-safe sudo command execution
+// ============================================================================
+//
+// Architecture inspired by sudo-rs (https://github.com/trifectatechfoundation/sudo-rs)
+// Key patterns:
+// - Use Command::output() for proper exit status checking
+// - No persistent shell subprocess (each command is independent)
+// - Validate credentials once with `sudo -v`
+// ============================================================================
+
+use std::path::Path;
+use std::process::Stdio;
+use tokio::io::AsyncWriteExt;
+use tokio::process::Command;
+
+/// Privileged command executor with proper exit status handling.
+///
+/// # Architecture
+///
+/// Unlike the old approach (persistent `sudo sh` with stdin pipe), this executor:
+/// 1. Validates sudo credentials ONCE with `sudo -v` (prompts for password)
+/// 2. Each operation spawns a fresh `sudo <command>` process
+/// 3. Uses `Command::output()` to wait for completion and check exit status
+/// 4. No shell wrapper, no marker protocols, no race conditions
+///
+/// # Usage
+///
+/// ```rust
+/// let executor = PrivilegedExecutor::spawn().await?; // Single password prompt
+/// executor.exec(&["sh", "-c", "echo '127.0.0.1 host' >> /etc/hosts"]).await?;
+/// executor.write_file(&cert_path, &cert_content).await?;
+/// // No close() needed - each command is independent
+/// ```
+#[cfg(unix)]
+pub struct PrivilegedExecutor {
+    /// Whether to use sudo for commands (false if already root)
+    use_sudo: bool,
+}
+
+#[cfg(unix)]
+impl PrivilegedExecutor {
+    /// Autodetect privilege state and spawn executor.
+    ///
+    /// Three-step detection:
+    /// 1. Already root (geteuid == 0)? → No sudo needed
+    /// 2. Sudo credentials cached? → Use sudo without prompt
+    /// 3. Neither? → Prompt once with sudo -v
+    ///
+    /// This ensures:
+    /// - Daemon mode (launchd/systemd as root): no prompts, silent operation
+    /// - User with cached creds: no prompts
+    /// - User without creds: exactly one prompt
+    pub async fn spawn() -> Result<Self> {
+        // Step 1: Already root? (daemon mode via launchd/systemd)
+        if nix::unistd::geteuid().is_root() {
+            log::info!("Already running as root, no sudo needed");
+            return Ok(Self { use_sudo: false });
+        }
+
+        // Step 2: Sudo credentials already cached?
+        let cached = Command::new("sudo")
+            .args(["-n", "true"]) // non-interactive check
+            .output()
+            .await
+            .context("Failed to check sudo cache")?;
+
+        if cached.status.success() {
+            log::info!("Sudo credentials cached, no prompt needed");
+            return Ok(Self { use_sudo: true });
+        }
+
+        // Step 3: Need to prompt for credentials (once only)
+        log::info!("Requesting sudo credentials...");
+        let status = Command::new("sudo")
+            .arg("-v")
+            .status()
+            .await
+            .context("Failed to execute sudo -v")?;
+
+        if !status.success() {
+            anyhow::bail!("Sudo authentication failed");
+        }
+
+        log::info!("Sudo credentials validated successfully");
+        Ok(Self { use_sudo: true })
+    }
+
+    /// Execute a command with root privileges.
+    ///
+    /// If already root, runs command directly.
+    /// If using sudo, uses `sudo -n` (non-interactive) to prevent re-prompting.
+    ///
+    /// # Arguments
+    /// * `args` - Command arguments (e.g., `["mkdir", "-p", "/usr/local/bin"]`)
+    pub async fn exec(&self, args: &[&str]) -> Result<()> {
+        if args.is_empty() {
+            anyhow::bail!("exec() called with empty args");
+        }
+
+        log::debug!(
+            "Executing privileged command: {}{}",
+            if self.use_sudo { "sudo -n " } else { "" },
+            args.join(" ")
+        );
+
+        let output = if self.use_sudo {
+            // Use sudo -n (non-interactive) - fails instead of prompting
+            Command::new("sudo")
+                .arg("-n")
+                .args(args)
+                .output()
+                .await
+                .context("Failed to execute sudo command")?
+        } else {
+            // Already root - run directly
+            Command::new(args[0])
+                .args(&args[1..])
+                .output()
+                .await
+                .with_context(|| format!("Failed to execute {}", args[0]))?
+        };
+
+        if output.status.success() {
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // Check for sudo credential expiry
+            if stderr.contains("password is required")
+                || (stderr.contains("sudo:") && stderr.contains("a password is required"))
+            {
+                anyhow::bail!("Sudo credentials expired - please re-run the operation");
+            }
+            if let Some(code) = output.status.code() {
+                anyhow::bail!(
+                    "Command {:?} failed (exit {}): {}",
+                    args,
+                    code,
+                    stderr.trim()
+                );
+            } else {
+                anyhow::bail!("Command {:?} terminated by signal", args);
+            }
+        }
+    }
+
+    /// Write content to a file with root privileges.
+    ///
+    /// If already root, writes directly via tokio::fs.
+    /// If using sudo, writes via `sudo -n tee`.
+    ///
+    /// Creates parent directories if needed.
+    pub async fn write_file(&self, path: &Path, content: &str) -> Result<()> {
+        // Create parent directory first
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            self.exec(&["mkdir", "-p", &parent.to_string_lossy()])
+                .await?;
+        }
+
+        if self.use_sudo {
+            // Write via sudo -n tee (stdin -> file)
+            let mut child = Command::new("sudo")
+                .args(["-n", "tee", &path.to_string_lossy()])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null()) // tee echoes to stdout, suppress it
+                .stderr(Stdio::piped())
+                .spawn()
+                .context("Failed to spawn sudo tee")?;
+
+            // Write content to stdin
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin
+                    .write_all(content.as_bytes())
+                    .await
+                    .context("Failed to write to tee stdin")?;
+                // stdin is dropped here, closing the pipe
+            }
+
+            // Wait for completion and check status
+            let output = child
+                .wait_with_output()
+                .await
+                .context("Failed to wait for tee")?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if stderr.contains("password is required") {
+                    anyhow::bail!("Sudo credentials expired - please re-run the operation");
+                }
+                anyhow::bail!("Failed to write {}: {}", path.display(), stderr.trim());
+            }
+        } else {
+            // Already root - write directly
+            tokio::fs::write(path, content)
+                .await
+                .with_context(|| format!("Failed to write {}", path.display()))?;
+        }
+
+        Ok(())
+    }
+
+    /// Copy a file to a privileged location
+    pub async fn copy_file(&self, src: &Path, dst: &Path) -> Result<()> {
+        self.exec(&["cp", "-f", &src.to_string_lossy(), &dst.to_string_lossy()])
+            .await
+    }
+
+    /// Set file permissions
+    pub async fn chmod(&self, path: &Path, mode: &str) -> Result<()> {
+        self.exec(&["chmod", mode, &path.to_string_lossy()]).await
+    }
+
+    /// Append content to a file with root privileges
+    ///
+    /// Uses `sudo tee -a` (append mode) to add content to an existing file.
+    /// Creates the file if it doesn't exist.
+    pub async fn append_to_file(&self, path: &Path, content: &str) -> Result<()> {
+        // Create parent directory if needed
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            self.exec(&["mkdir", "-p", &parent.to_string_lossy()])
+                .await?;
+        }
+
+        if self.use_sudo {
+            // Append via sudo -n tee -a (append mode)
+            let mut child = Command::new("sudo")
+                .args(["-n", "tee", "-a", &path.to_string_lossy()])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null()) // Suppress tee echo
+                .stderr(Stdio::piped())
+                .spawn()
+                .context("Failed to spawn sudo tee -a")?;
+
+            // Write content to stdin
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin
+                    .write_all(content.as_bytes())
+                    .await
+                    .context("Failed to write to tee stdin")?;
+                // stdin dropped here, closing pipe
+            }
+
+            // Wait for completion
+            let output = child
+                .wait_with_output()
+                .await
+                .context("Failed to wait for tee")?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                // Check for sudo credential expiry
+                if stderr.contains("password is required") {
+                    anyhow::bail!("Sudo credentials expired - please re-run the operation");
+                }
+                anyhow::bail!("Failed to append to {}: {}", path.display(), stderr.trim());
+            }
+        } else {
+            // Already root - append directly
+            use tokio::fs::OpenOptions;
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .await
+                .with_context(|| format!("Failed to open {} for append", path.display()))?;
+
+            file.write_all(content.as_bytes())
+                .await
+                .with_context(|| format!("Failed to append to {}", path.display()))?;
+        }
+
+        Ok(())
+    }
+}
+

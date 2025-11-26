@@ -7,9 +7,11 @@ mod binaries;
 mod binary_staging;
 mod chromium;
 mod cli;
+mod component_fixers;
 mod download;
 #[cfg(feature = "gui")]
 mod gui;
+mod hosts;
 mod installer;
 mod orchestration;
 mod privilege;
@@ -20,9 +22,27 @@ mod wizard;
 mod detection;
 mod environment;
 
-// Public exports
+// Public exports - Legacy
 pub use detection::{InstallationState, check_installation_state};
 pub use environment::{is_cli_environment, is_desktop_environment};
+
+// Public exports - Granular component system
+pub use detection::{
+    ComponentStatus,
+    ComponentStatusReport,
+    ComponentFixResult,
+    InstallationFixReport,
+    check_all_components,
+    check_hosts_status,
+    check_certificates_status,
+    check_kodegen_version_status,
+};
+pub use component_fixers::{
+    fix_hosts,
+    fix_certificates,
+    fix_kodegen_version,
+    fix_all_components,
+};
 
 // Re-export installer types and modules for internal use
 pub use installer::{InstallerBuilder, InstallerError};
@@ -31,59 +51,74 @@ pub(crate) use installer::{core, config, uninstall};
 use anyhow::Result;
 use cli::Cli;
 
-/// Ensure Kodegen is fully installed, running installation if needed
+/// Ensure Kodegen is fully installed with GRANULAR component checks
 ///
 /// This is the main entry point for kodegend to call during startup.
-/// Detects installation state and runs appropriate installation mode.
+/// Checks each component individually and fixes only those that need action.
 ///
-/// # Behavior
-/// - `NotInstalled` → run full installation
-/// - `PartiallyInstalled` → run full installation (repair mode)
-/// - `FullyInstalled` → return immediately (no-op)
+/// # Behavior (NEW - Granular)
+/// - Checks each component independently: hosts, certificates, kodegen version
+/// - Fixes only components that need action
+/// - Uses fail-fast behavior: stops on first component failure
+/// - Uses SEPARATE sudo operations for each privileged component
 ///
-/// # Environment Detection
-/// - Desktop environment (DISPLAY set, not SSH) → GUI installer (if feature enabled)
-/// - CLI environment (SSH, no DISPLAY, TTY) → non-interactive CLI installer
+/// # Components Checked
+/// 1. Hosts entry (127.0.0.1 mcp.kodegen.ai in /etc/hosts)
+/// 2. Certificates (valid TLS cert in config_dir/kodegen/certs/)
+/// 3. Kodegen version (binary in /usr/local/bin matches crates.io version)
 ///
 /// # Returns
-/// - `Ok(())` if installation verified or completed successfully
-/// - `Err(e)` if installation fails
+/// - `Ok(())` if all components verified or fixed successfully
+/// - `Err(e)` if any component fix fails (fail-fast)
 pub async fn ensure_installed() -> Result<()> {
-    let state = check_installation_state();
-    
-    match state {
-        InstallationState::FullyInstalled => {
-            log::info!("Installation verified - all components present");
-            Ok(())
+    let report = ensure_installed_granular().await?;
+
+    if report.overall_success {
+        Ok(())
+    } else {
+        // Find first failure and return that error
+        if let Some(ref result) = report.hosts
+            && !result.success
+        {
+            return Err(anyhow::anyhow!(
+                "Hosts fix failed: {}",
+                result.error.as_deref().unwrap_or("unknown error")
+            ));
         }
-        InstallationState::NotInstalled | InstallationState::PartiallyInstalled => {
-            log::info!("Installation required: {:?}", state);
-            run_installation().await
+        if let Some(ref result) = report.certificates
+            && !result.success
+        {
+            return Err(anyhow::anyhow!(
+                "Certificate fix failed: {}",
+                result.error.as_deref().unwrap_or("unknown error")
+            ));
         }
+        if let Some(ref result) = report.kodegen_version
+            && !result.success
+        {
+            return Err(anyhow::anyhow!(
+                "Kodegen version fix failed: {}",
+                result.error.as_deref().unwrap_or("unknown error")
+            ));
+        }
+        Err(anyhow::anyhow!("Installation failed"))
     }
 }
 
-/// Run installation with auto-detected environment
+/// Granular installation with detailed reporting
 ///
-/// Internal function called by ensure_installed() when installation is needed.
-async fn run_installation() -> Result<()> {
-    let cli = Cli::default_non_interactive();
-    
-    if is_desktop_environment() {
-        #[cfg(feature = "gui")]
-        {
-            log::info!("Desktop environment detected, using GUI installer");
-            runners::run_gui_mode(&cli).await
-        }
-        #[cfg(not(feature = "gui"))]
-        {
-            log::warn!("Desktop environment detected but GUI feature not enabled, using CLI");
-            runners::run_install(&cli).await
-        }
-    } else {
-        log::info!("CLI environment detected, using non-interactive installer");
-        runners::run_install(&cli).await
-    }
+/// Checks each component individually and returns a detailed report
+/// of what was checked and fixed.
+///
+/// # Fail-Fast Behavior
+/// Components are checked and fixed in order:
+/// 1. Hosts entry
+/// 2. Certificates
+/// 3. Kodegen version
+///
+/// If any component fix fails, the function returns immediately with the report.
+pub async fn ensure_installed_granular() -> Result<InstallationFixReport> {
+    fix_all_components().await
 }
 
 /// Public API for manual installation (used by main.rs binary)

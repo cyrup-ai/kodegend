@@ -77,6 +77,12 @@ shlex = "1.3"  # POSIX shell escaping (MUST be >= 1.2.1 to avoid RUSTSEC-2024-00
 # Archive extraction (for installer binary downloads)
 zip = { version = "6", default-features = false, features = ["deflate"] }
 tar = "0.4"
+ar = "0.9"              # Pure Rust ar archive extraction (for .deb)
+rpm = "0.14"            # RPM package parsing
+cpio = "0.4"            # CPIO archive extraction (RPM payload)
+xz2 = "0.1"             # Xz/LZMA decompression (RPM)
+bzip2 = "0.4"           # Bzip2 decompression (RPM)
+zstd = "0.13"           # Zstd decompression (RPM)
 
 # Interactive installer wizard UI
 inquire = "0.9"
@@ -103,7 +109,7 @@ tokio = { version = "1", features = [
 axum = { version = "0.8" }
 tower = { version = "0.5" }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 regex = { version = "1" }
 url = { version = "2" }
 uuid = { version = "1", features = ["v4"] }
@@ -188,6 +194,7 @@ windows = { version = "0.62", features = [
 
 [target.'cfg(target_os = "macos")'.dependencies]
 plist = "1"
+core-graphics2 = { version = "0.4.1", default-features = false, features = ["display", "link"] }
 zip = { version = "6", default-features = false, features = [
   "aes-crypto",
   "bzip2",
@@ -196,6 +203,8 @@ zip = { version = "6", default-features = false, features = [
   "time",
   "zstd",
 ] }
+apple-dmg = "0.5"       # Pure Rust DMG reading
+fatfs = "0.3"           # FAT32 filesystem parsing
 
 [build-dependencies]
 pkg-config = "0.3"

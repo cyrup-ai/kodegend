@@ -1,10 +1,10 @@
 //! Package extraction for different platform formats
 //!
 //! Handles extracting binaries from .deb, .rpm, .dmg, and .zip packages.
+//! Uses pure Rust implementations (no external command-line tools required).
 
 use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use tar::Archive;
 use flate2::read::GzDecoder;
 use super::platform::Platform;
@@ -17,17 +17,39 @@ pub async fn extract_from_deb(
 ) -> Result<PathBuf> {
     let temp_dir = tempfile::tempdir()?;
 
-    // Step 1: Extract ar archive using 'ar' command (async)
-    let output = tokio::process::Command::new("ar")
-        .arg("x")
-        .arg(deb_path)
-        .current_dir(temp_dir.path())
-        .output()
-        .await?;
+    // Step 1: Extract ar archive using pure Rust ar crate (wrapped in spawn_blocking)
+    let temp_dir_path = temp_dir.path().to_path_buf();
+    let deb_path_clone = deb_path.to_path_buf();
 
-    if !output.status.success() {
-        return Err(anyhow!("Failed to extract .deb archive: {:?}", output));
-    }
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        use ar::Archive;
+
+        let ar_file = std::fs::File::open(&deb_path_clone)
+            .context("Failed to open .deb file")?;
+
+        let mut archive = Archive::new(ar_file);
+
+        // Extract all entries from the ar archive
+        while let Some(entry_result) = archive.next_entry() {
+            let mut entry = entry_result
+                .context("Failed to read ar archive entry")?;
+
+            let identifier = entry.header().identifier();
+            let entry_name = std::str::from_utf8(identifier)
+                .context("Invalid UTF-8 in ar entry name")?
+                .to_string();
+
+            let entry_path = temp_dir_path.join(&entry_name);
+
+            let mut output_file = std::fs::File::create(&entry_path)
+                .context(format!("Failed to create {}", entry_path.display()))?;
+
+            std::io::copy(&mut entry, &mut output_file)
+                .context(format!("Failed to extract {}", entry_name))?;
+        }
+
+        Ok(())
+    }).await??;
 
     // Step 2: Extract data.tar.gz
     let data_tar_gz = temp_dir.path().join("data.tar.gz");
@@ -73,105 +95,125 @@ pub async fn extract_from_rpm(
     let extract_dir = temp_dir.path().join("extracted");
     tokio::fs::create_dir_all(&extract_dir).await?;
 
-    // Use rpm2cpio to convert RPM to cpio, then extract with cpio (async with manual piping)
-    let mut rpm2cpio = tokio::process::Command::new("rpm2cpio")
-        .arg(rpm_path)
-        .stdout(std::process::Stdio::piped())
-        .spawn()?;
+    // Extract RPM using pure Rust: rpm crate for metadata + manual CPIO extraction
+    let rpm_path_clone = rpm_path.to_path_buf();
+    let binary_name_clone = binary_name.to_string();
+    let extract_dir_clone = extract_dir.clone();
 
-    let mut cpio = tokio::process::Command::new("cpio")
-        .arg("-idm")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .current_dir(&extract_dir)
-        .spawn()?;
+    tokio::task::spawn_blocking(move || -> Result<PathBuf> {
+        use rpm::{Package, CompressionType};
+        use flate2::read::GzDecoder;
+        use std::io::{BufReader, Seek, SeekFrom};
 
-    // Manually pipe rpm2cpio stdout to cpio stdin
-    let mut rpm2cpio_stdout = rpm2cpio.stdout.take()
-        .ok_or_else(|| anyhow!("Failed to capture rpm2cpio stdout"))?;
-    let mut cpio_stdin = cpio.stdin.take()
-        .ok_or_else(|| anyhow!("Failed to capture cpio stdin"))?;
+        // Step 1: Open RPM package
+        let package = Package::open(&rpm_path_clone)
+            .context("Failed to open RPM package")?;
 
-    // Spawn task to copy data between processes
-    tokio::spawn(async move {
-        let _ = tokio::io::copy(&mut rpm2cpio_stdout, &mut cpio_stdin).await;
-    });
+        // Step 2: Get payload offset and compression type
+        let offsets = package.metadata.get_package_segment_offsets();
+        let compressor = package.metadata.get_payload_compressor()
+            .context("Failed to determine payload compression")?;
 
-    // Wait for both processes to complete
-    let rpm2cpio_status = rpm2cpio.wait().await?;
-    let cpio_status = cpio.wait().await?;
+        // Step 3: Seek to payload offset
+        let mut rpm_file = std::fs::File::open(&rpm_path_clone)?;
+        rpm_file.seek(SeekFrom::Start(offsets.payload))?;
 
-    if !rpm2cpio_status.success() || !cpio_status.success() {
-        return Err(anyhow!("Failed to extract .rpm package"));
-    }
+        // Step 4: Decompress based on compression type
+        let decompressed_cpio = match compressor {
+            CompressionType::Gzip => {
+                let mut decoder = GzDecoder::new(BufReader::new(rpm_file));
+                let mut buf = Vec::new();
+                std::io::copy(&mut decoder, &mut buf)
+                    .context("Failed to decompress gzip payload")?;
+                buf
+            }
+            CompressionType::Zstd => {
+                use zstd::stream::read::Decoder as ZstdDecoder;
+                let mut decoder = ZstdDecoder::new(BufReader::new(rpm_file))?;
+                let mut buf = Vec::new();
+                std::io::copy(&mut decoder, &mut buf)
+                    .context("Failed to decompress zstd payload")?;
+                buf
+            }
+            CompressionType::Xz => {
+                use xz2::read::XzDecoder;
+                let mut decoder = XzDecoder::new(BufReader::new(rpm_file));
+                let mut buf = Vec::new();
+                std::io::copy(&mut decoder, &mut buf)
+                    .context("Failed to decompress xz payload")?;
+                buf
+            }
+            CompressionType::Bzip2 => {
+                use bzip2::read::BzDecoder;
+                let mut decoder = BzDecoder::new(BufReader::new(rpm_file));
+                let mut buf = Vec::new();
+                std::io::copy(&mut decoder, &mut buf)
+                    .context("Failed to decompress bzip2 payload")?;
+                buf
+            }
+            CompressionType::None => {
+                let mut buf = Vec::new();
+                std::io::copy(&mut rpm_file, &mut buf)
+                    .context("Failed to read uncompressed payload")?;
+                buf
+            }
+        };
 
-    // Binary should be at usr/bin/{binary_name}
-    let binary_path = extract_dir.join("usr/bin").join(binary_name);
+        // Step 5: Extract files from CPIO archive using cpio crate
+        // Pattern verified from cpio-rs/examples/extractcpio.rs and cpio-rs/src/newc.rs
+        use std::io::Cursor;
+        let mut cpio_reader = Cursor::new(decompressed_cpio);
 
-    if !tokio::fs::try_exists(&binary_path).await? {
-        return Err(anyhow!("Binary {} not found at usr/bin/ in .rpm package", binary_name));
-    }
+        loop {
+            let reader = match cpio::NewcReader::new(cpio_reader) {
+                Ok(r) => r,
+                Err(_) => break, // End of archive
+            };
 
-    // Copy to persistent output directory
-    let final_path = output_dir.join(binary_name);
-    tokio::fs::copy(&binary_path, &final_path).await?;
+            if reader.entry().is_trailer() {
+                break;
+            }
 
-    Ok(final_path)
-}
+            let entry_name = reader.entry().name();
+            let file_size = reader.entry().file_size();
 
-/// RAII wrapper for macOS DMG mount point
-///
-/// Ensures DMG is automatically unmounted when dropped, even on error/panic.
-/// Follows the same pattern as ScManagerHandle in src/install/windows.rs
-#[cfg(target_os = "macos")]
-struct DmgMount {
-    mount_point: PathBuf,
-}
+            // Build output path (remove leading ./)
+            let rel_path = entry_name.trim_start_matches("./");
+            let output_path = extract_dir_clone.join(rel_path);
 
-#[cfg(target_os = "macos")]
-impl DmgMount {
-    /// Mount a DMG file at the specified mount point (async)
-    async fn mount(dmg_path: &Path, mount_point: PathBuf) -> Result<Self> {
-        tokio::fs::create_dir_all(&mount_point).await?;
+            // Create parent directories
+            if let Some(parent) = output_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
 
-        let mount = tokio::process::Command::new("hdiutil")
-            .args(["attach", "-mountpoint"])
-            .arg(&mount_point)
-            .arg(dmg_path)
-            .arg("-nobrowse")
-            .arg("-quiet")
-            .output()
-            .await?;
+            // Extract file content (skip directories and zero-length files)
+            if file_size > 0 {
+                let mut output_file = std::fs::File::create(&output_path)
+                    .context(format!("Failed to create {}", output_path.display()))?;
 
-        if !mount.status.success() {
-            return Err(anyhow!("Failed to mount .dmg: {:?}", mount));
+                cpio_reader = reader.to_writer(output_file)
+                    .context(format!("Failed to extract {}", entry_name))?;
+            } else {
+                cpio_reader = reader.finish()
+                    .context("Failed to skip CPIO entry")?;
+            }
         }
 
-        Ok(Self { mount_point })
-    }
+        // Step 6: Return path to extracted binary
+        let binary_path = extract_dir_clone.join("usr/bin").join(&binary_name_clone);
 
-    /// Get the mount point path
-    #[inline]
-    fn path(&self) -> &Path {
-        &self.mount_point
-    }
+        if !binary_path.exists() {
+            return Err(anyhow!(
+                "Binary {} not found at usr/bin/ in RPM package",
+                binary_name_clone
+            ));
+        }
+
+        Ok(binary_path)
+    }).await?
 }
 
-#[cfg(target_os = "macos")]
-impl Drop for DmgMount {
-    fn drop(&mut self) {
-        // Always try to unmount with -force flag
-        // Ignore errors since we're in cleanup (best effort)
-        let _ = Command::new("hdiutil")
-            .args(["detach"])
-            .arg(&self.mount_point)
-            .arg("-force")  // Force unmount even if busy
-            .output();
-    }
-}
-
-/// Extract binary from macOS .dmg (requires hdiutil on macOS)
+/// Extract binary from macOS .dmg (pure Rust implementation)
 #[allow(unused_variables)]
 pub async fn extract_from_dmg(
     dmg_path: &Path,
@@ -185,54 +227,91 @@ pub async fn extract_from_dmg(
 
     #[cfg(target_os = "macos")]
     {
-        let temp_dir = tempfile::tempdir()?;
-        let mount_point = temp_dir.path().join("mount");
+        use apple_dmg::DmgReader;
+        use fatfs::{FileSystem, FsOptions};
+        use std::io::Cursor;
 
-        // Mount DMG with RAII guard - auto-unmounts on ANY exit (async)
-        let dmg_mount = DmgMount::mount(dmg_path, mount_point).await?;
+        let dmg_path_clone = dmg_path.to_path_buf();
+        let binary_name_clone = binary_name.to_string();
+        let output_dir_clone = output_dir.to_path_buf();
 
-        // Find .app bundle
-        let app_bundle = dmg_mount.path().join(format!("{}.app", binary_name));
-        let app_bundle = if tokio::fs::try_exists(&app_bundle).await? {
-            app_bundle
-        } else {
-            // Try without exact name match (async)
-            let mut entries = tokio::fs::read_dir(dmg_mount.path()).await?;
-            let mut app_bundle = None;
+        tokio::task::spawn_blocking(move || -> Result<PathBuf> {
+            // Step 1: Open DMG file
+            let mut dmg = DmgReader::open(&dmg_path_clone)
+                .context("Failed to open DMG file")?;
 
-            while let Some(entry) = entries.next_entry().await? {
-                if entry.path().extension().and_then(|s| s.to_str()) == Some("app") {
-                    app_bundle = Some(entry.path());
+            // Step 2: Extract FAT32 partition (usually partition index 1)
+            // Partition 0 is MBR, Partition 1 is the actual filesystem
+            let partition_count = dmg.plist().partitions().len();
+
+            if partition_count < 2 {
+                return Err(anyhow!("DMG does not contain expected partitions"));
+            }
+
+            let fat32_data = dmg.partition_data(1)
+                .context("Failed to extract FAT32 partition from DMG")?;
+
+            // Step 3: Mount FAT32 filesystem in-memory
+            let fs = FileSystem::new(
+                Cursor::new(fat32_data),
+                FsOptions::new()
+            ).context("Failed to parse FAT32 filesystem")?;
+
+            // Step 4: Find .app bundle in root directory
+            let root = fs.root_dir();
+            let mut app_entry = None;
+
+            for entry_result in root.iter() {
+                let entry = entry_result
+                    .context("Failed to read FAT32 directory entry")?;
+
+                let name = entry.file_name();
+                if name.ends_with(".app") || name.ends_with(".APP") {
+                    app_entry = Some(name);
                     break;
                 }
             }
 
-            if let Some(app_path) = app_bundle {
-                app_path
-            } else {
-                // No manual cleanup needed - Drop handles it
-                return Err(anyhow!("No .app bundle found in .dmg"));
+            let app_name = app_entry
+                .ok_or_else(|| anyhow!("No .app bundle found in DMG"))?;
+
+            // Step 5: Navigate to .app/Contents/MacOS/{binary_name}
+            let app_dir = root.open_dir(&app_name)
+                .context(format!("Failed to open {}", app_name))?;
+
+            let contents_dir = app_dir.open_dir("Contents")
+                .context("Failed to open Contents directory in .app bundle")?;
+
+            let macos_dir = contents_dir.open_dir("MacOS")
+                .context("Failed to open MacOS directory")?;
+
+            // Step 6: Extract binary file
+            let mut binary_file = macos_dir.open_file(&binary_name_clone)
+                .context(format!(
+                    "Binary {} not found in {}/Contents/MacOS",
+                    binary_name_clone, app_name
+                ))?;
+
+            // Step 7: Copy to output directory
+            let final_path = output_dir_clone.join(&binary_name_clone);
+            let mut output_file = std::fs::File::create(&final_path)
+                .context("Failed to create output file")?;
+
+            std::io::copy(&mut binary_file, &mut output_file)
+                .context("Failed to copy binary from DMG")?;
+
+            // Step 8: Set executable permissions on Unix
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(
+                    &final_path,
+                    std::fs::Permissions::from_mode(0o755)
+                )?;
             }
-        };
 
-        // Binary is at .app/Contents/MacOS/{binary_name}
-        let binary_path = app_bundle.join("Contents/MacOS").join(binary_name);
-
-        if !tokio::fs::try_exists(&binary_path).await? {
-            // No manual cleanup needed - Drop handles it
-            return Err(anyhow!(
-                "Binary not found in .app bundle at Contents/MacOS/{}",
-                binary_name
-            ));
-        }
-
-        // Copy binary to persistent output directory (async)
-        let final_path = output_dir.join(binary_name);
-        tokio::fs::copy(&binary_path, &final_path).await?;
-        // ✅ If copy fails, Drop unmounts DMG automatically
-
-        // Drop unmounts DMG here automatically on success
-        Ok(final_path)
+            Ok(final_path)
+        }).await?
     }
 }
 

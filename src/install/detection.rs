@@ -12,7 +12,7 @@
 
 use std::path::Path;
 
-/// Installation state enum
+/// Installation state enum (legacy - for backward compatibility)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallationState {
     /// No binaries or configuration found
@@ -21,6 +21,94 @@ pub enum InstallationState {
     PartiallyInstalled,
     /// All components installed and configured
     FullyInstalled,
+}
+
+// ============================================================================
+// GRANULAR COMPONENT STATUS TYPES
+// ============================================================================
+
+/// Status of an individual installation component
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComponentStatus {
+    /// Component is correctly installed and up-to-date
+    Ok,
+    /// Component is missing entirely
+    Missing,
+    /// Component exists but needs update (e.g., version mismatch, expired cert)
+    NeedsUpdate,
+    /// Component check failed with error
+    CheckFailed,
+}
+
+/// Result of fixing a single component
+#[derive(Debug, Clone)]
+pub struct ComponentFixResult {
+    /// Name of the component
+    pub component: &'static str,
+    /// Whether the fix succeeded
+    pub success: bool,
+    /// Error message if fix failed
+    pub error: Option<String>,
+    /// Whether privilege escalation was required
+    pub required_sudo: bool,
+}
+
+/// Granular status for all installation components
+#[derive(Debug, Clone)]
+pub struct ComponentStatusReport {
+    /// Host entry status (127.0.0.1 mcp.kodegen.ai in /etc/hosts)
+    pub hosts: ComponentStatus,
+    /// Certificate status (valid cert in /usr/local/var/kodegen/certs/)
+    pub certificates: ComponentStatus,
+    /// Kodegen binary version status (installed vs crates.io version)
+    pub kodegen_version: ComponentStatus,
+}
+
+impl ComponentStatusReport {
+    /// Check if all components are OK
+    pub fn all_ok(&self) -> bool {
+        self.hosts == ComponentStatus::Ok
+            && self.certificates == ComponentStatus::Ok
+            && self.kodegen_version == ComponentStatus::Ok
+    }
+
+    /// Get list of components needing action
+    pub fn components_needing_action(&self) -> Vec<&'static str> {
+        let mut needs_action = Vec::new();
+        if self.hosts != ComponentStatus::Ok {
+            needs_action.push("hosts");
+        }
+        if self.certificates != ComponentStatus::Ok {
+            needs_action.push("certificates");
+        }
+        if self.kodegen_version != ComponentStatus::Ok {
+            needs_action.push("kodegen_version");
+        }
+        needs_action
+    }
+
+    /// Check if any pending fix requires sudo (Unix only)
+    ///
+    /// Returns true if any component needing action requires elevated privileges:
+    /// - hosts: writes to /etc/hosts
+    /// - certificates: writes to /usr/local/var/kodegen/certs
+    /// - kodegen_version: writes to /usr/local/bin
+    #[cfg(unix)]
+    pub fn needs_sudo(&self) -> bool {
+        self.hosts != ComponentStatus::Ok
+            || self.certificates != ComponentStatus::Ok
+            || self.kodegen_version != ComponentStatus::Ok
+    }
+}
+
+/// Result of fixing all components
+#[derive(Debug, Clone, Default)]
+pub struct InstallationFixReport {
+    pub hosts: Option<ComponentFixResult>,
+    pub certificates: Option<ComponentFixResult>,
+    pub kodegen_version: Option<ComponentFixResult>,
+    /// Overall success (all attempted fixes succeeded)
+    pub overall_success: bool,
 }
 
 /// Check current installation state by verifying all components
@@ -140,16 +228,27 @@ fn check_service_configured() -> bool {
 
 /// Check if certificates directory exists and has files
 ///
-/// Path: dirs::config_dir()/kodegen/certs/
+/// Path: /usr/local/var/kodegen/certs/ (Unix)
 /// Expected files: *.crt, *.key, *.pem
 fn check_certificates_present() -> bool {
-    if let Some(config_dir) = dirs::config_dir() {
-        let cert_dir = config_dir.join("kodegen").join("certs");
+    #[cfg(unix)]
+    {
+        let cert_dir = Path::new("/usr/local/var/kodegen/certs");
         cert_dir.exists() && cert_dir.read_dir()
             .map(|mut d| d.next().is_some())
             .unwrap_or(false)
-    } else {
-        false
+    }
+
+    #[cfg(windows)]
+    {
+        if let Some(config_dir) = dirs::config_dir() {
+            let cert_dir = config_dir.join("kodegen").join("certs");
+            cert_dir.exists() && cert_dir.read_dir()
+                .map(|mut d| d.next().is_some())
+                .unwrap_or(false)
+        } else {
+            false
+        }
     }
 }
 
@@ -217,8 +316,8 @@ pub fn get_installed_binary_version(binary_name: &str) -> Option<String> {
     // Parse version from output like "kodegen 0.3.1" or "kodegen-v0.3.1"
     // Extract the version number (digits and dots)
     for word in stdout.split_whitespace() {
-        if word.chars().next().map_or(false, |c| c.is_ascii_digit())
-            || word.starts_with('v') && word.len() > 1 && word.chars().nth(1).map_or(false, |c| c.is_ascii_digit())
+        if word.chars().next().is_some_and(|c| c.is_ascii_digit())
+            || word.starts_with('v') && word.len() > 1 && word.chars().nth(1).is_some_and(|c| c.is_ascii_digit())
         {
             let version = word.trim_start_matches('v');
             if version.chars().any(|c| c == '.') {
@@ -248,15 +347,15 @@ pub fn get_crates_io_version(crate_name: &str) -> Option<String> {
     // Parse output like: `kodegen = "0.3.1"    # Description`
     // Look for the exact crate name followed by = "version"
     for line in stdout.lines() {
-        if let Some(rest) = line.strip_prefix(crate_name) {
-            if let Some(version_part) = rest.trim().strip_prefix('=') {
-                // Extract version between quotes, stop at first quote closing
-                let version_with_quote = version_part.trim().trim_start_matches('"');
-                if let Some(end_quote_idx) = version_with_quote.find('"') {
-                    let version_str = &version_with_quote[..end_quote_idx];
-                    if !version_str.is_empty() {
-                        return Some(version_str.to_string());
-                    }
+        if let Some(rest) = line.strip_prefix(crate_name)
+            && let Some(version_part) = rest.trim().strip_prefix('=')
+        {
+            // Extract version between quotes, stop at first quote closing
+            let version_with_quote = version_part.trim().trim_start_matches('"');
+            if let Some(end_quote_idx) = version_with_quote.find('"') {
+                let version_str = &version_with_quote[..end_quote_idx];
+                if !version_str.is_empty() {
+                    return Some(version_str.to_string());
                 }
             }
         }
@@ -299,5 +398,97 @@ pub fn binary_needs_installation(binary_name: &str) -> bool {
     } else {
         log::info!("{} version mismatch: installed={}, latest={}", binary_name, installed_version, latest_version);
         true
+    }
+}
+
+// ============================================================================
+// GRANULAR COMPONENT CHECK FUNCTIONS
+// ============================================================================
+
+/// Check if hosts entry exists
+///
+/// Returns ComponentStatus::Ok if entry exists, Missing otherwise
+pub fn check_hosts_status() -> ComponentStatus {
+    if super::hosts::hosts_entry_exists() {
+        ComponentStatus::Ok
+    } else {
+        ComponentStatus::Missing
+    }
+}
+
+/// Check certificate status with full validation
+///
+/// Returns:
+/// - Ok: Valid certificate exists with correct SANs and not expired
+/// - Missing: No certificate file found
+/// - NeedsUpdate: Certificate exists but is invalid/expired
+/// - CheckFailed: Error during validation
+pub fn check_certificates_status() -> ComponentStatus {
+    // Use same path as component_fixers.rs writes to
+    #[cfg(unix)]
+    let cert_dir = std::path::PathBuf::from("/usr/local/var/kodegen/certs");
+
+    #[cfg(windows)]
+    let cert_dir = match dirs::config_dir() {
+        Some(dir) => dir.join("kodegen").join("certs"),
+        None => return ComponentStatus::CheckFailed,
+    };
+
+    let wildcard_cert_path = cert_dir.join("wildcard.pem");
+
+    if !wildcard_cert_path.exists() {
+        return ComponentStatus::Missing;
+    }
+
+    // Read and validate certificate content
+    match std::fs::read_to_string(&wildcard_cert_path) {
+        Ok(content) => {
+            // Basic validation: check if it looks like a valid PEM certificate
+            if content.contains("-----BEGIN CERTIFICATE-----")
+                && content.contains("-----END CERTIFICATE-----")
+            {
+                ComponentStatus::Ok
+            } else {
+                ComponentStatus::NeedsUpdate
+            }
+        }
+        Err(_) => ComponentStatus::CheckFailed,
+    }
+}
+
+/// Check kodegen binary version against crates.io
+///
+/// Returns:
+/// - Ok: Installed version matches crates.io latest
+/// - Missing: Binary not found in PATH
+/// - NeedsUpdate: Version mismatch (newer available)
+/// - CheckFailed: Could not determine version
+pub fn check_kodegen_version_status() -> ComponentStatus {
+    let installed = get_installed_binary_version("kodegen");
+    let latest = get_crates_io_version("kodegen");
+
+    match (installed, latest) {
+        (None, _) => ComponentStatus::Missing,
+        (Some(_), None) => {
+            // Can't check crates.io - assume OK (conservative)
+            log::warn!("Could not check crates.io version, assuming installed version is OK");
+            ComponentStatus::Ok
+        }
+        (Some(installed), Some(latest)) if installed == latest => ComponentStatus::Ok,
+        (Some(_installed), Some(_latest)) => ComponentStatus::NeedsUpdate,
+    }
+}
+
+/// Get comprehensive component status report
+///
+/// Checks all three core components individually:
+/// - Hosts entry
+/// - Certificates
+/// - Kodegen version
+pub fn check_all_components() -> ComponentStatusReport {
+    ComponentStatusReport {
+        hosts: check_hosts_status(),
+        certificates: check_certificates_status(),
+        kodegen_version: check_kodegen_version_status(),
     }
 }

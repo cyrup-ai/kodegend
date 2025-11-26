@@ -38,20 +38,6 @@ impl Cli {
         Self::parse()
     }
 
-    /// Create default CLI config for non-interactive mode (library usage)
-    ///
-    /// This constructor is used by lib.rs when kodegend calls ensure_installed()
-    /// to provide sensible defaults without requiring command-line args.
-    pub fn default_non_interactive() -> Self {
-        Self {
-            binary: PathBuf::from("./target/release/kodegend"), // Fallback, not used
-            uninstall: false,
-            dry_run: false,
-            no_start: false,
-            no_interaction: true,
-        }
-    }
-
     /// Check if running in uninstall mode
     pub fn is_uninstall(&self) -> bool {
         self.uninstall

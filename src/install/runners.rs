@@ -81,123 +81,121 @@ pub async fn run_install(cli: &Cli) -> Result<()> {
     use super::detection::binary_needs_installation;
     let needs_kodegen = binary_needs_installation("kodegen");
 
-    if !needs_kodegen {
+    // Download binaries that need installation
+    let binary_paths = if needs_kodegen {
+        let _ = stdout.set_color(ColorSpec::new().set_fg(Some(Color::Cyan)));
+        let _ = writeln!(stdout, "📥 Downloading binaries from GitHub...");
+        let _ = stdout.reset();
+
+        download::download_all_binaries(tx).await?
+    } else {
         let _ = stdout.set_color(ColorSpec::new().set_fg(Some(Color::Green)));
         let _ = writeln!(stdout, "✓ kodegen is up to date, skipping download\n");
         let _ = stdout.reset();
 
-        // No binaries to install, but continue with other installation steps
-        // (service configuration, certificates, etc.)
-        let _ = stdout.set_color(ColorSpec::new().set_fg(Some(Color::Cyan)));
-        let _ = writeln!(stdout, "📦 Configuring system...");
-        let _ = stdout.reset();
-
-        // TODO: Add service configuration, certificate generation, etc.
-        // For now, just return success
-        return Ok(());
-    }
-
-    // Download binaries that need installation
-    let _ = stdout.set_color(ColorSpec::new().set_fg(Some(Color::Cyan)));
-    let _ = writeln!(stdout, "📥 Downloading binaries from GitHub...");
-    let _ = stdout.reset();
-
-    let binary_paths = download::download_all_binaries(tx).await?;
+        Vec::new()
+    };
 
     // Wait for progress task to finish consuming all events
     progress_task.await.ok();
 
-    let _ = stdout.set_color(ColorSpec::new().set_fg(Some(Color::Green)));
-    let _ = writeln!(stdout, "✓ Downloaded {} binaries\n", binary_paths.len());
-    let _ = stdout.reset();
+    if !binary_paths.is_empty() {
+        let _ = stdout.set_color(ColorSpec::new().set_fg(Some(Color::Green)));
+        let _ = writeln!(stdout, "✓ Downloaded {} binaries\n", binary_paths.len());
+        let _ = stdout.reset();
+    }
 
-    // Stage binaries for installation (runs as unprivileged user)
-    let _ = stdout.set_color(ColorSpec::new().set_fg(Some(Color::Cyan)));
-    let _ = writeln!(stdout, "📦 Staging binaries...");
-    let _ = stdout.reset();
-
+    // Stage binaries for installation if downloaded (runs as unprivileged user)
     let staging_dir = if !binary_paths.is_empty() {
+        let _ = stdout.set_color(ColorSpec::new().set_fg(Some(Color::Cyan)));
+        let _ = writeln!(stdout, "📦 Staging binaries...");
+        let _ = stdout.reset();
+
         let dir = binary_staging::stage_binaries_for_install(&binary_paths).await?;
+
+        let _ = stdout.set_color(ColorSpec::new().set_fg(Some(Color::Green)));
+        let _ = writeln!(stdout, "✓ Binaries staged\n");
+        let _ = stdout.reset();
+
         Some(dir)
     } else {
         None
     };
 
-    let _ = stdout.set_color(ColorSpec::new().set_fg(Some(Color::Green)));
-    let _ = writeln!(stdout, "✓ Binaries staged\n");
-    let _ = stdout.reset();
+    // If we have binaries to install, verify and install the daemon
+    let install_result = if let Some(ref staging_dir) = staging_dir {
+        let binary_path = staging_dir.join("kodegend");
 
-    // Use staged binary path for daemon installation (binary will be copied to system location later)
-    let binary_path = if let Some(ref staging_dir) = staging_dir {
-        staging_dir.join("kodegend")
+        let _ = stdout.set_color(ColorSpec::new().set_fg(Some(Color::Cyan)));
+        let _ = writeln!(stdout, "\n📍 Daemon binary:");
+        let _ = stdout.reset();
+        let _ = writeln!(stdout, "   kodegend: {}", binary_path.display());
+
+        // Verify staged daemon binary exists and is executable
+        if !binary_path.exists() {
+            anyhow::bail!("Staged binary not found: {}", binary_path.display());
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let metadata = std::fs::metadata(&binary_path)?;
+            if metadata.permissions().mode() & 0o111 == 0 {
+                anyhow::bail!(
+                    "Binary not executable: {}\nRun: chmod +x {}",
+                    binary_path.display(),
+                    binary_path.display()
+                );
+            }
+        }
+
+        let _ = stdout.set_color(ColorSpec::new().set_fg(Some(Color::Green)));
+        let _ = writeln!(stdout, "✓ Daemon binary verified\n");
+        let _ = stdout.reset();
+
+        let _ = writeln!(stdout, "Installing {} to system...", binary_path.display());
+
+        // Determine config path
+        let config_path = dirs::config_dir()
+            .ok_or_else(|| anyhow::anyhow!("Could not determine config directory"))?
+            .join("kodegen")
+            .join("config.toml");
+
+        // Call the actual installation logic (no progress channel in CLI mode)
+        let auto_start = !cli.no_start;
+        let result =
+            install::config::install_kodegen_daemon(binary_path, config_path, auto_start, None).await?;
+
+        let _ = stdout.set_color(ColorSpec::new().set_fg(Some(Color::Green)).set_bold(true));
+        let _ = writeln!(
+            stdout,
+            "\n✅ Daemon installed to: {}",
+            result.data_dir.display()
+        );
+        let _ = stdout.reset();
+        let _ = writeln!(
+            stdout,
+            "   Service: {}",
+            result.service_path.display()
+        );
+
+        if !result.certificates_installed {
+            let _ = stdout.set_color(ColorSpec::new().set_fg(Some(Color::Yellow)));
+            let _ = writeln!(stdout, "   ⚠ Certificate installation had issues");
+            let _ = stdout.reset();
+        }
+        if !result.host_entries_added {
+            let _ = stdout.set_color(ColorSpec::new().set_fg(Some(Color::Yellow)));
+            let _ = writeln!(stdout, "   ⚠ Host entries not added (may require sudo)");
+            let _ = stdout.reset();
+        }
+
+        Some(result)
     } else {
-        return Err(anyhow::anyhow!("No binaries to install"));
+        None
     };
 
-    let _ = stdout.set_color(ColorSpec::new().set_fg(Some(Color::Cyan)));
-    let _ = writeln!(stdout, "\n📍 Daemon binary:");
-    let _ = stdout.reset();
-    let _ = writeln!(stdout, "   kodegend: {}", binary_path.display());
-
-    // Verify staged daemon binary exists and is executable
-    if !binary_path.exists() {
-        anyhow::bail!("Staged binary not found: {}", binary_path.display());
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let metadata = std::fs::metadata(&binary_path)?;
-        if metadata.permissions().mode() & 0o111 == 0 {
-            anyhow::bail!(
-                "Binary not executable: {}\nRun: chmod +x {}",
-                binary_path.display(),
-                binary_path.display()
-            );
-        }
-    }
-
-    let _ = stdout.set_color(ColorSpec::new().set_fg(Some(Color::Green)));
-    let _ = writeln!(stdout, "✓ Daemon binary verified\n");
-    let _ = stdout.reset();
-
-    let _ = writeln!(stdout, "Installing {} to system...", binary_path.display());
-
-    // Determine config path
-    let config_path = dirs::config_dir()
-        .ok_or_else(|| anyhow::anyhow!("Could not determine config directory"))?
-        .join("kodegen")
-        .join("config.toml");
-
-    // Call the actual installation logic (no progress channel in CLI mode)
-    let auto_start = !cli.no_start;
-    let install_result =
-        install::config::install_kodegen_daemon(binary_path, config_path, auto_start, None).await?;
-
-    let _ = stdout.set_color(ColorSpec::new().set_fg(Some(Color::Green)).set_bold(true));
-    let _ = writeln!(
-        stdout,
-        "\n✅ Daemon installed to: {}",
-        install_result.data_dir.display()
-    );
-    let _ = stdout.reset();
-    let _ = writeln!(
-        stdout,
-        "   Service: {}",
-        install_result.service_path.display()
-    );
-
-    if !install_result.certificates_installed {
-        let _ = stdout.set_color(ColorSpec::new().set_fg(Some(Color::Yellow)));
-        let _ = writeln!(stdout, "   ⚠ Certificate installation had issues");
-        let _ = stdout.reset();
-    }
-    if !install_result.host_entries_added {
-        let _ = stdout.set_color(ColorSpec::new().set_fg(Some(Color::Yellow)));
-        let _ = writeln!(stdout, "   ⚠ Host entries not added (may require sudo)");
-        let _ = stdout.reset();
-    }
-
+    // INDEPENDENT CHECK: Install Chromium/Chrome (runs regardless of binary installation)
     let _ = stdout.set_color(ColorSpec::new().set_fg(Some(Color::Cyan)));
     let _ = writeln!(stdout, "\n📦 Installing Chromium (required)...");
     let _ = stdout.reset();
@@ -225,9 +223,10 @@ pub async fn run_install(cli: &Cli) -> Result<()> {
         }
     }
 
-    // Now perform ONLY the privileged operations (Phase 3: Deferred privilege escalation)
-    // All unprivileged operations (downloads, extraction, staging) have completed as user
-    if let Some(staging_dir) = staging_dir {
+    // Perform privileged operations if binaries were installed
+    if let Some(ref staging_dir_path) = staging_dir
+        && let Some(ref result) = install_result
+    {
         let _ = stdout.set_color(ColorSpec::new().set_fg(Some(Color::Cyan)));
         let _ = writeln!(stdout, "\n📦 Installing to system (requires sudo)...");
         let _ = stdout.reset();
@@ -235,9 +234,9 @@ pub async fn run_install(cli: &Cli) -> Result<()> {
         // Pass certificate content instead of file path
         // Execute privileged operations (copy to /usr/local/bin, update /etc/hosts, import certs)
         privilege::install_with_elevated_privileges(
-            &staging_dir,
-            install_result.certificate_content.as_deref(),
-            &install_result.data_dir,
+            staging_dir_path,
+            result.certificate_content.as_deref(),
+            &result.data_dir,
         )
         .await?;
 
@@ -245,6 +244,10 @@ pub async fn run_install(cli: &Cli) -> Result<()> {
         let _ = writeln!(stdout, "✓ System installation complete");
         let _ = stdout.reset();
     }
+
+    // INDEPENDENT CHECK: Ensure hosts file is configured (runs regardless of binary installation)
+    let _ = writeln!(stdout);
+    super::hosts::ensure_hosts_configured().await?;
 
     let _ = stdout.set_color(ColorSpec::new().set_fg(Some(Color::Green)).set_bold(true));
     let _ = writeln!(stdout, "\n✅ Installation complete");
