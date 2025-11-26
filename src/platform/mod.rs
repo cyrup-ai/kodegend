@@ -130,4 +130,5 @@ pub fn log_dir(is_elevated: bool) -> PathBuf {
 
 // Signal handling abstraction
 pub mod signal;
+#[allow(unused_imports)] // False positive - SignalWatcher is used in manager.rs
 pub use signal::{SignalKind, SignalWatcher, watch_signals};

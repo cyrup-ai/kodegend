@@ -30,7 +30,6 @@
 //! }
 //! ```
 
-use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -43,9 +42,6 @@ use tokio::time::{Duration, timeout};
 
 /// Maximum number of vulnerabilities to track without heap allocation
 const MAX_VULNERABILITIES: usize = 256;
-
-/// Maximum size for vulnerability report content
-const MAX_REPORT_SIZE: usize = 1024;
 
 /// Maximum size for package names and vulnerability IDs
 const MAX_IDENTIFIER_SIZE: usize = 64;
@@ -349,6 +345,94 @@ pub struct VulnerabilityScanner {
     timeout_duration: Duration,
 }
 
+/// cargo-audit JSON report structure (subset of rustsec::Report)
+/// 
+/// Full spec: https://github.com/rustsec/rustsec/blob/main/rustsec/src/report.rs
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct CargoAuditReport {
+    pub vulnerabilities: VulnerabilitiesSection,
+    
+    #[serde(default)]
+    pub warnings: WarningsSection,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct VulnerabilitiesSection {
+    pub found: bool,
+    pub count: usize,
+    pub list: Vec<VulnerabilityJson>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[allow(dead_code)]
+struct WarningsSection {
+    #[serde(default)]
+    pub count: usize,
+}
+
+/// Individual vulnerability from cargo-audit JSON output
+/// 
+/// Full spec: https://github.com/rustsec/rustsec/blob/main/rustsec/src/vulnerability.rs
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct VulnerabilityJson {
+    pub advisory: AdvisoryMetadata,
+    pub package: PackageInfo,
+    
+    #[serde(default)]
+    pub versions: VersionInfo,
+}
+
+/// Advisory metadata from RustSec database
+/// 
+/// Full spec: https://docs.rs/rustsec/latest/rustsec/advisory/struct.Metadata.html
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct AdvisoryMetadata {
+    pub id: String,
+    pub package: String,
+    
+    #[serde(default)]
+    pub title: String,
+    
+    #[serde(default)]
+    pub description: String,
+    
+    #[serde(default)]
+    pub date: String,
+    
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    
+    #[serde(default)]
+    pub cvss: Option<String>,
+    
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct PackageInfo {
+    pub name: String,
+    pub version: String,
+    
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[allow(dead_code)]
+struct VersionInfo {
+    #[serde(default)]
+    pub patched: Vec<String>,
+    
+    #[serde(default)]
+    pub unaffected: Vec<String>,
+}
+
 impl VulnerabilityScanner {
     /// Create new vulnerability scanner with default thresholds
     pub fn new(thresholds: AuditThresholds) -> Self {
@@ -406,147 +490,115 @@ impl VulnerabilityScanner {
         self.parse_audit_output(stdout).await
     }
 
-    /// Parse cargo-audit JSON output with zero-allocation
+    /// Parse cargo-audit JSON output using proper serde deserialization
+    /// 
+    /// This replaces the previous manual string parsing with proper JSON deserialization,
+    /// eliminating the unused buffer bug and improving maintainability.
     async fn parse_audit_output(&self, output: &str) -> Result<AuditResult, AuditError> {
         let mut result = AuditResult::new();
-        let _start_time = std::time::Instant::now();
+        let start_time = std::time::Instant::now();
 
-        // Parse JSON using zero-allocation string processing
-        let mut buffer = ArrayString::<MAX_REPORT_SIZE>::new();
-        if output.len() > MAX_REPORT_SIZE {
-            buffer.push_str(&output[..MAX_REPORT_SIZE]);
-        } else {
-            buffer.push_str(output);
+        // Deserialize the full cargo-audit JSON report
+        let report: CargoAuditReport = serde_json::from_str(output)
+            .map_err(|e| AuditError::JsonParsingFailed(format!("Failed to parse cargo-audit JSON: {}", e)))?;
+
+        // Check if we found any vulnerabilities
+        if !report.vulnerabilities.found {
+            result.scan_duration_ms = start_time.elapsed().as_millis() as u64;
+            result.success = true;
+            return Ok(result);
         }
 
-        // Use SIMD-accelerated pattern matching to find vulnerability entries
-        let vuln_pattern = b"\"type\":\"vulnerability\"";
-        let finder = memmem::Finder::new(vuln_pattern);
-
-        let mut offset = 0;
-        while let Some(pos) = finder.find(&output.as_bytes()[offset..]) {
-            let start = offset + pos;
-
-            // Extract vulnerability JSON object
-            if let Some(vuln) = self.extract_vulnerability_at(output, start) {
+        // Convert each vulnerability from JSON format to our internal format
+        for vuln_json in report.vulnerabilities.list {
+            // Parse severity from CVSS string or infer from aliases
+            let severity = Self::parse_severity(&vuln_json.advisory)?;
+            
+            // Extract patched version (first patched version if available)
+            let patched = vuln_json.versions.patched
+                .first()
+                .map(|s| s.as_str());
+            
+            // Create our internal Vulnerability struct
+            if let Some(vuln) = Vulnerability::new(
+                &vuln_json.advisory.id,
+                &vuln_json.package.name,
+                severity,
+                &vuln_json.advisory.description,
+                &vuln_json.package.version,
+                patched,
+            ) {
                 result.add_vulnerability(vuln)?;
+            } else {
+                // Log when vulnerability data exceeds our fixed-size limits
+                log::warn!(
+                    "Skipping vulnerability {} for {} - data exceeds ArrayString limits",
+                    vuln_json.advisory.id,
+                    vuln_json.package.name
+                );
             }
-
-            offset = start + vuln_pattern.len();
         }
 
-        result.scan_duration_ms = _start_time.elapsed().as_millis() as u64;
+        result.scan_duration_ms = start_time.elapsed().as_millis() as u64;
         result.success = true;
 
         Ok(result)
     }
 
-    /// Extract vulnerability from JSON at given position
-    fn extract_vulnerability_at(&self, json: &str, start: usize) -> Option<Vulnerability> {
-        // Find JSON object boundaries
-        let mut brace_count = 0;
-        let mut in_string = false;
-        let mut escape_next = false;
-        let mut object_start = None;
-        let mut object_end = None;
-
-        for (i, byte) in json.bytes().enumerate().skip(start) {
-            if escape_next {
-                escape_next = false;
-                continue;
-            }
-
-            match byte {
-                b'\\' => escape_next = true,
-                b'"' => in_string = !in_string,
-                b'{' if !in_string => {
-                    if object_start.is_none() {
-                        object_start = Some(i);
-                    }
-                    brace_count += 1;
-                }
-                b'}' if !in_string => {
-                    brace_count -= 1;
-                    if brace_count == 0 {
-                        object_end = Some(i + 1);
-                        break;
-                    }
-                }
-                _ => {}
-            }
+    /// Parse vulnerability severity from advisory metadata
+    /// 
+    /// Attempts to extract severity from:
+    /// 1. CVSS vector string (if present)
+    /// 2. CVE aliases (if present) 
+    /// 3. Defaults to Info if unable to determine
+    fn parse_severity(advisory: &AdvisoryMetadata) -> Result<VulnerabilitySeverity, AuditError> {
+        // Try parsing from CVSS vector if available
+        if let Some(cvss) = &advisory.cvss {
+            return Self::severity_from_cvss(cvss);
         }
-
-        // Extract and parse vulnerability object
-        if let (Some(start), Some(end)) = (object_start, object_end) {
-            let vuln_json = &json[start..end];
-            self.parse_vulnerability_json(vuln_json)
-        } else {
-            None
+        
+        // Check if there are CVE aliases (indicates real vulnerability)
+        if !advisory.aliases.is_empty() {
+            // Has CVE - default to Medium if no CVSS
+            return Ok(VulnerabilitySeverity::Medium);
         }
+        
+        // No CVSS, no CVE - likely informational
+        Ok(VulnerabilitySeverity::Info)
     }
 
-    /// Parse individual vulnerability JSON with zero-allocation
-    fn parse_vulnerability_json(&self, json: &str) -> Option<Vulnerability> {
-        // Use SIMD-accelerated field extraction
-        let id = self.extract_json_field(json, "id")?;
-        let package = self.extract_json_field(json, "package")?;
-        let severity_str = self.extract_json_field(json, "severity")?;
-        let description = self.extract_json_field(json, "description")?;
-        let version = self.extract_json_field(json, "version")?;
-        let patched = self.extract_json_field(json, "patched");
-
-        let severity = VulnerabilitySeverity::from_str(&severity_str).ok()?;
-
-        Vulnerability::new(
-            &id,
-            &package,
-            severity,
-            &description,
-            &version,
-            patched.as_deref(),
-        )
-    }
-
-    /// Extract JSON field value using SIMD-accelerated search
-    fn extract_json_field(&self, json: &str, field: &str) -> Option<String> {
-        let pattern = format!("\"{field}\":");
-        let finder = memmem::Finder::new(pattern.as_bytes());
-
-        let pos = finder.find(json.as_bytes())?;
-        let start = pos + pattern.len();
-
-        // Skip whitespace
-        let mut value_start = start;
-        while value_start < json.len() && json.as_bytes()[value_start].is_ascii_whitespace() {
-            value_start += 1;
+    /// Extract severity level from CVSS v3.1 vector string
+    /// 
+    /// CVSS format: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+    /// Base score ranges:
+    /// - Critical: 9.0-10.0
+    /// - High: 7.0-8.9
+    /// - Medium: 4.0-6.9
+    /// - Low: 0.1-3.9
+    fn severity_from_cvss(cvss: &str) -> Result<VulnerabilitySeverity, AuditError> {
+        // For now, do a simple heuristic based on impact ratings
+        // A full CVSS parser would be more accurate but also more complex
+        
+        let high_impact = cvss.contains("C:H") || cvss.contains("I:H") || cvss.contains("A:H");
+        let medium_impact = cvss.contains("C:M") || cvss.contains("I:M") || cvss.contains("A:M");
+        
+        // Network accessible with high impact = Critical
+        if cvss.contains("AV:N") && high_impact {
+            return Ok(VulnerabilitySeverity::Critical);
         }
-
-        if value_start >= json.len() || json.as_bytes()[value_start] != b'"' {
-            return None;
+        
+        // High impact regardless of vector = High
+        if high_impact {
+            return Ok(VulnerabilitySeverity::High);
         }
-
-        value_start += 1; // Skip opening quote
-
-        // Find closing quote
-        let mut value_end = value_start;
-        let mut escaped = false;
-        while value_end < json.len() {
-            let byte = json.as_bytes()[value_end];
-            if escaped {
-                escaped = false;
-            } else if byte == b'\\' {
-                escaped = true;
-            } else if byte == b'"' {
-                break;
-            }
-            value_end += 1;
+        
+        // Medium impact = Medium
+        if medium_impact {
+            return Ok(VulnerabilitySeverity::Medium);
         }
-
-        if value_end >= json.len() {
-            return None;
-        }
-
-        Some(json[value_start..value_end].to_string())
+        
+        // Low impact = Low
+        Ok(VulnerabilitySeverity::Low)
     }
 
     /// Update atomic vulnerability counters

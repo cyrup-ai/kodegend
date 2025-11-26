@@ -171,7 +171,11 @@ pub fn platform_system_config_dir() -> PathBuf {
 /// Follows XDG Base Directory Specification
 pub fn platform_user_config_dir() -> PathBuf {
     dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("~/.config"))
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("/tmp"))
+                .join(".config")
+        })
         .join("kodegend")
 }
 
@@ -249,7 +253,11 @@ pub fn platform_log_dir(is_elevated: bool) -> PathBuf {
         PathBuf::from("/var/log/kodegend")
     } else {
         dirs::state_dir()
-            .unwrap_or_else(|| PathBuf::from("~/.local/state"))
+            .unwrap_or_else(|| {
+                dirs::home_dir()
+                    .unwrap_or_else(|| PathBuf::from("/tmp"))
+                    .join(".local/state")
+            })
             .join("kodegend/logs")
     }
 }

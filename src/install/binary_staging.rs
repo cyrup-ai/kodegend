@@ -26,7 +26,7 @@ pub async fn stage_binaries_for_install(binary_paths: &[PathBuf]) -> Result<Path
         .context("Failed to create staging directory")?;
     
     // Persist the directory (prevent auto-cleanup) and get the path
-    let staging_dir = temp_dir.into_path();
+    let staging_dir = temp_dir.keep();
 
     #[cfg(unix)]
     {

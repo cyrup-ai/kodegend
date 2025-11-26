@@ -215,7 +215,7 @@ fn install_build_dependencies() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "macos")]
     {
         eprintln!("Build: Installing Xcode Command Line Tools...");
-        Command::new("xcode-select").args(&["--install"]).status()?;
+        Command::new("xcode-select").args(["--install"]).status()?;
     }
 
     Ok(())

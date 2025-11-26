@@ -57,7 +57,14 @@ impl SignalWatcher {
     /// Use this with crossbeam's select! macro to receive signals
     /// in the daemon's main event loop.
     pub fn receiver(&self) -> &Receiver<SignalKind> {
-        self.rx.as_ref().expect("SignalWatcher receiver already taken")
+        match self.rx.as_ref() {
+            Some(rx) => rx,
+            None => {
+                // This should never happen - receiver is only None after Drop starts
+                // If this panics, there's a logic error in the signal watcher usage
+                panic!("SignalWatcher receiver accessed after Drop began");
+            }
+        }
     }
 }
 
