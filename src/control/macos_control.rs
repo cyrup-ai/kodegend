@@ -111,23 +111,136 @@ pub fn stop_daemon() -> Result<()> {
     Ok(())
 }
 
+/// Wait for daemon to fully stop (check_status returns false)
+///
+/// Uses exponential backoff pattern from autoconfig.rs for efficiency.
+/// Polls check_status() until it returns false (stopped) or timeout expires.
+///
+/// # Arguments
+/// * `timeout` - Maximum time to wait for daemon to stop
+///
+/// # Returns
+/// * `Ok(())` if daemon stopped within timeout
+/// * `Err()` if timeout expired or status check failed persistently
+fn wait_for_stopped(timeout: Duration) -> Result<()> {
+    let start_time = std::time::Instant::now();
+    let mut backoff_ms = 1;
+
+    loop {
+        // Check if already stopped
+        match check_status() {
+            Ok(false) => return Ok(()), // Stopped successfully
+            Ok(true) => {
+                // Still running, continue waiting
+                if start_time.elapsed() > timeout {
+                    anyhow::bail!(
+                        "Daemon did not stop within {:?}. Manual intervention may be required.",
+                        timeout
+                    );
+                }
+
+                // Exponential backoff sleep (1ms → 2ms → 4ms → ... → 100ms cap)
+                std::thread::sleep(Duration::from_millis(backoff_ms));
+                backoff_ms = (backoff_ms * 2).min(100);
+            }
+            Err(e) => {
+                // If check_status fails, we can't determine state
+                // Log warning but continue - might be already stopped
+                log::warn!("Failed to check daemon status during shutdown: {}", e);
+                
+                if start_time.elapsed() > timeout {
+                    return Err(e).context(format!(
+                        "Timeout waiting for daemon to stop ({:?}), and status check failed",
+                        timeout
+                    ));
+                }
+                
+                std::thread::sleep(Duration::from_millis(backoff_ms));
+                backoff_ms = (backoff_ms * 2).min(100);
+            }
+        }
+    }
+}
+
+/// Wait for daemon to become active (check_status returns true)
+///
+/// Uses exponential backoff pattern from autoconfig.rs for efficiency.
+/// Polls check_status() until it returns true (running) or timeout expires.
+///
+/// # Arguments
+/// * `timeout` - Maximum time to wait for daemon to become active
+///
+/// # Returns
+/// * `Ok(())` if daemon became active within timeout
+/// * `Err()` if timeout expired or status check failed persistently
+fn wait_for_active(timeout: Duration) -> Result<()> {
+    let start_time = std::time::Instant::now();
+    let mut backoff_ms = 1;
+
+    loop {
+        // Check if active
+        match check_status() {
+            Ok(true) => return Ok(()), // Active successfully
+            Ok(false) => {
+                // Not running yet, continue waiting
+                if start_time.elapsed() > timeout {
+                    anyhow::bail!(
+                        "Daemon did not become active within {:?}. Check logs for startup errors.",
+                        timeout
+                    );
+                }
+
+                // Exponential backoff sleep (1ms → 2ms → 4ms → ... → 100ms cap)
+                std::thread::sleep(Duration::from_millis(backoff_ms));
+                backoff_ms = (backoff_ms * 2).min(100);
+            }
+            Err(e) => {
+                // If check_status fails during startup, that's a problem
+                if start_time.elapsed() > timeout {
+                    anyhow::bail!(
+                        "Daemon startup verification failed after {:?}: {}",
+                        timeout,
+                        e
+                    );
+                }
+                
+                std::thread::sleep(Duration::from_millis(backoff_ms));
+                backoff_ms = (backoff_ms * 2).min(100);
+            }
+        }
+    }
+}
+
 /// Restart daemon via launchctl
 ///
-/// Uses kickstart -k (kill flag) with manual stop+start fallback
+/// Uses kickstart -k (kill flag) with manual stop+start fallback that includes verification
 pub fn restart_daemon() -> Result<()> {
-    // macOS launchctl doesn't have a direct restart command
-    // Use kickstart with -k (kill) flag which restarts the service
-    
+    // Try modern kickstart with -k (kill) flag which restarts the service
     let output = Command::new("launchctl")
         .args(["kickstart", "-k", SERVICE_LABEL])
         .output()
         .context("Failed to execute launchctl kickstart -k")?;
 
     if !output.status.success() {
-        // Fallback: manual stop + start
-        stop_daemon()?;
-        std::thread::sleep(Duration::from_secs(1));
-        start_daemon()?;
+        // Fallback: manual stop + start with proper verification
+        log::warn!("launchctl kickstart -k failed, using manual stop+start fallback");
+        
+        stop_daemon()
+            .context("Failed to stop daemon during restart")?;
+        
+        wait_for_stopped(Duration::from_secs(10))
+            .context("Daemon did not stop cleanly within 10 seconds")?;
+        
+        // Small delay to ensure port release (launchd-specific timing)
+        std::thread::sleep(Duration::from_millis(500));
+        
+        start_daemon()
+            .context("Failed to start daemon after stop")?;
+        
+        wait_for_active(Duration::from_secs(30))
+            .context("Daemon started but did not become active within 30 seconds")?;
+        
+        log::info!("Daemon restarted successfully via fallback path");
     }
 
     Ok(())

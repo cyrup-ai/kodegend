@@ -4,7 +4,9 @@
 
 use anyhow::{Result, Context};
 use crossbeam_channel::{Sender, Receiver, bounded};
+use std::panic::{self, AssertUnwindSafe};
 use std::thread;
+use std::time::Duration;
 
 /// Signal types recognized across platforms
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,70 +142,116 @@ pub fn watch_signals() -> Result<SignalWatcher> {
 // Unix Implementation
 // ============================================================================
 
+/// Internal: Run Unix signal handler loop (can panic - caller must handle)
+#[cfg(unix)]
+fn run_unix_signal_handler(tx: Sender<SignalKind>) {
+    // Create tokio runtime for signal handling
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to create tokio runtime for signal handling");
+    
+    rt.block_on(async {
+        use tokio::signal::unix::{signal, SignalKind as TokioSignalKind};
+        
+        let mut sigterm = signal(TokioSignalKind::terminate())
+            .expect("Failed to install SIGTERM handler");
+        
+        let mut sigint = signal(TokioSignalKind::interrupt())
+            .expect("Failed to install SIGINT handler");
+        
+        let mut sighup = signal(TokioSignalKind::hangup())
+            .expect("Failed to install SIGHUP handler");
+        
+        loop {
+            tokio::select! {
+                _ = sigterm.recv() => {
+                    if tx.send(SignalKind::Terminate).is_err() {
+                        break; // Channel closed
+                    }
+                }
+                _ = sigint.recv() => {
+                    if tx.send(SignalKind::Interrupt).is_err() {
+                        break;
+                    }
+                }
+                _ = sighup.recv() => {
+                    if tx.send(SignalKind::Hangup).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+}
+
 #[cfg(unix)]
 fn spawn_unix_watcher(tx: Sender<SignalKind>) -> Result<std::thread::JoinHandle<()>> {
     let handle = thread::Builder::new()
         .name("signal-watcher-unix".to_string())
         .spawn(move || {
-            // Create tokio runtime for signal handling
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    log::error!("Failed to create tokio runtime for signal handling: {}", e);
-                    return;
-                }
-            };
+            const MAX_RESTARTS: u32 = 3;
+            let mut restart_count = 0;
             
-            rt.block_on(async {
-                use tokio::signal::unix::{signal, SignalKind as TokioSignalKind};
+            loop {
+                let tx_clone = tx.clone();
                 
-                let mut sigterm = match signal(TokioSignalKind::terminate()) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        log::error!("Failed to install SIGTERM handler: {}", e);
-                        return;
+                // Wrap signal handler in panic catcher
+                // AssertUnwindSafe is required because Sender is not UnwindSafe
+                // This is safe because we're restarting the entire handler on panic
+                let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                    run_unix_signal_handler(tx_clone);
+                }));
+                
+                match result {
+                    Ok(()) => {
+                        // Normal exit - signal handler loop terminated cleanly
+                        log::info!("Signal watcher exiting normally");
+                        break;
                     }
-                };
-                
-                let mut sigint = match signal(TokioSignalKind::interrupt()) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        log::error!("Failed to install SIGINT handler: {}", e);
-                        return;
-                    }
-                };
-                
-                let mut sighup = match signal(TokioSignalKind::hangup()) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        log::error!("Failed to install SIGHUP handler: {}", e);
-                        return;
-                    }
-                };
-                
-                loop {
-                    tokio::select! {
-                        _ = sigterm.recv() => {
-                            if tx.send(SignalKind::Terminate).is_err() {
-                                break; // Channel closed
-                            }
+                    Err(panic_payload) => {
+                        restart_count += 1;
+                        
+                        // Extract panic message using pattern from kodegen-mcp-tool/src/tool.rs:69-77
+                        let panic_msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                            s.to_string()
+                        } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                            s.clone()
+                        } else {
+                            "Unknown panic (no message)".to_string()
+                        };
+                        
+                        log::error!(
+                            "CRITICAL: Signal watcher thread panicked (attempt {}/{}): {}",
+                            restart_count,
+                            MAX_RESTARTS,
+                            panic_msg
+                        );
+                        
+                        // Check if we've exhausted retries
+                        if restart_count >= MAX_RESTARTS {
+                            log::error!(
+                                "Signal watcher failed {} times, giving up. \
+                                 Daemon will not respond to SIGTERM/SIGINT and must be killed with SIGKILL.",
+                                MAX_RESTARTS
+                            );
+                            break;
                         }
-                        _ = sigint.recv() => {
-                            if tx.send(SignalKind::Interrupt).is_err() {
-                                break;
-                            }
-                        }
-                        _ = sighup.recv() => {
-                            if tx.send(SignalKind::Hangup).is_err() {
-                                break;
-                            }
-                        }
+                        
+                        // Exponential backoff: attempt 1 = 1s, attempt 2 = 2s, attempt 3 = 4s
+                        // Pattern from kodegen-bundler-release and kodegend/src/service/port_cleanup.rs:298-301
+                        let delay_secs = 1u64 << (restart_count - 1); // 2^(n-1) where n starts at 1
+                        log::info!(
+                            "Restarting signal watcher in {}s (attempt {}/{})",
+                            delay_secs,
+                            restart_count + 1,
+                            MAX_RESTARTS
+                        );
+                        
+                        thread::sleep(Duration::from_secs(delay_secs));
                     }
                 }
-            });
+            }
         })
         .context("Failed to spawn Unix signal watcher thread")?;
     
@@ -214,83 +262,120 @@ fn spawn_unix_watcher(tx: Sender<SignalKind>) -> Result<std::thread::JoinHandle<
 // Windows Implementation  
 // ============================================================================
 
+/// Internal: Run Windows signal handler loop (can panic - caller must handle)
+#[cfg(windows)]
+fn run_windows_signal_handler(tx: Sender<SignalKind>) {
+    // Create tokio runtime for signal handling
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to create tokio runtime for signal handling");
+    
+    rt.block_on(async {
+        use tokio::signal::windows;
+        
+        let mut ctrl_c = windows::ctrl_c()
+            .expect("Failed to install CTRL+C handler");
+        
+        let mut ctrl_break = windows::ctrl_break()
+            .expect("Failed to install CTRL+BREAK handler");
+        
+        let mut ctrl_close = windows::ctrl_close()
+            .expect("Failed to install CTRL+CLOSE handler");
+        
+        let mut ctrl_shutdown = windows::ctrl_shutdown()
+            .expect("Failed to install CTRL+SHUTDOWN handler");
+        
+        loop {
+            tokio::select! {
+                _ = ctrl_c.recv() => {
+                    if tx.send(SignalKind::Interrupt).is_err() {
+                        break;
+                    }
+                }
+                _ = ctrl_break.recv() => {
+                    if tx.send(SignalKind::Hangup).is_err() {
+                        break;
+                    }
+                }
+                _ = ctrl_close.recv() => {
+                    if tx.send(SignalKind::Terminate).is_err() {
+                        break;
+                    }
+                }
+                _ = ctrl_shutdown.recv() => {
+                    if tx.send(SignalKind::Shutdown).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+}
+
 #[cfg(windows)]
 fn spawn_windows_watcher(tx: Sender<SignalKind>) -> Result<std::thread::JoinHandle<()>> {
     let handle = thread::Builder::new()
         .name("signal-watcher-windows".to_string())
         .spawn(move || {
-            // Create tokio runtime for signal handling
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    log::error!("Failed to create tokio runtime for signal handling: {}", e);
-                    return;
-                }
-            };
+            const MAX_RESTARTS: u32 = 3;
+            let mut restart_count = 0;
             
-            rt.block_on(async {
-                use tokio::signal::windows;
+            loop {
+                let tx_clone = tx.clone();
                 
-                let mut ctrl_c = match windows::ctrl_c() {
-                    Ok(s) => s,
-                    Err(e) => {
-                        log::error!("Failed to install CTRL+C handler: {}", e);
-                        return;
+                // Wrap signal handler in panic catcher
+                let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                    run_windows_signal_handler(tx_clone);
+                }));
+                
+                match result {
+                    Ok(()) => {
+                        // Normal exit
+                        log::info!("Signal watcher exiting normally");
+                        break;
                     }
-                };
-                
-                let mut ctrl_break = match windows::ctrl_break() {
-                    Ok(s) => s,
-                    Err(e) => {
-                        log::error!("Failed to install CTRL+BREAK handler: {}", e);
-                        return;
-                    }
-                };
-                
-                let mut ctrl_close = match windows::ctrl_close() {
-                    Ok(s) => s,
-                    Err(e) => {
-                        log::error!("Failed to install CTRL+CLOSE handler: {}", e);
-                        return;
-                    }
-                };
-                
-                let mut ctrl_shutdown = match windows::ctrl_shutdown() {
-                    Ok(s) => s,
-                    Err(e) => {
-                        log::error!("Failed to install CTRL+SHUTDOWN handler: {}", e);
-                        return;
-                    }
-                };
-                
-                loop {
-                    tokio::select! {
-                        _ = ctrl_c.recv() => {
-                            if tx.send(SignalKind::Interrupt).is_err() {
-                                break;
-                            }
+                    Err(panic_payload) => {
+                        restart_count += 1;
+                        
+                        // Extract panic message
+                        let panic_msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                            s.to_string()
+                        } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                            s.clone()
+                        } else {
+                            "Unknown panic (no message)".to_string()
+                        };
+                        
+                        log::error!(
+                            "CRITICAL: Signal watcher thread panicked (attempt {}/{}): {}",
+                            restart_count,
+                            MAX_RESTARTS,
+                            panic_msg
+                        );
+                        
+                        if restart_count >= MAX_RESTARTS {
+                            log::error!(
+                                "Signal watcher failed {} times, giving up. \
+                                 Daemon will not respond to CTRL+C/CTRL+BREAK and must be terminated.",
+                                MAX_RESTARTS
+                            );
+                            break;
                         }
-                        _ = ctrl_break.recv() => {
-                            if tx.send(SignalKind::Hangup).is_err() {
-                                break;
-                            }
-                        }
-                        _ = ctrl_close.recv() => {
-                            if tx.send(SignalKind::Terminate).is_err() {
-                                break;
-                            }
-                        }
-                        _ = ctrl_shutdown.recv() => {
-                            if tx.send(SignalKind::Shutdown).is_err() {
-                                break;
-                            }
-                        }
+                        
+                        // Exponential backoff
+                        let delay_secs = 1u64 << (restart_count - 1);
+                        log::info!(
+                            "Restarting signal watcher in {}s (attempt {}/{})",
+                            delay_secs,
+                            restart_count + 1,
+                            MAX_RESTARTS
+                        );
+                        
+                        thread::sleep(Duration::from_secs(delay_secs));
                     }
                 }
-            });
+            }
         })
         .context("Failed to spawn Windows signal watcher thread")?;
     

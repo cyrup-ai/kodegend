@@ -43,23 +43,32 @@ pub(super) fn platform_init_logging() -> Result<()> {
         .filter_level(LevelFilter::Info)
         .build();
 
-    // Create EventLog instance for Windows Event Log
-    // Note: EventLog::new() will gracefully handle missing registration
-    // If not registered, events may appear under generic "Application" source
-    let event_logger = eventlog::EventLog::new("kodegend", log::Level::Info)
-        .context("Failed to create Windows Event Log logger")?;
+    // Try to create Event Log logger, but track success/failure
+    let mut loggers: Vec<Box<dyn log::Log>> = vec![Box::new(env_logger)];
+    let mut event_log_enabled = false;
 
-    // Combine BOTH loggers using multi_log
-    // This enables simultaneous output to console AND Event Viewer
-    multi_log::MultiLogger::init(
-        vec![
-            Box::new(env_logger),
-            Box::new(event_logger),
-        ],
-        log::Level::Info
-    ).context("Failed to initialize multi-logger")?;
+    match eventlog::EventLog::new("kodegend", log::Level::Info) {
+        Ok(event_logger) => {
+            loggers.push(Box::new(event_logger));
+            event_log_enabled = true;
+        }
+        Err(e) => {
+            // Log to stderr (goes to console before logger is initialized)
+            eprintln!("Warning: Failed to create Windows Event Log logger: {}", e);
+            eprintln!("Continuing with console-only logging. Run 'kodegend install' with Administrator privileges to enable Event Log.");
+        }
+    }
 
-    log::info!("Logging initialized: console + Windows Event Log");
+    // Initialize multi-logger with whatever loggers we have
+    multi_log::MultiLogger::init(loggers, log::Level::Info)
+        .context("Failed to initialize logging framework")?;
+
+    // Log ACCURATE status based on what actually succeeded
+    if event_log_enabled {
+        log::info!("Logging initialized: console + Windows Event Log");
+    } else {
+        log::warn!("Logging initialized: console only (Windows Event Log unavailable)");
+    }
     
     Ok(())
 }

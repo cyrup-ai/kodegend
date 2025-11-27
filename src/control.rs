@@ -5,7 +5,7 @@
 //! - Linux: systemd (systemctl)
 //! - Windows: Service Control Manager (Windows API)
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 // Platform-specific implementations
 cfg_if::cfg_if! {
@@ -53,19 +53,23 @@ cfg_if::cfg_if! {
 /// Returns: Ok(true) if running, Ok(false) if stopped
 pub fn check_status() -> Result<bool> {
     platform::check_status()
+        .context("Failed to check daemon status")
 }
 
 /// Start the daemon service
 pub fn start_daemon() -> Result<()> {
     platform::start_daemon()
+        .context("Failed to start daemon service")
 }
 
 /// Stop the daemon service
 pub fn stop_daemon() -> Result<()> {
     platform::stop_daemon()
+        .context("Failed to stop daemon service")
 }
 
 /// Restart the daemon service
 pub fn restart_daemon() -> Result<()> {
     platform::restart_daemon()
+        .context("Failed to restart daemon service")
 }

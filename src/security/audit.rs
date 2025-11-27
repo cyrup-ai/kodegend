@@ -483,11 +483,36 @@ impl VulnerabilityScanner {
         let stdout = std::str::from_utf8(&output.stdout)?;
         let stderr = std::str::from_utf8(&output.stderr)?;
 
-        if !output.status.success() && !stderr.is_empty() {
-            return Err(AuditError::CargoAuditFailed(stderr.to_string()));
+        // Log stderr for diagnostics (warnings, fetch messages, etc.)
+        // but don't treat it as an error condition
+        if !stderr.is_empty() {
+            log::debug!("cargo-audit stderr: {}", stderr);
         }
 
-        self.parse_audit_output(stdout).await
+        // cargo-audit exit codes per official source code:
+        // 0 = no vulnerabilities found
+        // 1 = vulnerabilities found (EXPECTED - this is a successful scan!)
+        // 2+ = actual failure (Cargo.lock not found, network error, etc.)
+        match output.status.code() {
+            Some(0) | Some(1) => {
+                // Both 0 and 1 are successful scan results
+                // 0 = no vulnerabilities, 1 = vulnerabilities found
+                // In both cases, we parse the JSON output from stdout
+                self.parse_audit_output(stdout).await
+            }
+            Some(code) => {
+                // Exit codes 2+ indicate actual errors
+                Err(AuditError::CargoAuditFailed(
+                    format!("cargo-audit failed with exit code {}: {}", code, stderr)
+                ))
+            }
+            None => {
+                // Process was terminated by signal (SIGKILL, SIGTERM, etc.)
+                Err(AuditError::CargoAuditFailed(
+                    format!("cargo-audit terminated by signal: {}", stderr)
+                ))
+            }
+        }
     }
 
     /// Parse cargo-audit JSON output using proper serde deserialization
