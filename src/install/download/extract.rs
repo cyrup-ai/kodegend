@@ -136,7 +136,7 @@ pub async fn extract_from_rpm(
                 buf
             }
             CompressionType::Xz => {
-                use xz2::read::XzDecoder;
+                use liblzma::read::XzDecoder;
                 let mut decoder = XzDecoder::new(BufReader::new(rpm_file));
                 let mut buf = Vec::new();
                 std::io::copy(&mut decoder, &mut buf)
