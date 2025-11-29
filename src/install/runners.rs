@@ -156,9 +156,7 @@ pub async fn run_install(cli: &Cli) -> Result<()> {
         let _ = writeln!(stdout, "Installing {} to system...", binary_path.display());
 
         // Determine config path
-        let config_path = dirs::config_dir()
-            .ok_or_else(|| anyhow::anyhow!("Could not determine config directory"))?
-            .join("kodegen")
+        let config_path = crate::platform::user_config_dir()
             .join("config.toml");
 
         // Call the actual installation logic (no progress channel in CLI mode)

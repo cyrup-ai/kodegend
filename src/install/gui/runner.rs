@@ -87,18 +87,8 @@ pub async fn run_gui_installation(cli: &super::super::cli::Cli) -> anyhow::Resul
         }
 
         // Get config path (platform-specific)
-        let config_path = match dirs::config_dir() {
-            Some(dir) => dir.join("kodegen").join("config.toml"),
-            None => {
-                let err = anyhow::anyhow!("Could not determine config directory");
-                let _ = tx.try_send(InstallProgress::error(
-                    "config".to_string(),
-                    format!("{}", err),
-                ));
-                let _ = result_tx.send(Err(err));
-                return;
-            }
-        };
+        let config_path = crate::platform::user_config_dir()
+            .join("config.toml");
 
         // Run daemon installation (function already accepts progress channel!)
         let auto_start = !cli_clone.no_start;

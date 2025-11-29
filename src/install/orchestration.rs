@@ -151,9 +151,7 @@ pub async fn run_install_with_options(options: &wizard::InstallOptions, _cli: &C
     };
 
     // Determine config path
-    let config_path = dirs::config_dir()
-        .ok_or_else(|| anyhow::anyhow!("Could not determine config directory"))?
-        .join("kodegen")
+    let config_path = crate::platform::user_config_dir()
         .join("config.toml");
 
     pb_overall.set_message("Configuring daemon service...");

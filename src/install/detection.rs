@@ -246,14 +246,10 @@ fn check_certificates_present() -> bool {
 
     #[cfg(windows)]
     {
-        if let Some(config_dir) = dirs::config_dir() {
-            let cert_dir = config_dir.join("kodegen").join("certs");
-            cert_dir.exists() && cert_dir.read_dir()
-                .map(|mut d| d.next().is_some())
-                .unwrap_or(false)
-        } else {
-            false
-        }
+        let cert_dir = crate::platform::user_config_dir().join("certs");
+        cert_dir.exists() && cert_dir.read_dir()
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false)
     }
 }
 
@@ -266,34 +262,11 @@ fn check_certificates_present() -> bool {
 /// - Linux: ~/.cache/kodegen/chromium/
 /// - Windows: %LOCALAPPDATA%\kodegen\chromium\
 fn check_chromium_installed() -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        if let Some(home) = dirs::home_dir() {
-            let chromium_path = home.join("Library/Caches/kodegen/chromium");
-            chromium_path.exists()
-        } else {
-            false
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        if let Some(cache) = dirs::cache_dir() {
-            let chromium_path = cache.join("kodegen/chromium");
-            chromium_path.exists()
-        } else {
-            false
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        if let Some(local_data) = dirs::data_local_dir() {
-            let chromium_path = local_data.join("kodegen\\chromium");
-            chromium_path.exists()
-        } else {
-            false
-        }
+    if let Ok(data_dir) = kodegen_config::KodegenConfig::data_dir() {
+        let chromium_path = data_dir.join("chromium");
+        chromium_path.exists()
+    } else {
+        false
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -609,9 +582,9 @@ pub fn check_certificates_status() -> ComponentStatus {
     let cert_dir = std::path::PathBuf::from("/usr/local/var/kodegen/certs");
 
     #[cfg(windows)]
-    let cert_dir = match dirs::config_dir() {
-        Some(dir) => dir.join("kodegen").join("certs"),
-        None => return ComponentStatus::CheckFailed,
+    let cert_dir = match kodegen_config::KodegenConfig::user_config_dir() {
+        Ok(dir) => dir.join("kodegend").join("certs"),
+        Err(_) => return ComponentStatus::CheckFailed,
     };
 
     let wildcard_cert_path = cert_dir.join("wildcard.pem");

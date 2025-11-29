@@ -9,6 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::fs::{self, DirBuilder};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use kodegen_config::KodegenConfig;
 use nix::unistd::{Pid, getpid, geteuid, Uid};
 use nix::sys::signal::kill;
 use anyhow::{Context, Result, bail};
@@ -166,17 +167,13 @@ pub fn platform_system_config_dir() -> PathBuf {
     PathBuf::from("/etc/kodegend")
 }
 
-/// User configuration directory: ~/.config/kodegend
+/// User configuration directory: ~/.config/kodegen/kodegend
 ///
-/// Follows XDG Base Directory Specification
+/// Follows XDG Base Directory Specification via kodegen-config
 pub fn platform_user_config_dir() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| {
-            dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("/tmp"))
-                .join(".config")
-        })
-        .join("kodegend")
+    KodegenConfig::user_config_dir()
+        .map(|dir| dir.join("kodegend"))
+        .unwrap_or_else(|_| PathBuf::from(".config/kodegen/kodegend"))
 }
 
 /// Runtime directory for PID files and sockets
@@ -247,17 +244,13 @@ pub fn platform_runtime_dir(is_elevated: bool) -> PathBuf {
 /// Log directory
 ///
 /// Elevated: /var/log/kodegend
-/// User: ~/.local/state/kodegend/logs
+/// User: Uses kodegen-config's log_dir for consistency
 pub fn platform_log_dir(is_elevated: bool) -> PathBuf {
     if is_elevated {
         PathBuf::from("/var/log/kodegend")
     } else {
-        dirs::state_dir()
-            .unwrap_or_else(|| {
-                dirs::home_dir()
-                    .unwrap_or_else(|| PathBuf::from("/tmp"))
-                    .join(".local/state")
-            })
-            .join("kodegend/logs")
+        // Use kodegen-config's log_dir for consistency
+        kodegen_config::KodegenConfig::log_dir()
+            .unwrap_or_else(|_| PathBuf::from("/tmp/kodegend/logs"))
     }
 }

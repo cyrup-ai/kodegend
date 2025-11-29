@@ -102,8 +102,10 @@ pub fn system_config_dir() -> PathBuf {
 
 /// User-specific configuration directory
 ///
-/// - Unix: ~/.config/kodegend (XDG_CONFIG_HOME)
-/// - Windows: %APPDATA%\kodegend
+/// - Unix: ~/.config/kodegen/kodegend
+/// - Windows: %APPDATA%\kodegen\kodegend
+/// 
+/// Delegates to kodegen-config for base path, then appends 'kodegend' subdirectory
 pub fn user_config_dir() -> PathBuf {
     platform_user_config_dir()
 }

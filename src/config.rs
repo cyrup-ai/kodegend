@@ -141,23 +141,16 @@ pub fn discover_certificate_paths() -> (Option<std::path::PathBuf>, Option<std::
     #[cfg(target_os = "macos")]
     let search_paths = vec![
         PathBuf::from("/usr/local/var/kodegen/certs"),
-        dirs::data_local_dir()
-            .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp")))
-            .join("kodegen")
+        kodegen_config::KodegenConfig::data_dir()
+            .unwrap_or_else(|_| PathBuf::from("/tmp"))
             .join("certs"),
     ];
 
     #[cfg(target_os = "linux")]
     let search_paths = vec![
         PathBuf::from("/var/lib/kodegen/certs"),
-        dirs::data_local_dir()
-            .unwrap_or_else(|| {
-                dirs::home_dir()
-                    .unwrap_or_else(|| PathBuf::from("/tmp"))
-                    .join(".local")
-                    .join("share")
-            })
-            .join("kodegen")
+        kodegen_config::KodegenConfig::data_dir()
+            .unwrap_or_else(|_| PathBuf::from("/tmp"))
             .join("certs"),
     ];
 
@@ -166,9 +159,8 @@ pub fn discover_certificate_paths() -> (Option<std::path::PathBuf>, Option<std::
         use crate::install::installer::windows::paths;
         vec![
             paths::cert_dir(),
-            dirs::data_dir()
-                .unwrap_or_else(|| PathBuf::from("C:\\temp"))
-                .join("Kodegen")
+            kodegen_config::KodegenConfig::data_dir()
+                .unwrap_or_else(|_| PathBuf::from("C:\\temp"))
                 .join("certs"),
         ]
     };

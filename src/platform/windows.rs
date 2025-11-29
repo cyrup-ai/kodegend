@@ -17,6 +17,7 @@
 
 use std::path::PathBuf;
 use std::mem;
+use kodegen_config::KodegenConfig;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, ERROR_INVALID_PARAMETER};
 use windows::Win32::System::Threading::{
     GetCurrentProcess,
@@ -137,12 +138,12 @@ pub(super) fn platform_system_config_dir() -> PathBuf {
 
 /// User-specific configuration directory
 ///
-/// Returns: %APPDATA%\kodegend (typically C:\Users\{user}\AppData\Roaming\kodegend)
-/// Uses `dirs` crate for proper Windows path resolution
+/// Returns: %APPDATA%\kodegen\kodegend (typically C:\Users\{user}\AppData\Roaming\kodegen\kodegend)
+/// Uses kodegen-config for consistent path resolution
 pub(super) fn platform_user_config_dir() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("%APPDATA%"))
-        .join("kodegend")
+    KodegenConfig::user_config_dir()
+        .map(|dir| dir.join("kodegend"))
+        .unwrap_or_else(|_| PathBuf::from("C:\\ProgramData\\kodegen\\kodegend"))
 }
 
 /// Runtime directory for PID files

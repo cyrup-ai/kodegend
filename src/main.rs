@@ -15,6 +15,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use kodegen_config::KodegenConfig;
 use log::{error, info};
 use manager::ServiceManager;
 use kodegend::install::ensure_installed;
@@ -90,9 +91,9 @@ async fn run_daemon(
         PathBuf::from("/etc/kodegend/kodegend.toml")
     } else {
         // Default to user config directory
-        let config_dir = dirs::config_dir()
-            .ok_or_else(|| anyhow::anyhow!("Could not determine config directory"))?
+        let config_dir = KodegenConfig::user_config_dir()?
             .join("kodegend");
+        fs::create_dir_all(&config_dir)?;
         config_dir.join("kodegend.toml")
     };
 
