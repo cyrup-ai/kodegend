@@ -76,9 +76,7 @@ pub async fn install_kodegen_daemon(
                 info!("Installation pipeline completed successfully");
                 ctx
             })
-            .map_err(|e: anyhow::Error| {
-                anyhow::anyhow!("Installation pipeline failed: {e}")
-            })
+            .map_err(|e: anyhow::Error| anyhow::anyhow!("Installation pipeline failed: {e}"))
             .await?
     };
 
@@ -111,7 +109,7 @@ pub async fn install_kodegen_daemon(
     // Hosts file modification is deferred to install_with_elevated_privileges() in main.rs
     // This runs as unprivileged user - privileged operations happen at the end of installation
     // add_kodegen_host_entries() is now called from install_with_elevated_privileges()
-    
+
     // Mark as not yet added - will be set to true if privileged ops succeed
     host_entries_added = false;
 

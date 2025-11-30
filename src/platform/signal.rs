@@ -2,8 +2,8 @@
 //!
 //! Unified API for OS signals on Unix (POSIX) and Windows (Console Control Handlers).
 
-use anyhow::{Result, Context};
-use crossbeam_channel::{Sender, Receiver, bounded};
+use anyhow::{Context, Result};
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use std::panic::{self, AssertUnwindSafe};
 use std::thread;
 use std::time::Duration;
@@ -13,10 +13,10 @@ use std::time::Duration;
 pub enum SignalKind {
     /// Termination request (SIGTERM on Unix, CTRL+CLOSE on Windows)
     Terminate,
-    
+
     /// Interrupt signal (SIGINT/CTRL+C on both platforms)
     Interrupt,
-    
+
     /// Hangup signal (SIGHUP on Unix, CTRL+BREAK on Windows)
     /// Used for configuration reload
     Hangup,
@@ -27,15 +27,15 @@ pub enum SignalKind {
 }
 
 /// Cross-platform signal watcher with automatic thread cleanup
-/// 
+///
 /// Spawns a background thread to monitor OS signals and forwards them
 /// to a crossbeam channel. The thread is automatically joined when
 /// the watcher is dropped, providing proper RAII resource management.
-/// 
+///
 /// # Example
 /// ```
 /// let watcher = watch_signals()?;
-/// 
+///
 /// loop {
 ///     select! {
 ///         recv(watcher.receiver()) -> sig => {
@@ -55,7 +55,7 @@ pub struct SignalWatcher {
 
 impl SignalWatcher {
     /// Get a reference to the signal receiver channel
-    /// 
+    ///
     /// Use this with crossbeam's select! macro to receive signals
     /// in the daemon's main event loop.
     pub fn receiver(&self) -> &Receiver<SignalKind> {
@@ -72,12 +72,12 @@ impl SignalWatcher {
 
 impl Drop for SignalWatcher {
     /// Automatically clean up signal watcher thread on drop
-    /// 
+    ///
     /// This runs during:
     /// - Normal function return
     /// - Early return (?)  
     /// - Panic unwinding
-    /// 
+    ///
     /// Does NOT run during:
     /// - SIGKILL (kill -9) - immediate termination
     /// - Process::abort() - immediate termination
@@ -88,7 +88,7 @@ impl Drop for SignalWatcher {
         if let Some(rx) = self.rx.take() {
             drop(rx);
         }
-        
+
         // Step 2: Join the thread and wait for it to finish
         if let Some(handle) = self.thread_handle.take() {
             match handle.join() {
@@ -110,11 +110,11 @@ impl Drop for SignalWatcher {
 /// Spawns background thread that listens for OS signals and forwards them
 /// to the returned channel. The thread is automatically joined when the
 /// SignalWatcher is dropped, providing proper RAII cleanup.
-/// 
+///
 /// # Example
 /// ```
 /// let watcher = watch_signals()?;
-/// 
+///
 /// loop {
 ///     select! {
 ///         recv(watcher.receiver()) -> sig => {
@@ -124,14 +124,14 @@ impl Drop for SignalWatcher {
 /// }
 /// ```
 pub fn watch_signals() -> Result<SignalWatcher> {
-    let (tx, rx) = bounded::<SignalKind>(16);
-    
+    let (tx, rx) = unbounded::<SignalKind>();
+
     #[cfg(unix)]
     let handle = spawn_unix_watcher(tx)?;
-    
+
     #[cfg(windows)]
     let handle = spawn_windows_watcher(tx)?;
-    
+
     Ok(SignalWatcher {
         rx: Some(rx),
         thread_handle: Some(handle),
@@ -150,19 +150,19 @@ fn run_unix_signal_handler(tx: Sender<SignalKind>) {
         .enable_all()
         .build()
         .expect("Failed to create tokio runtime for signal handling");
-    
+
     rt.block_on(async {
-        use tokio::signal::unix::{signal, SignalKind as TokioSignalKind};
-        
-        let mut sigterm = signal(TokioSignalKind::terminate())
-            .expect("Failed to install SIGTERM handler");
-        
-        let mut sigint = signal(TokioSignalKind::interrupt())
-            .expect("Failed to install SIGINT handler");
-        
-        let mut sighup = signal(TokioSignalKind::hangup())
-            .expect("Failed to install SIGHUP handler");
-        
+        use tokio::signal::unix::{SignalKind as TokioSignalKind, signal};
+
+        let mut sigterm =
+            signal(TokioSignalKind::terminate()).expect("Failed to install SIGTERM handler");
+
+        let mut sigint =
+            signal(TokioSignalKind::interrupt()).expect("Failed to install SIGINT handler");
+
+        let mut sighup =
+            signal(TokioSignalKind::hangup()).expect("Failed to install SIGHUP handler");
+
         loop {
             tokio::select! {
                 _ = sigterm.recv() => {
@@ -254,12 +254,12 @@ fn spawn_unix_watcher(tx: Sender<SignalKind>) -> Result<std::thread::JoinHandle<
             }
         })
         .context("Failed to spawn Unix signal watcher thread")?;
-    
+
     Ok(handle)
 }
 
 // ============================================================================
-// Windows Implementation  
+// Windows Implementation
 // ============================================================================
 
 /// Internal: Run Windows signal handler loop (can panic - caller must handle)
@@ -270,22 +270,19 @@ fn run_windows_signal_handler(tx: Sender<SignalKind>) {
         .enable_all()
         .build()
         .expect("Failed to create tokio runtime for signal handling");
-    
+
     rt.block_on(async {
         use tokio::signal::windows;
-        
-        let mut ctrl_c = windows::ctrl_c()
-            .expect("Failed to install CTRL+C handler");
-        
-        let mut ctrl_break = windows::ctrl_break()
-            .expect("Failed to install CTRL+BREAK handler");
-        
-        let mut ctrl_close = windows::ctrl_close()
-            .expect("Failed to install CTRL+CLOSE handler");
-        
-        let mut ctrl_shutdown = windows::ctrl_shutdown()
-            .expect("Failed to install CTRL+SHUTDOWN handler");
-        
+
+        let mut ctrl_c = windows::ctrl_c().expect("Failed to install CTRL+C handler");
+
+        let mut ctrl_break = windows::ctrl_break().expect("Failed to install CTRL+BREAK handler");
+
+        let mut ctrl_close = windows::ctrl_close().expect("Failed to install CTRL+CLOSE handler");
+
+        let mut ctrl_shutdown =
+            windows::ctrl_shutdown().expect("Failed to install CTRL+SHUTDOWN handler");
+
         loop {
             tokio::select! {
                 _ = ctrl_c.recv() => {
@@ -378,6 +375,6 @@ fn spawn_windows_watcher(tx: Sender<SignalKind>) -> Result<std::thread::JoinHand
             }
         })
         .context("Failed to spawn Windows signal watcher thread")?;
-    
+
     Ok(handle)
 }

@@ -6,16 +6,16 @@
 
 // Module declarations
 mod async_task;
-mod progress;
 mod certificate;
-mod service;
 mod context;
+mod progress;
+mod service;
 
 // Re-export all public types
 pub use async_task::AsyncTask;
-pub use progress::InstallProgress;
+pub use certificate::CertificateConfig;
+pub use context::InstallContext;
 #[allow(unused_imports)]
 pub use progress::DownloadPhase;
-pub use certificate::CertificateConfig;
+pub use progress::InstallProgress;
 pub use service::ServiceConfig;
-pub use context::InstallContext;

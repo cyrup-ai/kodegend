@@ -1,10 +1,11 @@
 use std::borrow::Cow;
+use std::sync::Arc;
 use std::fmt;
 
 use chrono::{DateTime, Utc};
 
 /// Service state for IPC event reporting
-/// 
+///
 /// Represents the runtime state of a managed service or the manager itself.
 /// Used in `Evt::State` for type-safe state communication between workers and manager.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,23 +46,23 @@ pub enum Cmd {
     /// Start the service
     /// correlation_id: Used to match Evt::State responses
     Start { correlation_id: u64 },
-    
+
     /// Stop the service
     /// correlation_id: Used to match Evt::State responses
     Stop { correlation_id: u64 },
-    
+
     /// Restart the service (stop + start)
     /// correlation_id: Used to match Evt::State responses
     Restart { correlation_id: u64 },
-    
+
     /// Shutdown worker thread
     /// No correlation_id: This is a fire-and-forget broadcast command
     Shutdown,
-    
+
     /// Periodic health probe
     /// correlation_id: Used to match Evt::Health responses
     TickHealth { correlation_id: u64 },
-    
+
     /// Periodic log rotation
     /// correlation_id: Used to match Evt::LogRotate responses
     TickLogRotate { correlation_id: u64 },
@@ -71,7 +72,7 @@ pub enum Cmd {
 #[derive(Debug, Clone)]
 pub enum Evt {
     State {
-        service: String,
+        service: Arc<str>,
         state: ServiceState,
         ts: DateTime<Utc>,
         pid: Option<u32>,
@@ -80,20 +81,20 @@ pub enum Evt {
         correlation_id: Option<u64>,
     },
     Health {
-        service: String,
+        service: Arc<str>,
         healthy: bool,
         ts: DateTime<Utc>,
         /// Correlation ID from the TickHealth command that triggered this
         correlation_id: u64,
     },
     LogRotate {
-        service: String,
+        service: Arc<str>,
         ts: DateTime<Utc>,
         /// Correlation ID from the TickLogRotate command that triggered this
         correlation_id: u64,
     },
     Fatal {
-        service: String,
+        service: Arc<str>,
         msg: Cow<'static, str>,
         ts: DateTime<Utc>,
         // No correlation_id: Fatal events are always spontaneous

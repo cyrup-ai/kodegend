@@ -2,8 +2,8 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
 use log::warn;
@@ -17,11 +17,11 @@ use super::service::ServiceConfig;
 
 #[cfg(windows)]
 use windows::{
-    core::PCWSTR,
     Win32::Foundation::{CloseHandle, GetLastError, HWND},
-    Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, INFINITE},
-    Win32::UI::Shell::{ShellExecuteExW, SHELLEXECUTEINFOW, SEE_MASK_NOCLOSEPROCESS},
+    Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject},
+    Win32::UI::Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW},
     Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
+    core::PCWSTR,
 };
 
 /// Installation context
@@ -126,17 +126,14 @@ impl InstallContext {
             }
 
             // try_send for synchronous context (we're in sync fn)
-            tx.try_send(progress)
-                .map_err(|e| match e {
-                    tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                        anyhow::anyhow!("Installation cancelled: progress channel closed")
-                    }
-                    tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                        anyhow::anyhow!(
-                            "Progress channel full - GUI not consuming updates fast enough"
-                        )
-                    }
-                })?;
+            tx.try_send(progress).map_err(|e| match e {
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                    anyhow::anyhow!("Installation cancelled: progress channel closed")
+                }
+                tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                    anyhow::anyhow!("Progress channel full - GUI not consuming updates fast enough")
+                }
+            })?;
         }
         Ok(())
     }
@@ -335,44 +332,34 @@ impl InstallContext {
         {
             // Check if process is elevated using Windows Security API
             // Pattern: OpenProcessToken + GetTokenInformation with TokenElevation
-            // See: packages/kodegend/src/platform/windows.rs:41-71
-            // See: packages/kodegend/src/install/installer/windows/privileges.rs:24-51
-            
+            // See: packages/kodegend/src/platform/windows/mod.rs (platform_is_elevated)
+            // See: packages/kodegend/src/install/installer/windows/privileges.rs (check_privileges)
+
             use std::mem;
-            use windows::Win32::Foundation::{CloseHandle, HANDLE};
-            use windows::Win32::Security::{
-                GetTokenInformation,
-                OpenProcessToken,
-                TokenElevation,
-                TOKEN_ELEVATION,
-                TOKEN_QUERY,
-            };
-            use windows::Win32::System::Threading::GetCurrentProcess;
+            use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TokenElevation};
+            use crate::platform::windows::TokenHandle;
 
-            let is_elevated = unsafe {
-                let mut token_handle: HANDLE = HANDLE::default();
+            let is_elevated = (|| -> anyhow::Result<bool> {
+                // Open current process token - handle auto-closed on drop
+                let token = TokenHandle::open_current_process_query()?;
 
-                // Open process token with query access
-                if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token_handle).is_err() {
-                    false
-                } else {
-                    // Query token elevation information
+                unsafe {
                     let mut elevation: TOKEN_ELEVATION = mem::zeroed();
                     let mut return_length: u32 = 0;
 
-                    let result = GetTokenInformation(
-                        token_handle,
+                    GetTokenInformation(
+                        token.as_raw(),
                         TokenElevation,
                         Some(&mut elevation as *mut _ as *mut std::ffi::c_void),
                         mem::size_of::<TOKEN_ELEVATION>() as u32,
                         &mut return_length,
-                    );
+                    )?;
 
-                    CloseHandle(token_handle);
-
-                    result.is_ok() && elevation.TokenIsElevated != 0
+                    Ok(elevation.TokenIsElevated != 0)
                 }
-            };
+                // Token handle automatically closed here
+            })()
+            .unwrap_or(false);
 
             if !is_elevated {
                 return Err(anyhow::anyhow!(
@@ -503,8 +490,7 @@ impl InstallContext {
         use std::io::Write;
 
         // Get the current executable path and arguments
-        let exe_path = std::env::current_exe()
-            .context("Failed to get current executable path")?;
+        let exe_path = std::env::current_exe().context("Failed to get current executable path")?;
         let args: Vec<String> = std::env::args().collect();
 
         eprintln!("   Current exe: {exe_path:?}");
@@ -530,13 +516,13 @@ impl InstallContext {
         // Set up SHELLEXECUTEINFOW structure
         let mut sei = SHELLEXECUTEINFOW {
             cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
-            fMask: SEE_MASK_NOCLOSEPROCESS,  // Keep process handle for waiting
+            fMask: SEE_MASK_NOCLOSEPROCESS, // Keep process handle for waiting
             hwnd: HWND::default(),
             lpVerb: PCWSTR(verb.as_ptr()),
             lpFile: PCWSTR(exe_path_wide.as_ptr()),
             lpParameters: PCWSTR(args_wide.as_ptr()),
             lpDirectory: PCWSTR::null(),
-            nShow: SW_SHOWNORMAL.0 as i32,  // Show window normally
+            nShow: SW_SHOWNORMAL.0 as i32, // Show window normally
             hInstApp: Default::default(),
             lpIDList: std::ptr::null_mut(),
             lpClass: PCWSTR::null(),

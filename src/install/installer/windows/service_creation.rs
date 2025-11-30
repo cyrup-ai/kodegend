@@ -5,23 +5,19 @@ use std::path::PathBuf;
 
 use windows::Win32::Foundation::ERROR_SERVICE_EXISTS;
 use windows::Win32::System::Services::{
-    ChangeServiceConfig2W, CreateServiceW, OpenServiceW,
-    SC_ACTION, SC_ACTION_RESTART,
-    SERVICE_ALL_ACCESS, SERVICE_AUTO_START,
-    SERVICE_CONFIG_DELAYED_AUTO_START_INFO, SERVICE_CONFIG_DESCRIPTION,
-    SERVICE_CONFIG_DESCRIPTION_W,
-    SERVICE_CONFIG_FAILURE_ACTIONS,
-    SERVICE_CONFIG_FAILURE_ACTIONSW,
-    SERVICE_CONFIG_SERVICE_SID_INFO,
+    ChangeServiceConfig2W, CreateServiceW, OpenServiceW, SC_ACTION, SC_ACTION_RESTART,
+    SERVICE_ALL_ACCESS, SERVICE_AUTO_START, SERVICE_CONFIG_DELAYED_AUTO_START_INFO,
+    SERVICE_CONFIG_DESCRIPTION, SERVICE_CONFIG_DESCRIPTION_W, SERVICE_CONFIG_FAILURE_ACTIONS,
+    SERVICE_CONFIG_FAILURE_ACTIONSW, SERVICE_CONFIG_SERVICE_SID_INFO,
     SERVICE_DELAYED_AUTO_START_INFO, SERVICE_DEMAND_START, SERVICE_ERROR_IGNORE,
     SERVICE_FAILURE_ACTIONSW, SERVICE_SID_TYPE_UNRESTRICTED, SERVICE_WIN32_OWN_PROCESS,
     StartServiceW,
 };
 use windows::core::{PCWSTR, PWSTR};
 
-use super::{InstallerBuilder, InstallerError};
 use super::handles::{ScManagerHandle, ServiceHandle};
-use super::utils::{str_to_wide, MAX_PATH, MAX_SERVICE_NAME, MAX_DESCRIPTION, MAX_DEPENDENCIES};
+use super::utils::{MAX_DEPENDENCIES, MAX_DESCRIPTION, MAX_PATH, MAX_SERVICE_NAME, str_to_wide};
+use super::{InstallerBuilder, InstallerError};
 
 /// Create the Windows service with comprehensive configuration
 pub(super) fn create_service(
@@ -122,9 +118,7 @@ pub(super) fn configure_service_description(
             SERVICE_CONFIG_DESCRIPTION,
             Some(&service_desc as *const _ as *const std::ffi::c_void),
         )
-        .map_err(|e| {
-            InstallerError::System(format!("Failed to set service description: {}", e))
-        })?;
+        .map_err(|e| InstallerError::System(format!("Failed to set service description: {}", e)))?;
     }
 
     Ok(())
@@ -268,9 +262,8 @@ pub(super) fn install_services(
     services: &[crate::config::ServiceDefinition],
 ) -> Result<(), InstallerError> {
     for service in services {
-        let service_toml = toml::to_string_pretty(service).map_err(|e| {
-            InstallerError::System(format!("Failed to serialize service: {}", e))
-        })?;
+        let service_toml = toml::to_string_pretty(service)
+            .map_err(|e| InstallerError::System(format!("Failed to serialize service: {}", e)))?;
 
         // Create services directory
         use super::paths;
@@ -281,9 +274,8 @@ pub(super) fn install_services(
 
         // Write service file
         let service_file = services_dir.join(format!("{}.toml", service.name));
-        std::fs::write(&service_file, service_toml).map_err(|e| {
-            InstallerError::System(format!("Failed to write service file: {}", e))
-        })?;
+        std::fs::write(&service_file, service_toml)
+            .map_err(|e| InstallerError::System(format!("Failed to write service file: {}", e)))?;
     }
     Ok(())
 }

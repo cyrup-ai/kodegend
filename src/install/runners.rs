@@ -12,8 +12,8 @@ use super::binary_staging;
 use super::chromium;
 use super::cli::Cli;
 use super::download;
-use crate::install;
 use super::privilege;
+use crate::install;
 
 #[cfg(feature = "gui")]
 use crate::install::gui;
@@ -54,7 +54,10 @@ pub async fn run_install(cli: &Cli) -> Result<()> {
             if let Some(meta) = &progress.download_metadata {
                 match meta.phase {
                     DownloadPhase::Discovering => {
-                        eprintln!("🔍 Checking {} ({}/{})", meta.binary_name, meta.binary_index, BINARY_COUNT);
+                        eprintln!(
+                            "🔍 Checking {} ({}/{})",
+                            meta.binary_name, meta.binary_index, BINARY_COUNT
+                        );
                     }
                     DownloadPhase::Downloading => {
                         let mb_dl = meta.bytes_downloaded as f64 / 1_048_576.0;
@@ -87,7 +90,8 @@ pub async fn run_install(cli: &Cli) -> Result<()> {
         let _ = writeln!(stdout, "📥 Downloading binaries from GitHub...");
         let _ = stdout.reset();
 
-        download::download_all_binaries(tx).await?
+        let (paths, _download_dir) = download::download_all_binaries(tx).await?;
+        paths
     } else {
         let _ = stdout.set_color(ColorSpec::new().set_fg(Some(Color::Green)));
         let _ = writeln!(stdout, "✓ kodegen is up to date, skipping download\n");
@@ -156,13 +160,13 @@ pub async fn run_install(cli: &Cli) -> Result<()> {
         let _ = writeln!(stdout, "Installing {} to system...", binary_path.display());
 
         // Determine config path
-        let config_path = crate::platform::user_config_dir()
-            .join("config.toml");
+        let config_path = crate::platform::user_config_dir().join("config.toml");
 
         // Call the actual installation logic (no progress channel in CLI mode)
         let auto_start = !cli.no_start;
         let result =
-            install::config::install_kodegen_daemon(binary_path, config_path, auto_start, None).await?;
+            install::config::install_kodegen_daemon(binary_path, config_path, auto_start, None)
+                .await?;
 
         let _ = stdout.set_color(ColorSpec::new().set_fg(Some(Color::Green)).set_bold(true));
         let _ = writeln!(
@@ -171,11 +175,7 @@ pub async fn run_install(cli: &Cli) -> Result<()> {
             result.data_dir.display()
         );
         let _ = stdout.reset();
-        let _ = writeln!(
-            stdout,
-            "   Service: {}",
-            result.service_path.display()
-        );
+        let _ = writeln!(stdout, "   Service: {}", result.service_path.display());
 
         if !result.certificates_installed {
             let _ = stdout.set_color(ColorSpec::new().set_fg(Some(Color::Yellow)));

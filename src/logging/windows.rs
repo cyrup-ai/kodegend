@@ -22,24 +22,13 @@
 //! - **Registration**: Requires HKLM write access (Administrator only)
 //! - **Runtime logging**: Works as any user (no elevation needed)
 
-use anyhow::{Result, Context};
+use anyhow::Result;
 use log::LevelFilter;
 
 pub(super) fn platform_init_logging() -> Result<()> {
     // Create env_logger for console/file output
     let env_logger = env_logger::Builder::from_default_env()
-        .format(|buf, record| {
-            use std::io::Write;
-            writeln!(
-                buf,
-                "[{} {} {}:{}] {}",
-                buf.timestamp_millis(),
-                record.level(),
-                record.file().unwrap_or("unknown"),
-                record.line().unwrap_or(0),
-                record.args()
-            )
-        })
+        .format(super::kodegend_log_format)
         .filter_level(LevelFilter::Info)
         .build();
 
@@ -55,20 +44,45 @@ pub(super) fn platform_init_logging() -> Result<()> {
         Err(e) => {
             // Log to stderr (goes to console before logger is initialized)
             eprintln!("Warning: Failed to create Windows Event Log logger: {}", e);
-            eprintln!("Continuing with console-only logging. Run 'kodegend install' with Administrator privileges to enable Event Log.");
+            eprintln!(
+                "Continuing with console-only logging. Run 'kodegend install' with Administrator privileges to enable Event Log."
+            );
         }
     }
 
     // Initialize multi-logger with whatever loggers we have
-    multi_log::MultiLogger::init(loggers, log::Level::Info)
-        .context("Failed to initialize logging framework")?;
-
-    // Log ACCURATE status based on what actually succeeded
-    if event_log_enabled {
-        log::info!("Logging initialized: console + Windows Event Log");
-    } else {
-        log::warn!("Logging initialized: console only (Windows Event Log unavailable)");
+    match multi_log::MultiLogger::init(loggers, log::Level::Info) {
+        Ok(_) => {
+            // Success: MultiLogger is active
+            // Log accurate status based on what actually succeeded
+            if event_log_enabled {
+                log::info!("Logging initialized: console + Windows Event Log");
+            } else {
+                log::warn!("Logging initialized: console only (Windows Event Log unavailable)");
+            }
+        }
+        Err(e) => {
+            // MultiLogger failed - fall back to basic env_logger
+            eprintln!("Warning: MultiLogger initialization failed: {}", e);
+            eprintln!("Falling back to basic console logging");
+            
+            // Reinitialize with basic env_logger as fallback
+            // Use try_init() because MultiLogger may have partially initialized the global logger
+            env_logger::Builder::from_default_env()
+                .format(super::kodegend_log_format)
+                .filter_level(LevelFilter::Info)
+                .try_init()
+                .unwrap_or_else(|e| {
+                    // Even try_init() failed - this is extremely rare
+                    eprintln!("CRITICAL: Cannot initialize any logging: {}", e);
+                    eprintln!("Service will continue but logs may be lost");
+                    // Don't exit - let the service run without logging
+                });
+            
+            // Log warning using the fallback logger (if it initialized successfully)
+            log::warn!("Logging initialized in fallback mode (basic console only)");
+        }
     }
     
-    Ok(())
+    Ok(())  // Always return Ok - service must start
 }

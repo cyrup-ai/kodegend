@@ -7,9 +7,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use anyhow::{Context, Result};
 use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
-use windows::Win32::System::Services::{
-    OpenSCManagerW, SC_MANAGER_ALL_ACCESS,
-};
+use windows::Win32::System::Services::{OpenSCManagerW, SC_MANAGER_ALL_ACCESS};
 use windows::core::PCWSTR;
 
 use super::{InstallerBuilder, InstallerError};
@@ -22,20 +20,22 @@ mod service_creation;
 mod utils;
 
 use handles::{ScManagerHandle, ServiceHandle};
-use privileges::{check_privileges, ensure_helper_path, HELPER_PATH, HELPER_EXTRACTION_LOCK};
+use privileges::{HELPER_EXTRACTION_LOCK, HELPER_PATH, check_privileges, ensure_helper_path};
 use registry::{
-    create_registry_entries, cleanup_registry_entries,
-    register_event_source, unregister_event_source,
+    cleanup_registry_entries, create_registry_entries, register_event_source,
+    unregister_event_source,
 };
 use service_creation::{
-    create_service, configure_service_description, configure_failure_actions,
-    configure_delayed_start, configure_service_sid,
-    start_service, stop_service, open_service, install_services,
+    configure_delayed_start, configure_failure_actions, configure_service_description,
+    configure_service_sid, create_service, install_services, open_service, start_service,
+    stop_service,
 };
-use utils::{str_to_wide, MAX_SERVICE_NAME};
+use utils::{MAX_SERVICE_NAME, str_to_wide};
 
 // Re-export paths module for use in other modules
-pub use paths::{InstallScope, install_dir, kodegend_exe, installer_data_dir, hosts_file, temp_cert_file};
+pub use paths::{
+    InstallScope, hosts_file, install_dir, installer_data_dir, kodegend_exe, temp_cert_file,
+};
 
 pub(crate) struct PlatformExecutor;
 

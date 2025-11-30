@@ -214,11 +214,7 @@ pub fn show_completion_panel(
 }
 
 /// Show error panel when installation fails
-pub fn show_error_panel(
-    window: &InstallWindow,
-    ui: &mut egui::Ui,
-    _frame: &mut eframe::Frame,
-) {
+pub fn show_error_panel(window: &InstallWindow, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
     // Error icon (large, prominent)
     ui.label(
         egui::RichText::new("❌")

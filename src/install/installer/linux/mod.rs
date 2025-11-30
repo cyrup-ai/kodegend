@@ -22,14 +22,14 @@ use anyhow::{Context, Result};
 use super::{InstallerBuilder, InstallerError};
 
 // Submodules
-mod helper;
-mod privileges;
-mod file_ops;
-mod unit;
 mod dropin;
+mod file_ops;
+mod helper;
 mod journal;
+mod privileges;
 mod service_control;
 mod services;
+mod unit;
 
 // Re-export for internal use
 pub(crate) use unit::SystemdConfig;
@@ -48,6 +48,25 @@ pub(crate) struct PlatformExecutor;
 impl PlatformExecutor {
     /// Install the daemon as a systemd service with comprehensive configuration
     pub fn install(b: InstallerBuilder) -> Result<(), InstallerError> {
+        use crate::platform;
+        
+        // ═══════════════════════════════════════════════════════════════
+        // STEP 1: Verify systemd is available
+        // ═══════════════════════════════════════════════════════════════
+        if !platform::is_systemd_available() {
+            return Err(InstallerError::System(
+                "systemd not detected on this system.\n\n\
+                 This Linux system appears to use a different init system (OpenRC, runit, sysvinit, etc.).\n\
+                 kodegend currently requires systemd for service management.\n\n\
+                 Workarounds:\n\
+                 1. Run kodegend manually: `kodegend daemon`\n\
+                 2. Create init scripts for your init system manually\n\
+                 3. Use kodegend in foreground mode for testing\n\n\
+                 Detected init system check: /run/systemd/system does not exist"
+                    .to_string()
+            ));
+        }
+        
         // System daemons always use system directory
         let unit_dir = PathBuf::from("/etc/systemd/system");
 
@@ -56,7 +75,8 @@ impl PlatformExecutor {
         privileges::check_privileges()?;
 
         // Create systemd configuration
-        let env_vec: Vec<(String, String)> = b.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let env_vec: Vec<(String, String)> =
+            b.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         let config = SystemdConfig {
             service_name: &b.label,
             description: &b.description,

@@ -3,14 +3,13 @@
 use std::path::PathBuf;
 
 use windows::Win32::System::Registry::{
-    HKEY, HKEY_LOCAL_MACHINE, KEY_WRITE, REG_DWORD, REG_SZ,
-    RegCreateKeyExW, RegSetValueExW,
+    HKEY, HKEY_LOCAL_MACHINE, KEY_WRITE, REG_DWORD, REG_SZ, RegCreateKeyExW, RegSetValueExW,
 };
 use windows::core::PCWSTR;
 
-use super::{InstallerBuilder, InstallerError};
 use super::handles::RegistryHandle;
 use super::utils::str_to_wide;
+use super::{InstallerBuilder, InstallerError};
 
 /// Create registry entries for service configuration
 pub(super) fn create_registry_entries(builder: &InstallerBuilder) -> Result<(), InstallerError> {
@@ -73,7 +72,10 @@ pub(super) fn register_event_source(service_name: &str) -> Result<(), InstallerE
             service_name, e
         )))?;
 
-    log::info!("Windows Event Log source '{}' registered successfully", service_name);
+    log::info!(
+        "Windows Event Log source '{}' registered successfully",
+        service_name
+    );
     Ok(())
 }
 
@@ -88,13 +90,17 @@ pub(super) fn cleanup_registry_entries(service_name: &str) -> Result<(), Install
 ///
 /// Removes the Event Log source registry entries for the service.
 pub(super) fn unregister_event_source(service_name: &str) -> Result<(), InstallerError> {
-    eventlog::deregister(service_name)
-        .map_err(|e| InstallerError::System(format!(
+    eventlog::deregister(service_name).map_err(|e| {
+        InstallerError::System(format!(
             "Failed to deregister Windows Event Log source '{}': {}",
             service_name, e
-        )))?;
+        ))
+    })?;
 
-    log::info!("Windows Event Log source '{}' deregistered successfully", service_name);
+    log::info!(
+        "Windows Event Log source '{}' deregistered successfully",
+        service_name
+    );
     Ok(())
 }
 

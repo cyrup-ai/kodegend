@@ -1,11 +1,12 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender};
 use kodegen_bundler_autoconfig::{clients::all_clients, watcher::AutoConfigWatcher};
 use log::{error, info};
+use scopeguard::defer;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::ServiceDefinition;
@@ -13,14 +14,14 @@ use crate::ipc::{Cmd, Evt, ServiceState};
 
 /// Auto-configuration service that watches for MCP client installations
 pub struct AutoConfigService {
-    name: String,
+    name: Arc<str>,
     bus: Sender<Evt>,
 }
 
 impl AutoConfigService {
     pub fn new(def: ServiceDefinition, bus: Sender<Evt>) -> Self {
         Self {
-            name: def.name,
+            name: Arc::from(def.name.as_str()),
             bus,
         }
     }
@@ -33,6 +34,8 @@ impl AutoConfigService {
 
         // Create cancellation token for graceful shutdown
         let cancel_token = CancellationToken::new();
+
+        // Create shutdown completion flag for lock-free coordination
         let shutdown_complete = Arc::new(AtomicBool::new(false));
 
         // Create the watcher with all client plugins
@@ -42,14 +45,14 @@ impl AutoConfigService {
         // Spawn the watcher task with graceful cancellation
         let watcher_handle = rt.spawn({
             let bus = self.bus.clone();
-            let service_name = self.name.clone();
+            let service_name = Arc::clone(&self.name);
             let cancel_token = cancel_token.clone();
-            let shutdown_complete = shutdown_complete.clone();
+            let shutdown_complete = Arc::clone(&shutdown_complete);
 
             async move {
                 // Notify daemon we're starting
                 let _ = bus.send(Evt::State {
-                    service: service_name.clone(),
+                    service: Arc::clone(&service_name),
                     state: ServiceState::Running,
                     ts: chrono::Utc::now(),
                     pid: Some(std::process::id()),
@@ -62,8 +65,8 @@ impl AutoConfigService {
                         if let Err(e) = result {
                             error!("Auto-config watcher failed: {e}");
                             let _ = bus.send(Evt::Fatal {
-                                service: service_name.clone(),
-                                msg: "Watcher error occurred".into(),
+                                service: Arc::clone(&service_name),
+                                msg: format!("Auto-config watcher failed: {}", e).into(),
                                 ts: chrono::Utc::now(),
                             });
                         }
@@ -71,7 +74,7 @@ impl AutoConfigService {
                     () = cancel_token.cancelled() => {
                         info!("Auto-config watcher cancelled gracefully");
                         let _ = bus.send(Evt::State {
-                            service: service_name.clone(),
+                            service: Arc::clone(&service_name),
                             state: ServiceState::StoppedClean,
                             ts: chrono::Utc::now(),
                             pid: Some(std::process::id()),
@@ -79,11 +82,44 @@ impl AutoConfigService {
                         });
                     }
                 }
-
-                // Signal shutdown completion atomically
+                
+                // Signal shutdown completion
                 shutdown_complete.store(true, Ordering::Release);
             }
         });
+
+        // CLEANUP GUARD: Ensures cleanup happens on ALL exit paths
+        // This defer block runs when run() exits, regardless of how:
+        // - Normal shutdown (Cmd::Stop/Shutdown breaks loop)
+        // - Channel error (cmd_rx.recv() returns Err)
+        // - Panic in command loop
+        defer! {
+            // Only cleanup if task hasn't already shut down gracefully
+            if !shutdown_complete.load(Ordering::Acquire) {
+                // Attempt graceful cancellation first
+                cancel_token.cancel();
+                
+                // Wait briefly for graceful shutdown with exponential backoff
+                let timeout = std::time::Duration::from_secs(5);
+                let start = std::time::Instant::now();
+                let mut backoff_ms = 1;
+                
+                while !shutdown_complete.load(Ordering::Acquire) && start.elapsed() < timeout {
+                    std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                    backoff_ms = (backoff_ms * 2).min(100);  // Cap at 100ms
+                }
+                
+                // Force abort if still running after timeout
+                if !shutdown_complete.load(Ordering::Acquire) {
+                    info!("Cleanup guard: Graceful shutdown timeout, aborting task");
+                    watcher_handle.abort();
+                }
+            }
+            
+            // CRITICAL: Always wait for task to fully complete
+            // This ensures the tokio runtime can shut down cleanly
+            let _ = rt.block_on(watcher_handle);
+        }
 
         // Handle control commands with lock-free coordination
         loop {
@@ -93,30 +129,16 @@ impl AutoConfigService {
                 }
                 Cmd::Stop { correlation_id: _ } => {
                     info!("Stopping auto-config service");
-                    let did_abort = perform_graceful_shutdown(&cancel_token, &watcher_handle, &shutdown_complete);
-                    
-                    // Ensure task is fully cleaned up
-                    // Only abort if we didn't already abort in the timeout loop
-                    if !did_abort && !shutdown_complete.load(Ordering::Acquire) {
-                        watcher_handle.abort();
-                    }
-                    
-                    // Wait for final task completion
-                    let _ = rt.block_on(watcher_handle);
+                    // Trigger graceful shutdown via helper
+                    // Final cleanup is guaranteed by defer! guard above
+                    let _did_abort = perform_graceful_shutdown(&cancel_token, &watcher_handle, &shutdown_complete);
                     break;
                 }
                 Cmd::Shutdown => {
                     info!("Shutting down auto-config service");
-                    let did_abort = perform_graceful_shutdown(&cancel_token, &watcher_handle, &shutdown_complete);
-                    
-                    // Ensure task is fully cleaned up
-                    // Only abort if we didn't already abort in the timeout loop
-                    if !did_abort && !shutdown_complete.load(Ordering::Acquire) {
-                        watcher_handle.abort();
-                    }
-                    
-                    // Wait for final task completion
-                    let _ = rt.block_on(watcher_handle);
+                    // Trigger graceful shutdown via helper
+                    // Final cleanup is guaranteed by defer! guard above
+                    let _did_abort = perform_graceful_shutdown(&cancel_token, &watcher_handle, &shutdown_complete);
                     break;
                 }
                 _ => {}

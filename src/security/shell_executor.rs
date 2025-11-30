@@ -3,9 +3,130 @@ use extism::convert::Json;
 use extism::{PluginBuilder, UserData, ValType, host_fn};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use tokio::process::Command;
 use std::process::Stdio;
+use std::sync::OnceLock;
 use std::time::Duration;
+use tokio::process::Command;
+
+// ============================================================================
+// GLOBAL REGEX PATTERN CACHE
+// ============================================================================
+
+/// Global cache of compiled security patterns.
+/// Initialized once on first access, then reused across all ShellExecutor instances.
+/// This eliminates the 1-5ms regex compilation overhead on every executor creation.
+static SECURITY_PATTERNS: OnceLock<Vec<(&'static str, Regex)>> = OnceLock::new();
+
+/// Get reference to compiled security patterns, initializing on first call.
+/// 
+/// This function is thread-safe and will only compile the patterns once,
+/// even if called concurrently from multiple threads.
+///
+/// # Returns
+/// Static reference to compiled pattern list with lifetime 'static
+fn get_security_patterns() -> &'static Vec<(&'static str, Regex)> {
+    SECURITY_PATTERNS.get_or_init(|| {
+        create_security_patterns()
+    })
+}
+
+/// Create comprehensive security patterns for command validation
+///
+/// Returns a vector of (pattern_name, compiled_regex) tuples.
+/// Pattern names are used in error messages for debugging.
+fn create_security_patterns() -> Vec<(&'static str, Regex)> {
+    let patterns = [
+        // ================================================================
+        // COMMAND CHAINING (CRITICAL) - Block ALL chaining operators
+        // ================================================================
+        ("semicolon", r";"),
+        ("pipe", r"\|(?!\|)"),         // Single pipe (but not ||)
+        ("double_pipe", r"\|\|"),      // OR operator
+        ("ampersand_bg", r"&(?!&|>)"), // Background (but not && or &>)
+        ("double_ampersand", r"&&"),   // AND operator
+        // ================================================================
+        // REDIRECTS - Block ALL file redirection
+        // ================================================================
+        ("redirect_stdout", r">(?!>)"), // Stdout redirect (but not >>)
+        ("redirect_stdin", r"<"),       // Stdin redirect
+        ("redirect_append", r">>"),     // Append redirect
+        ("redirect_stderr", r"2>"),     // Stderr redirect
+        ("redirect_stderr_stdout", r"&>"), // Both streams
+        ("redirect_merge", r"2>&1"),    // Merge stderr to stdout
+        ("redirect_fd", r"\d+>"),       // File descriptor redirect
+        // ================================================================
+        // COMMAND SUBSTITUTION - Block ALL substitution forms
+        // ================================================================
+        ("backticks", r"`"),            // Legacy command substitution
+        ("cmd_subst_paren", r"\$\("),   // Modern command substitution
+        ("var_expansion", r"\$\{"),     // Variable expansion
+        ("dollar_var", r"\$[A-Za-z_]"), // Simple variable reference
+        // ================================================================
+        // DANGEROUS COMMANDS - Block entirely regardless of args
+        // ================================================================
+
+        // File operations (destructive)
+        ("rm_command", r"(?:^|\s)rm(?:\s|$)"),
+        ("dd_command", r"(?:^|\s)dd(?:\s|$)"),
+        ("shred_command", r"(?:^|\s)shred(?:\s|$)"),
+        // Filesystem operations
+        ("mkfs_command", r"(?:^|\s)mkfs"),
+        ("fdisk_command", r"(?:^|\s)fdisk"),
+        ("parted_command", r"(?:^|\s)parted"),
+        ("mount_command", r"(?:^|\s)mount(?:\s|$)"),
+        ("umount_command", r"(?:^|\s)umount(?:\s|$)"),
+        // Privilege escalation
+        ("sudo_command", r"(?:^|\s)sudo(?:\s|$)"),
+        ("su_command", r"(?:^|\s)su(?:\s|$)"),
+        ("doas_command", r"(?:^|\s)doas(?:\s|$)"),
+        // Process control
+        ("kill_command", r"(?:^|\s)kill(?:\s|$)"),
+        ("killall_command", r"(?:^|\s)killall(?:\s|$)"),
+        ("pkill_command", r"(?:^|\s)pkill(?:\s|$)"),
+        // Permission changes
+        ("chmod_command", r"(?:^|\s)chmod(?:\s|$)"),
+        ("chown_command", r"(?:^|\s)chown(?:\s|$)"),
+        ("chgrp_command", r"(?:^|\s)chgrp(?:\s|$)"),
+        // System modification
+        ("reboot_command", r"(?:^|\s)reboot(?:\s|$)"),
+        ("shutdown_command", r"(?:^|\s)shutdown(?:\s|$)"),
+        ("init_command", r"(?:^|\s)init(?:\s|$)"),
+        ("systemctl_command", r"(?:^|\s)systemctl(?:\s|$)"),
+        // Package management
+        ("apt_command", r"(?:^|\s)apt(?:-get|-cache)?(?:\s|$)"),
+        ("yum_command", r"(?:^|\s)yum(?:\s|$)"),
+        ("dnf_command", r"(?:^|\s)dnf(?:\s|$)"),
+        ("pacman_command", r"(?:^|\s)pacman(?:\s|$)"),
+        // ================================================================
+        // PATH TRAVERSAL
+        // ================================================================
+        ("dot_dot_slash", r"\.\./"),
+        ("dot_dot_backslash", r"\.\.\\"),
+        // ================================================================
+        // SPECIAL CHARACTERS & CONTROL CODES
+        // ================================================================
+        ("newline", r"\n"),
+        ("carriage_return", r"\r"),
+        ("null_byte", r"\x00"),
+        ("tab_char", r"\t"),
+        // ================================================================
+        // SHELL SPECIFIC
+        // ================================================================
+        ("bash_brace_expansion", r"\{[^}]*,"), // Brace expansion
+        ("globstar", r"\*\*"),                 // Recursive glob
+    ];
+
+    patterns
+        .iter()
+        .filter_map(|(name, pattern)| match Regex::new(pattern) {
+            Ok(re) => Some((*name, re)),
+            Err(e) => {
+                eprintln!("Failed to compile pattern '{}': {}", name, e);
+                None
+            }
+        })
+        .collect()
+}
 
 // ============================================================================
 // REQUEST/RESPONSE STRUCTURES
@@ -60,14 +181,13 @@ impl Default for ShellExecutorConfig {
 
 pub struct ShellExecutor {
     timeout_duration: Duration,
-    
+
     // For execute() - legacy string-based API
-    blocked_patterns: Vec<(&'static str, Regex)>,
     allowed_commands: Vec<String>,
-    
+
     // For execute_safe() - parsed argument API
     allowed_programs: Vec<String>,
-    
+
     // Security settings
     max_command_length: usize,
     #[allow(dead_code)]
@@ -83,33 +203,30 @@ impl ShellExecutor {
     ) -> Self {
         Self {
             timeout_duration: Duration::from_secs(30),
-            blocked_patterns: Self::create_security_patterns(),
             allowed_commands,
             allowed_programs,
             max_command_length: 8192,
             allow_environment_vars: false,
         }
     }
-    
+
     /// Create executor that ONLY allows execute_safe() (most secure)
     #[must_use]
     pub fn new_safe_only(allowed_programs: Vec<String>) -> Self {
         Self {
             timeout_duration: Duration::from_secs(30),
-            blocked_patterns: Vec::new(),
             allowed_commands: Vec::new(), // Empty = block all string commands
             allowed_programs,
             max_command_length: 8192,
             allow_environment_vars: false,
         }
     }
-    
+
     /// Create from configuration (for extism host functions)
     #[must_use]
     pub fn from_config(config: ShellExecutorConfig) -> Self {
         Self {
             timeout_duration: Duration::from_secs(config.timeout_seconds),
-            blocked_patterns: Self::create_security_patterns(),
             allowed_commands: config.allowed_commands,
             allowed_programs: config.allowed_programs,
             max_command_length: config.max_command_length,
@@ -117,119 +234,8 @@ impl ShellExecutor {
         }
     }
 
-    /// Create comprehensive security patterns for command validation
-    /// 
-    /// Returns a vector of (pattern_name, compiled_regex) tuples.
-    /// Pattern names are used in error messages for debugging.
-    fn create_security_patterns() -> Vec<(&'static str, Regex)> {
-        let patterns = [
-            // ================================================================
-            // COMMAND CHAINING (CRITICAL) - Block ALL chaining operators
-            // ================================================================
-            ("semicolon", r";"),
-            ("pipe", r"\|(?!\|)"),           // Single pipe (but not ||)
-            ("double_pipe", r"\|\|"),         // OR operator
-            ("ampersand_bg", r"&(?!&|>)"),   // Background (but not && or &>)
-            ("double_ampersand", r"&&"),      // AND operator
-            
-            // ================================================================
-            // REDIRECTS - Block ALL file redirection
-            // ================================================================
-            ("redirect_stdout", r">(?!>)"),   // Stdout redirect (but not >>)
-            ("redirect_stdin", r"<"),         // Stdin redirect
-            ("redirect_append", r">>"),       // Append redirect
-            ("redirect_stderr", r"2>"),       // Stderr redirect
-            ("redirect_stderr_stdout", r"&>"), // Both streams
-            ("redirect_merge", r"2>&1"),      // Merge stderr to stdout
-            ("redirect_fd", r"\d+>"),         // File descriptor redirect
-            
-            // ================================================================
-            // COMMAND SUBSTITUTION - Block ALL substitution forms
-            // ================================================================
-            ("backticks", r"`"),              // Legacy command substitution
-            ("cmd_subst_paren", r"\$\("),     // Modern command substitution
-            ("var_expansion", r"\$\{"),       // Variable expansion
-            ("dollar_var", r"\$[A-Za-z_]"),   // Simple variable reference
-            
-            // ================================================================
-            // DANGEROUS COMMANDS - Block entirely regardless of args
-            // ================================================================
-            
-            // File operations (destructive)
-            ("rm_command", r"(?:^|\s)rm(?:\s|$)"),
-            ("dd_command", r"(?:^|\s)dd(?:\s|$)"),
-            ("shred_command", r"(?:^|\s)shred(?:\s|$)"),
-            
-            // Filesystem operations
-            ("mkfs_command", r"(?:^|\s)mkfs"),
-            ("fdisk_command", r"(?:^|\s)fdisk"),
-            ("parted_command", r"(?:^|\s)parted"),
-            ("mount_command", r"(?:^|\s)mount(?:\s|$)"),
-            ("umount_command", r"(?:^|\s)umount(?:\s|$)"),
-            
-            // Privilege escalation
-            ("sudo_command", r"(?:^|\s)sudo(?:\s|$)"),
-            ("su_command", r"(?:^|\s)su(?:\s|$)"),
-            ("doas_command", r"(?:^|\s)doas(?:\s|$)"),
-            
-            // Process control
-            ("kill_command", r"(?:^|\s)kill(?:\s|$)"),
-            ("killall_command", r"(?:^|\s)killall(?:\s|$)"),
-            ("pkill_command", r"(?:^|\s)pkill(?:\s|$)"),
-            
-            // Permission changes
-            ("chmod_command", r"(?:^|\s)chmod(?:\s|$)"),
-            ("chown_command", r"(?:^|\s)chown(?:\s|$)"),
-            ("chgrp_command", r"(?:^|\s)chgrp(?:\s|$)"),
-            
-            // System modification
-            ("reboot_command", r"(?:^|\s)reboot(?:\s|$)"),
-            ("shutdown_command", r"(?:^|\s)shutdown(?:\s|$)"),
-            ("init_command", r"(?:^|\s)init(?:\s|$)"),
-            ("systemctl_command", r"(?:^|\s)systemctl(?:\s|$)"),
-            
-            // Package management
-            ("apt_command", r"(?:^|\s)apt(?:-get|-cache)?(?:\s|$)"),
-            ("yum_command", r"(?:^|\s)yum(?:\s|$)"),
-            ("dnf_command", r"(?:^|\s)dnf(?:\s|$)"),
-            ("pacman_command", r"(?:^|\s)pacman(?:\s|$)"),
-            
-            // ================================================================
-            // PATH TRAVERSAL
-            // ================================================================
-            ("dot_dot_slash", r"\.\./"),
-            ("dot_dot_backslash", r"\.\.\\"),
-            
-            // ================================================================
-            // SPECIAL CHARACTERS & CONTROL CODES
-            // ================================================================
-            ("newline", r"\n"),
-            ("carriage_return", r"\r"),
-            ("null_byte", r"\x00"),
-            ("tab_char", r"\t"),
-            
-            // ================================================================
-            // SHELL SPECIFIC
-            // ================================================================
-            ("bash_brace_expansion", r"\{[^}]*,"),  // Brace expansion
-            ("globstar", r"\*\*"),                   // Recursive glob
-        ];
-        
-        patterns.iter()
-            .filter_map(|(name, pattern)| {
-                match Regex::new(pattern) {
-                    Ok(re) => Some((*name, re)),
-                    Err(e) => {
-                        eprintln!("Failed to compile pattern '{}': {}", name, e);
-                        None
-                    }
-                }
-            })
-            .collect()
-    }
-
     /// Validate command string with defense-in-depth layers
-    /// 
+    ///
     /// This validation is used for the legacy execute() method only.
     /// The execute_safe() method does not need string validation as it
     /// bypasses the shell entirely.
@@ -237,22 +243,22 @@ impl ShellExecutor {
         // ====================================================================
         // LAYER 1: Basic sanity checks
         // ====================================================================
-        
+
         if cmd.is_empty() {
             return Err("Empty command".to_string());
         }
-        
+
         if cmd.len() > self.max_command_length {
             return Err(format!(
-                "Command exceeds maximum length of {} bytes", 
+                "Command exceeds maximum length of {} bytes",
                 self.max_command_length
             ));
         }
-        
+
         // ====================================================================
         // LAYER 2: Control character validation
         // ====================================================================
-        
+
         // Check for dangerous control characters
         // Allow only printable ASCII and space, reject all control chars
         for (idx, c) in cmd.chars().enumerate() {
@@ -263,95 +269,89 @@ impl ShellExecutor {
                 ));
             }
         }
-        
+
         // ====================================================================
         // LAYER 3: Blocked pattern matching (comprehensive)
         // ====================================================================
-        
-        for (name, pattern) in &self.blocked_patterns {
+
+        for (name, pattern) in get_security_patterns() {
             if pattern.is_match(cmd) {
                 return Err(format!(
-                    "Command blocked by security policy: '{}' pattern matched", 
+                    "Command blocked by security policy: '{}' pattern matched",
                     name
                 ));
             }
         }
-        
+
         // ====================================================================
         // LAYER 4: Whitelist enforcement (MANDATORY)
         // ====================================================================
-        
+
         // Extract base command (first whitespace-delimited token)
         let parts: Vec<&str> = cmd.split_whitespace().collect();
         if parts.is_empty() {
             return Err("Command contains only whitespace".to_string());
         }
-        
+
         let base_cmd = match parts.first() {
             Some(cmd) => *cmd,
             None => return Err("Command contains only whitespace".to_string()),
         };
-        
+
         // Check against whitelist
         if self.allowed_commands.is_empty() {
             return Err(
-                "No commands allowed: whitelist is empty. Use execute_safe() instead.".to_string()
+                "No commands allowed: whitelist is empty. Use execute_safe() instead.".to_string(),
             );
         }
-        
+
         if !self.allowed_commands.contains(&base_cmd.to_string()) {
             return Err(format!(
                 "Command '{}' not in whitelist. Allowed commands: {:?}",
                 base_cmd, self.allowed_commands
             ));
         }
-        
+
         // ====================================================================
         // LAYER 5: Argument validation
         // ====================================================================
-        
+
         // Validate each argument doesn't contain path traversal
         for arg in &parts[1..] {
             if arg.contains("../") || arg.contains("..\\") {
-                return Err(format!(
-                    "Argument contains path traversal: '{}'", arg
-                ));
+                return Err(format!("Argument contains path traversal: '{}'", arg));
             }
         }
-        
+
         Ok(())
     }
 
     /// Execute command safely WITHOUT shell (RECOMMENDED METHOD)
-    /// 
+    ///
     /// This method executes a program directly with arguments, bypassing
     /// the shell entirely. This makes it inherently immune to command
     /// injection attacks.
-    /// 
+    ///
     /// # Arguments
     /// * `program` - The program to execute (must be in allowed_programs list)
     /// * `args` - Array of arguments to pass to the program
-    /// 
+    ///
     /// # Security
     /// This method is INJECTION-PROOF because:
     /// - No shell interpreter is used
     /// - Arguments are passed directly via execve() on Unix
     /// - No metacharacter interpretation occurs
-    /// 
+    ///
     /// # Example
     /// ```rust
     /// let executor = ShellExecutor::new_safe_only(vec!["ls".to_string()]);
     /// let response = executor.execute_safe("ls", &["-la".to_string()]).await;
     /// ```
-    pub async fn execute_safe(
-        &self,
-        program: &str,
-        args: &[String],
-    ) -> ShellExecuteResponse {
+    pub async fn execute_safe(&self, program: &str, args: &[String]) -> ShellExecuteResponse {
         // ================================================================
         // VALIDATION: Check program against whitelist
         // ================================================================
-        
+
         if self.allowed_programs.is_empty() {
             return ShellExecuteResponse {
                 stdout: String::new(),
@@ -360,7 +360,7 @@ impl ShellExecutor {
                 is_error: true,
             };
         }
-        
+
         if !self.allowed_programs.contains(&program.to_string()) {
             return ShellExecuteResponse {
                 stdout: String::new(),
@@ -372,18 +372,18 @@ impl ShellExecutor {
                 is_error: true,
             };
         }
-        
+
         // ================================================================
         // EXECUTION: Direct program execution (NO SHELL)
         // ================================================================
-        
+
         let child = Command::new(program)
             .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .env_clear()  // Clear environment for additional security
+            .env_clear() // Clear environment for additional security
             .spawn();
-        
+
         let mut child = match child {
             Ok(c) => c,
             Err(e) => {
@@ -395,11 +395,11 @@ impl ShellExecutor {
                 };
             }
         };
-        
+
         // ================================================================
         // TIMEOUT: Wait with timeout, kill if exceeded
         // ================================================================
-        
+
         let status = tokio::select! {
             result = child.wait() => {
                 match result {
@@ -419,7 +419,7 @@ impl ShellExecutor {
                 return ShellExecuteResponse {
                     stdout: String::new(),
                     stderr: format!(
-                        "Command execution timeout ({}s)", 
+                        "Command execution timeout ({}s)",
                         self.timeout_duration.as_secs()
                     ),
                     exit_code: Some(124),
@@ -427,22 +427,22 @@ impl ShellExecutor {
                 };
             }
         };
-        
+
         // ================================================================
         // OUTPUT: Capture stdout and stderr
         // ================================================================
-        
+
         use tokio::io::AsyncReadExt;
         let mut stdout_data = Vec::new();
         let mut stderr_data = Vec::new();
-        
+
         if let Some(mut stdout) = child.stdout.take() {
             let _ = stdout.read_to_end(&mut stdout_data).await;
         }
         if let Some(mut stderr) = child.stderr.take() {
             let _ = stderr.read_to_end(&mut stderr_data).await;
         }
-        
+
         ShellExecuteResponse {
             stdout: String::from_utf8_lossy(&stdout_data).to_string(),
             stderr: String::from_utf8_lossy(&stderr_data).to_string(),
@@ -452,17 +452,17 @@ impl ShellExecutor {
     }
 
     /// Execute command string via shell (LEGACY METHOD - USE WITH CAUTION)
-    /// 
+    ///
     /// This method executes a command string via `sh -c`, which is inherently
     /// risky. It applies multiple layers of validation but cannot be made
     /// completely secure. Use execute_safe() instead whenever possible.
-    /// 
+    ///
     /// # Security Notice
     /// This method uses `sh -c` and is vulnerable to:
     /// - Shell metacharacter exploitation (despite filtering)
     /// - Novel bypass techniques
     /// - Zero-day shell interpreter bugs
-    /// 
+    ///
     /// Only use this method if:
     /// - You need shell features (pipes, globs, etc.)
     /// - You have a tightly controlled whitelist
@@ -471,7 +471,7 @@ impl ShellExecutor {
         // ================================================================
         // VALIDATION: Multi-layer security checks
         // ================================================================
-        
+
         if let Err(e) = self.validate_command(command) {
             return ShellExecuteResponse {
                 stdout: String::new(),
@@ -480,19 +480,19 @@ impl ShellExecutor {
                 is_error: true,
             };
         }
-        
+
         // ================================================================
         // EXECUTION: Via shell (sh -c)
         // ================================================================
-        
+
         let child = Command::new("sh")
             .arg("-c")
             .arg(command)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .env_clear()  // Clear environment to prevent $VAR expansion
+            .env_clear() // Clear environment to prevent $VAR expansion
             .spawn();
-        
+
         let mut child = match child {
             Ok(c) => c,
             Err(e) => {
@@ -504,11 +504,11 @@ impl ShellExecutor {
                 };
             }
         };
-        
+
         // ================================================================
         // TIMEOUT: Same timeout logic as execute_safe()
         // ================================================================
-        
+
         let status = tokio::select! {
             result = child.wait() => {
                 match result {
@@ -528,7 +528,7 @@ impl ShellExecutor {
                 return ShellExecuteResponse {
                     stdout: String::new(),
                     stderr: format!(
-                        "Command execution timeout ({}s)", 
+                        "Command execution timeout ({}s)",
                         self.timeout_duration.as_secs()
                     ),
                     exit_code: Some(124),
@@ -536,22 +536,22 @@ impl ShellExecutor {
                 };
             }
         };
-        
+
         // ================================================================
         // OUTPUT: Capture stdout and stderr
         // ================================================================
-        
+
         use tokio::io::AsyncReadExt;
         let mut stdout_data = Vec::new();
         let mut stderr_data = Vec::new();
-        
+
         if let Some(mut stdout) = child.stdout.take() {
             let _ = stdout.read_to_end(&mut stdout_data).await;
         }
         if let Some(mut stderr) = child.stderr.take() {
             let _ = stderr.read_to_end(&mut stderr_data).await;
         }
-        
+
         ShellExecuteResponse {
             stdout: String::from_utf8_lossy(&stdout_data).to_string(),
             stderr: String::from_utf8_lossy(&stderr_data).to_string(),
@@ -570,17 +570,17 @@ impl ShellExecutor {
 // It accepts a program name and argument array, executes without shell.
 host_fn!(
     shell_execute_safe(
-        _config: ShellExecutorConfig; 
+        _config: ShellExecutorConfig;
         request: Json<ShellExecuteSafeRequest>
     ) -> Json<ShellExecuteResponse> {
         // TEMPORARY: Use default empty configuration for safety
         // TODO: Find correct way to access UserData<ShellExecutorConfig>
         let executor = ShellExecutor::new_safe_only(Vec::new());
-        
+
         let response = tokio::runtime::Handle::current().block_on(
             executor.execute_safe(&request.0.program, &request.0.args)
         );
-        
+
         Ok(Json(response))
     }
 );
@@ -591,30 +591,30 @@ host_fn!(
 // via shell. Use shell_execute_safe() instead whenever possible.
 host_fn!(
     shell_execute(
-        _config: ShellExecutorConfig; 
+        _config: ShellExecutorConfig;
         request: Json<ShellExecuteRequest>
     ) -> Json<ShellExecuteResponse> {
         // TEMPORARY: Use default empty configuration for safety
         // TODO: Find correct way to access UserData<ShellExecutorConfig>
         let executor = ShellExecutor::new_with_whitelist(Vec::new(), Vec::new());
-        
+
         let response = tokio::runtime::Handle::current().block_on(
             executor.execute(&request.0.command)
         );
-        
+
         Ok(Json(response))
     }
 );
 
 /// Register both host functions with PluginBuilder
-/// 
+///
 /// # Arguments
 /// * `builder` - The extism PluginBuilder
 /// * `config` - Security configuration (whitelists, timeouts, etc.)
-/// 
+///
 /// # Returns
 /// Updated PluginBuilder with both host functions registered
-/// 
+///
 /// # Example
 /// ```rust
 /// let config = ShellExecutorConfig {
@@ -623,7 +623,7 @@ host_fn!(
 ///     max_command_length: 8192,
 ///     timeout_seconds: 30,
 /// };
-/// 
+///
 /// let builder = PluginBuilder::new_with_module(wasm_module);
 /// let builder = register_shell_host_functions(builder, config);
 /// ```

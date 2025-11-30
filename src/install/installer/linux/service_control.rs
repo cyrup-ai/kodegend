@@ -45,9 +45,8 @@ pub(super) fn start_systemd_service(service_name: &str) -> Result<(), InstallerE
             .output()
     };
 
-    let output = output.map_err(|e| {
-        InstallerError::System(format!("Failed to execute systemctl start: {}", e))
-    })?;
+    let output = output
+        .map_err(|e| InstallerError::System(format!("Failed to execute systemctl start: {}", e)))?;
 
     if !output.status.success() {
         return Err(InstallerError::System(format!(
@@ -71,9 +70,8 @@ pub(super) fn stop_systemd_service(service_name: &str) -> Result<(), InstallerEr
             .output()
     };
 
-    let output = output.map_err(|e| {
-        InstallerError::System(format!("Failed to execute systemctl stop: {}", e))
-    })?;
+    let output = output
+        .map_err(|e| InstallerError::System(format!("Failed to execute systemctl stop: {}", e)))?;
 
     if !output.status.success() {
         return Err(InstallerError::System(format!(

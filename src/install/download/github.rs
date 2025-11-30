@@ -1,6 +1,6 @@
 //! GitHub release API interaction
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serde::Deserialize;
 
 /// GitHub release metadata from API
@@ -20,7 +20,10 @@ pub struct GitHubAsset {
 
 /// Fetch latest release from GitHub repository
 pub async fn get_latest_release(repo: &str) -> Result<GitHubRelease> {
-    let url = format!("https://api.github.com/repos/cyrup-ai/{}/releases/latest", repo);
+    let url = format!(
+        "https://api.github.com/repos/cyrup-ai/{}/releases/latest",
+        repo
+    );
 
     let client = reqwest::Client::builder()
         .user_agent("kodegen-installer/0.1")

@@ -10,10 +10,10 @@
 //! - `extract` - Platform-specific package extraction (DEB, RPM, DMG, ZIP)
 //! - `core` - Download orchestration and progress tracking
 
-mod platform;
-mod github;
-mod extract;
 mod core;
+mod extract;
+mod github;
+mod platform;
 
 // Re-export public API
 pub use core::download_all_binaries;

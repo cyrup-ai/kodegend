@@ -1,8 +1,8 @@
 //! Utility functions and constants for Windows operations.
 
+use super::InstallerError;
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
-use super::InstallerError;
 
 // Constants for zero-allocation buffers
 pub(super) const MAX_PATH: usize = 260;

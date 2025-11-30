@@ -5,6 +5,7 @@
 
 pub mod cli_output;
 pub mod config;
+pub mod constants;
 pub mod daemon;
 pub mod install;
 pub mod ipc;
@@ -13,7 +14,9 @@ pub mod manager;
 pub mod platform;
 pub mod security;
 pub mod service;
+pub mod signing;
 pub mod state_machine;
+pub mod status;
 
 // Re-export main types for convenience
 pub use config::{HealthCheckConfig, LogRotationConfig, ServiceConfig, ServiceDefinition};

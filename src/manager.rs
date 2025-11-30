@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -10,15 +11,15 @@ use crate::config::ServiceConfig;
 use crate::ipc::{Cmd, Evt, ServiceState};
 use crate::lifecycle::Lifecycle;
 use crate::platform::{SignalKind, watch_signals};
+use crate::service::embedded_servers::{EmbeddedServer, shutdown_all_servers};
 use crate::service::port_cleanup::cleanup_port_if_needed;
 use crate::state_machine::{Action, Event};
-use crate::service::embedded_servers::{EmbeddedServer, shutdown_all_servers};
 
 /// Global event bus size – small fixed size → zero heap growth.
 const BUS_BOUND: usize = 128;
 
 /// Restart state for a service
-/// 
+///
 /// Tracks restart attempts and timing for exponential backoff enforcement.
 /// Models circuit breaker pattern from kodegen-tools-citescrape.
 #[derive(Debug)]
@@ -26,13 +27,22 @@ struct RestartState {
     stop_time: Instant,
     attempts: u32,
     /// When service last started successfully (for success window calculation)
-    /// 
+    ///
     /// If service runs for >success_window_secs after this timestamp,
     /// the attempts counter is reset to 1 on next failure.
-    /// 
+    ///
     /// Set when restart is executed (process_pending_restarts line 316)
     /// Checked when scheduling next restart (schedule_restart line 454)
     last_successful_start: Option<Instant>,
+}
+
+/// Last known state for a service (used for status queries)
+#[derive(Debug, Clone)]
+struct LastServiceState {
+    state: ServiceState,
+    pid: Option<u32>,
+    timestamp: Instant,
+    failure_reason: Option<String>,
 }
 
 /// Top‑level in‑process manager supervising *all* workers.
@@ -41,20 +51,34 @@ pub struct ServiceManager {
     bus_rx: Receiver<Evt>,
     workers: HashMap<String, Sender<Cmd>>,
     pending_restarts: HashMap<String, RestartState>,
-    
+
     /// Restart policies per service (loaded from config)
     /// Allows per-service policy customization
     restart_policies: HashMap<String, crate::config::RestartPolicy>,
-    
+
+    /// Last known state for each service (for status queries)
+    last_state: HashMap<String, LastServiceState>,
+
     lifecycle: Lifecycle,
     embedded_servers: Option<Vec<EmbeddedServer>>,
-    
+
     /// Configuration for runtime reload
     config: std::sync::Arc<parking_lot::RwLock<ServiceConfig>>,
-    
+
     /// Correlation ID generator for IPC request tracking
     /// Uses Relaxed ordering since correlation IDs don't require synchronization
     next_correlation_id: AtomicU64,
+
+    /// External shutdown trigger channel
+    /// 
+    /// This allows Windows service or other external callers to trigger shutdown
+    /// without relying on OS signals. The run() loop monitors this receiver
+    /// and breaks when signaled.
+    /// 
+    /// Uses crossbeam channel (bounded, size 1) for compatibility with existing
+    /// select! macro infrastructure. Sender is exposed via shutdown() method.
+    shutdown_rx: Receiver<()>,
+    shutdown_tx: Sender<()>,
 }
 
 impl ServiceManager {
@@ -63,7 +87,7 @@ impl ServiceManager {
         let (bus_tx, bus_rx) = bounded::<Evt>(BUS_BOUND);
         let mut workers = HashMap::new();
         let mut restart_policies = HashMap::new();
-        
+
         let config = std::sync::Arc::new(parking_lot::RwLock::new(cfg));
         let cfg_read = config.read();
 
@@ -102,7 +126,10 @@ impl ServiceManager {
                                             );
                                             workers.insert(def.name.clone(), tx);
                                             // Store restart policy for dynamically loaded service
-                                            restart_policies.insert(def.name.clone(), def.restart_policy.clone());
+                                            restart_policies.insert(
+                                                def.name.clone(),
+                                                def.restart_policy.clone(),
+                                            );
                                         }
                                         Err(e) => {
                                             error!(
@@ -127,8 +154,12 @@ impl ServiceManager {
                 }
             }
         }
-        
+
         drop(cfg_read); // Release read lock
+
+        // Initialize shutdown coordination channel
+        // Bounded channel (size 1) for external shutdown trigger (Windows service, API, etc.)
+        let (shutdown_tx, shutdown_rx) = bounded::<()>(1);
 
         Ok(Self {
             bus_tx,
@@ -136,10 +167,13 @@ impl ServiceManager {
             workers,
             pending_restarts: HashMap::new(),
             restart_policies,
+            last_state: HashMap::new(),
             lifecycle: Lifecycle::default(),
             embedded_servers: None,
             config,
             next_correlation_id: AtomicU64::new(1),
+            shutdown_rx,
+            shutdown_tx,
         })
     }
 
@@ -155,20 +189,20 @@ impl ServiceManager {
     /// Individual server failures are logged but don't prevent daemon startup.
     /// Each server runs as a background tokio task (via embedded_servers.rs).
     async fn start_servers_gracefully(&mut self) {
+        use crate::service::embedded_servers::{EmbeddedServer, start_server};
         use std::net::SocketAddr;
-        use crate::service::embedded_servers::{start_server, EmbeddedServer};
 
         let configs = self.config.read().category_servers.clone();
         let (tls_cert, tls_key) = crate::config::discover_certificate_paths();
-        
+
         let mut servers = Vec::new();
         let mut failed_count = 0;
-        
+
         for config in &configs {
             if !config.enabled {
                 continue;
             }
-            
+
             let addr: SocketAddr = match format!("127.0.0.1:{}", config.port).parse() {
                 Ok(addr) => addr,
                 Err(e) => {
@@ -177,7 +211,7 @@ impl ServiceManager {
                     continue;
                 }
             };
-            
+
             // CRITICAL: Clear port before starting server to prevent "address in use" errors
             // This is essential for service manager integration - daemon MUST NOT exit on port conflicts
             log::info!("Clearing port {} for {} server", config.port, config.name);
@@ -186,16 +220,28 @@ impl ServiceManager {
                     log::debug!("Port {} is available for {}", config.port, config.name);
                 }
                 Err(e) => {
-                    log::error!("✗ Port cleanup failed for {} (port {}): {:#}", config.name, config.port, e);
+                    log::error!(
+                        "✗ Port cleanup failed for {} (port {}): {:#}",
+                        config.name,
+                        config.port,
+                        e
+                    );
                     log::error!("  This indicates port is held by a process that cannot be killed");
-                    log::error!("  Daemon continues with {} unavailable (graceful degradation)", config.name);
+                    log::error!(
+                        "  Daemon continues with {} unavailable (graceful degradation)",
+                        config.name
+                    );
                     failed_count += 1;
-                    continue;  // Skip this server, try next one
+                    continue; // Skip this server, try next one
                 }
             }
 
             // Port is now guaranteed available - start server
-            log::debug!("Starting {} server on port {} (post-cleanup)", config.name, config.port);
+            log::debug!(
+                "Starting {} server on port {} (post-cleanup)",
+                config.name,
+                config.port
+            );
             match start_server(&config.name, addr, tls_cert.clone(), tls_key.clone()).await {
                 Ok(handle) => {
                     log::info!("✓ Started {} server on port {}", config.name, config.port);
@@ -207,78 +253,102 @@ impl ServiceManager {
                 }
                 Err(e) => {
                     log::error!("✗ Failed to start {} server: {:#}", config.name, e);
-                    log::error!("  Port {} was cleared but server startup failed - check server implementation", config.port);
-                    log::error!("  Daemon continues with {} unavailable (graceful degradation)", config.name);
+                    log::error!(
+                        "  Port {} was cleared but server startup failed - check server implementation",
+                        config.port
+                    );
+                    log::error!(
+                        "  Daemon continues with {} unavailable (graceful degradation)",
+                        config.name
+                    );
                     failed_count += 1;
                 }
             }
         }
-        
+
         let total = configs.iter().filter(|c| c.enabled).count();
         let succeeded = servers.len();
-        
+
         if succeeded == 0 {
-            log::error!("No HTTP servers started successfully ({} failed)", failed_count);
+            log::error!(
+                "No HTTP servers started successfully ({} failed)",
+                failed_count
+            );
             log::error!("Daemon running but no services available");
         } else if failed_count > 0 {
-            log::warn!("Started {}/{} servers ({} failed)", succeeded, total, failed_count);
+            log::warn!(
+                "Started {}/{} servers ({} failed)",
+                succeeded,
+                total,
+                failed_count
+            );
         } else {
             log::info!("Started all {} servers successfully", succeeded);
         }
-        
+
         self.embedded_servers = Some(servers);
     }
 
     /// Reload configuration from disk and apply changes
-    /// 
+    ///
     /// Compares old and new service definitions:
     /// - Starts new services
     /// - Stops removed services  
     /// - Restarts modified services
     fn reload_config(&mut self) -> Result<()> {
         info!("Reloading configuration from disk");
-        
+
         // Read current config to find file path
         let config_path = {
             let cfg = self.config.read();
             match &cfg.config_file_path {
                 Some(path) => path.clone(),
                 None => {
-                    return Err(anyhow::anyhow!("No config file path stored - cannot reload"));
+                    return Err(anyhow::anyhow!(
+                        "No config file path stored - cannot reload"
+                    ));
                 }
             }
         };
-        
+
         // Load new config from disk
-        let new_cfg = ServiceConfig::load_from_file(&config_path)
-            .with_context(|| format!("Failed to load updated configuration from {:?}", config_path))?;
-        
+        let new_cfg = ServiceConfig::load_from_file(&config_path).with_context(|| {
+            format!(
+                "Failed to load updated configuration from {:?}",
+                config_path
+            )
+        })?;
+
         // Get old service names
         let old_services: HashMap<String, _> = {
             let cfg = self.config.read();
-            cfg.services.iter()
+            cfg.services
+                .iter()
                 .map(|def| (def.name.clone(), def.clone()))
                 .collect()
         };
-        
+
         // Get new service names
-        let new_services: HashMap<String, _> = new_cfg.services.iter()
+        let new_services: HashMap<String, _> = new_cfg
+            .services
+            .iter()
             .map(|def| (def.name.clone(), def.clone()))
             .collect();
-        
+
         // Find services to stop (in old but not in new)
         for name in old_services.keys() {
             if !new_services.contains_key(name) {
                 info!("Stopping removed service: {}", name);
                 if let Some(tx) = self.workers.get(name)
-                    && let Err(e) = tx.send(Cmd::Shutdown) {
-                        error!("Failed to send shutdown to service {}: {}", name, e);
-                    }
+                    && let Err(e) = tx.send(Cmd::Shutdown)
+                {
+                    error!("Failed to send shutdown to service {}: {}", name, e);
+                }
                 self.workers.remove(name);
                 self.restart_policies.remove(name);
             }
         }
-        
+
         // Find services to start (in new but not in old)
         for (name, def) in &new_services {
             if !old_services.contains_key(name.as_str()) {
@@ -286,7 +356,8 @@ impl ServiceManager {
                 match crate::service::spawn(def.clone(), self.bus_tx.clone()) {
                     Ok(tx) => {
                         self.workers.insert(name.clone(), tx);
-                        self.restart_policies.insert(name.clone(), def.restart_policy.clone());
+                        self.restart_policies
+                            .insert(name.clone(), def.restart_policy.clone());
                     }
                     Err(e) => {
                         error!("Failed to spawn new service '{}': {}", name, e);
@@ -294,25 +365,27 @@ impl ServiceManager {
                 }
             }
         }
-        
+
         // Find services to restart (in both but definition changed)
         for (name, new_def) in &new_services {
             if let Some(old_def) = old_services.get(name.as_str()) {
                 // Compare definitions (simplified - check if debug representation differs)
                 if format!("{:?}", old_def) != format!("{:?}", new_def) {
                     info!("Restarting modified service: {}", name);
-                    
+
                     // Stop old version
                     if let Some(tx) = self.workers.get(name)
-                        && let Err(e) = tx.send(Cmd::Shutdown) {
-                            error!("Failed to send shutdown to service {}: {}", name, e);
-                        }
-                    
+                        && let Err(e) = tx.send(Cmd::Shutdown)
+                    {
+                        error!("Failed to send shutdown to service {}: {}", name, e);
+                    }
+
                     // Start new version
                     match crate::service::spawn(new_def.clone(), self.bus_tx.clone()) {
                         Ok(tx) => {
                             self.workers.insert(name.clone(), tx);
-                            self.restart_policies.insert(name.clone(), new_def.restart_policy.clone());
+                            self.restart_policies
+                                .insert(name.clone(), new_def.restart_policy.clone());
                         }
                         Err(e) => {
                             error!("Failed to restart service '{}': {}", name, e);
@@ -321,12 +394,45 @@ impl ServiceManager {
                 }
             }
         }
-        
+
         // Update stored config
         *self.config.write() = new_cfg;
-        
+
         info!("Configuration reload complete");
         Ok(())
+    }
+
+    /// Log detailed diagnostics for signal channel disconnection
+    /// 
+    /// Called when recv() returns RecvError, indicating all signal senders
+    /// were dropped (typically due to signal watcher thread panic/exit).
+    fn log_signal_channel_disconnection(&self) {
+        error!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        error!("CRITICAL: Signal channel disconnected (RecvError)");
+        error!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        error!("");
+        error!("Root cause: All signal senders were dropped");
+        error!("Most likely: Signal watcher thread has exited or panicked");
+        error!("");
+        error!("DEBUGGING STEPS:");
+        error!("  1. Search logs for 'Signal watcher thread panicked'");
+        error!("  2. Search logs for 'Signal watcher failed 3 times, giving up'");
+        error!("  3. Check for tokio runtime creation failures");
+        error!("  4. Review packages/kodegend/src/platform/signal.rs for bugs");
+        error!("");
+        error!("CONSEQUENCES:");
+        error!("  • Daemon will NO LONGER respond to SIGTERM or SIGINT");
+        error!("  • Must use SIGKILL (kill -9) to stop daemon");
+        error!("  • Graceful shutdown is no longer possible");
+        error!("");
+        error!("TECHNICAL DETAILS:");
+        error!("  Channel: crossbeam_channel::bounded<SignalKind>(16)");
+        error!("  Sender: platform/signal.rs:116 (signal watcher thread)");
+        error!("  Receiver: manager.rs:385 (ServiceManager event loop)");
+        error!("  Error: crossbeam_channel::RecvError (all senders dropped)");
+        error!("  Docs: https://docs.rs/crossbeam-channel/latest/crossbeam_channel/struct.RecvError.html");
+        error!("");
+        log::warn!("Proceeding with emergency shutdown of service manager...");
     }
 
     /// Central event‑loop.  Runs until SIGINT / SIGTERM.
@@ -334,26 +440,45 @@ impl ServiceManager {
         // Process lifecycle start event
         let action = self.lifecycle.step(Event::CmdStart);
         if action == Action::SpawnProcess {
+            // Announce startup phase
+            crate::daemon::systemd_notify_status("Initializing service manager");
+            
             // Announce manager start
             self.bus_tx.send(Evt::State {
-                service: "manager".to_string(),
+                service: Arc::from("manager"),
                 state: ServiceState::Starting,
                 ts: chrono::Utc::now(),
                 pid: Some(std::process::id()),
                 correlation_id: None,
             })?;
 
+            // Start worker services
+            crate::daemon::systemd_notify_status(
+                &format!("Starting {} worker services", self.workers.len())
+            );
+            
             // Initial start‑up pass.
             for (name, tx) in &self.workers {
                 let correlation_id = self.next_correlation_id();
                 tx.send(Cmd::Start { correlation_id })?;
                 info!("Started service: {name} (correlation_id={correlation_id})");
             }
-            
+
             // Transition lifecycle state to Running now that workers are started
             let _action = self.lifecycle.step(Event::StartedOk);
             // Note: action will be Action::NotifyHealthy per state_machine.rs:83
             // Full action handling is out of scope (see lifecycle_actions_ignored.md)
+
+            // Start HTTP servers
+            let server_count = self.config.read()
+                .category_servers
+                .iter()
+                .filter(|s| s.enabled)
+                .count();
+            
+            crate::daemon::systemd_notify_status(
+                &format!("Starting {} HTTP servers", server_count)
+            );
             
             // Start HTTP servers with graceful degradation
             // NOTE: Servers run as background tokio tasks - this is correct
@@ -361,32 +486,124 @@ impl ServiceManager {
 
             // Manager is now running
             self.bus_tx.send(Evt::State {
-                service: "manager".to_string(),
+                service: Arc::from("manager"),
                 state: ServiceState::Running,
                 ts: chrono::Utc::now(),
                 pid: Some(std::process::id()),
                 correlation_id: None,
             })?;
+            
+            // Notify full readiness with final status
+            crate::daemon::systemd_notify_status("All services operational");
+            crate::daemon::systemd_notify_ready();
+            
+            info!("ServiceManager fully operational - systemd notified");
         }
         // Handle any other action types (though CmdStart always returns SpawnProcess)
         self.handle_lifecycle_action(action).await;
 
         // Setup cross-platform signal watcher
         let signal_watcher = watch_signals()?;
+
+        // Setup status query socket
+        #[cfg(unix)]
+        let socket_rx = {
+            use std::os::unix::net::UnixListener;
+            
+            let is_elevated = crate::platform::is_elevated();
+            let socket_path = crate::platform::status_socket_path(is_elevated);
+            
+            // Ensure parent directory exists
+            if let Some(parent) = socket_path.parent() {
+                std::fs::create_dir_all(parent).with_context(|| {
+                    format!("Failed to create status socket directory: {}", parent.display())
+                })?;
+            }
+            
+            // Remove stale socket file if it exists
+            let _ = std::fs::remove_file(&socket_path);
+            
+            match UnixListener::bind(&socket_path) {
+                Ok(listener) => {
+                    listener.set_nonblocking(true)
+                        .context("Failed to set socket as non-blocking")?;
+                    
+                    // Spawn thread to accept connections
+                    let (socket_tx, socket_rx) = bounded(8);
+                    std::thread::spawn(move || {
+                        for stream in listener.incoming() {
+                            match stream {
+                                Ok(stream) => {
+                                    if socket_tx.send(stream).is_err() {
+                                        break; // Receiver dropped, exit thread
+                                    }
+                                }
+                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                    std::thread::sleep(Duration::from_millis(100));
+                                }
+                                Err(e) => {
+                                    log::error!("Error accepting status socket connection: {}", e);
+                                }
+                            }
+                        }
+                    });
+                    
+                    info!("Status query socket listening at: {}", socket_path.display());
+                    Some(socket_rx)
+                }
+                Err(e) => {
+                    error!("Failed to bind status socket at {}: {}", socket_path.display(), e);
+                    error!("Status queries will not be available");
+                    None
+                }
+            }
+        };
         
+        #[cfg(not(unix))]
+        let socket_rx: Option<Receiver<()>> = None;
+
         let health_tick = tick(Duration::from_secs(30));
+        let watchdog_tick = tick(Duration::from_secs(15)); // WatchdogSec/2
         let log_rotate_tick = tick(Duration::from_secs(3600));
         let restart_tick = tick(Duration::from_millis(100));
 
         loop {
             select! {
                 recv(self.bus_rx) -> evt => self.handle_event(evt?)?,
+                
+                // External shutdown trigger (Windows service or API)
+                // This arm has priority over signal_watcher to ensure Windows service
+                // stop requests are handled before Unix signals
+                recv(self.shutdown_rx) -> _ => {
+                    info!("External shutdown signal received (Windows service or API)");
+                    
+                    // Announce manager stopping
+                    self.bus_tx.send(Evt::State {
+                        service: Arc::from("manager"),
+                        state: ServiceState::Stopping,
+                        ts: chrono::Utc::now(),
+                        pid: Some(std::process::id()),
+                        correlation_id: None,
+                    }).ok();
+
+                    // Transition lifecycle to stopping state
+                    // This triggers KillProcess action which shuts down workers
+                    let action = self.lifecycle.step(Event::CmdStop);
+                    self.handle_lifecycle_action(action).await;
+                    
+                    break;  // Exit event loop
+                }
+                
                 recv(signal_watcher.receiver()) -> sig => {
                     match sig {
                         Ok(SignalKind::Terminate) | Ok(SignalKind::Interrupt) => {
                             info!("Received shutdown signal: {:?}", sig);
+                            
+                            // Notify systemd of graceful shutdown
+                            crate::daemon::systemd_notify_stopping();
+                            
                             self.bus_tx.send(Evt::State {
-                                service: "manager".to_string(),
+                                service: Arc::from("manager"),
                                 state: ServiceState::Stopping,
                                 ts: chrono::Utc::now(),
                                 pid: Some(std::process::id()),
@@ -396,7 +613,7 @@ impl ServiceManager {
                             // Transition lifecycle to stopping state
                             let action = self.lifecycle.step(Event::CmdStop);
                             self.handle_lifecycle_action(action).await;
-                            
+
                             break;
                         }
                         Ok(SignalKind::Hangup) => {
@@ -408,15 +625,15 @@ impl ServiceManager {
                         }
                         Ok(SignalKind::Shutdown) => {
                             info!("Received system shutdown signal - graceful shutdown");
-                            
+
                             // Transition lifecycle to stopping state
                             let action = self.lifecycle.step(Event::CmdStop);
                             self.handle_lifecycle_action(action).await;
-                            
+
                             break;
                         }
                         Err(_) => {
-                            error!("Signal channel closed unexpectedly");
+                            self.log_signal_channel_disconnection();
                             break;
                         }
                     }
@@ -431,6 +648,13 @@ impl ServiceManager {
                         }
                     }
                 }
+                recv(watchdog_tick) -> _ => {
+                    // Send watchdog keepalive to systemd
+                    // Only has effect if unit file contains WatchdogSec=
+                    if self.lifecycle.is_running() {
+                        crate::daemon::systemd_notify_watchdog();
+                    }
+                }
                 recv(log_rotate_tick) -> _ => {
                     // Trigger log rotation on all services
                     for tx in self.workers.values() {
@@ -439,7 +663,7 @@ impl ServiceManager {
                     }
                     // Announce log rotation
                     self.bus_tx.send(Evt::LogRotate {
-                        service: "manager".to_string(),
+                        service: Arc::from("manager"),
                         ts: chrono::Utc::now(),
                         correlation_id: 0,
                     }).ok();
@@ -449,12 +673,26 @@ impl ServiceManager {
                     self.process_pending_restarts();
                 }
             }
+            
+            // Handle status queries (Unix only)
+            #[cfg(unix)]
+            if let Some(ref rx) = socket_rx {
+                select! {
+                    recv(rx) -> stream => {
+                        if let Ok(stream) = stream {
+                            if let Err(e) = self.handle_status_query(stream) {
+                                error!("Error handling status query: {}", e);
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // Announce manager stopped
         self.bus_tx
             .send(Evt::State {
-                service: "manager".to_string(),
+                service: Arc::from("manager"),
                 state: ServiceState::Stopped,
                 ts: chrono::Utc::now(),
                 pid: Some(std::process::id()),
@@ -479,18 +717,26 @@ impl ServiceManager {
                 } else {
                     info!("{service} → {state} (pid: {pid:?}, ts: {ts}, spontaneous)");
                 }
-                
+
+                // Store last known state for status queries
+                self.last_state.insert(service.to_string(), LastServiceState {
+                    state: *state,
+                    pid: *pid,
+                    timestamp: Instant::now(),
+                    failure_reason: None,
+                });
+
                 // Only restart on crash, not clean stop
                 // Use enum variants for type-safe matching
-                if *state == ServiceState::StoppedCrash && service != "manager" {
-                    if !self.schedule_restart(service, 0) {
+                if *state == ServiceState::StoppedCrash && service.as_ref() != "manager" {
+                    if !self.schedule_restart(service.as_ref(), 0) {
                         // Max attempts exceeded, log permanent failure
                         error!("{} permanently failed, will not restart", service);
                     }
                 } else if *state == ServiceState::StoppedClean {
                     info!("{} stopped cleanly, not restarting", service);
                     // Clean stop - remove from pending restarts to prevent stale state
-                    self.pending_restarts.remove(service.as_str());
+                    self.pending_restarts.remove(service.as_ref());
                 }
             }
             Evt::Health {
@@ -502,29 +748,170 @@ impl ServiceManager {
                 if *healthy {
                     info!("{service} health check OK at {ts} (correlation_id={correlation_id})");
                 } else {
-                    error!("{service} health check FAILED at {ts} (correlation_id={correlation_id})");
+                    error!(
+                        "{service} health check FAILED at {ts} (correlation_id={correlation_id})"
+                    );
                     // Schedule restart with 100ms delay, respect max attempts
-                    if !self.schedule_restart(service, 100) {
-                        error!("{} exceeded max restart attempts after health failure", service);
+                    if !self.schedule_restart(service.as_ref(), 100) {
+                        error!(
+                            "{} exceeded max restart attempts after health failure",
+                            service
+                        );
                     }
                 }
             }
-            Evt::LogRotate { service, ts, correlation_id } => {
+            Evt::LogRotate {
+                service,
+                ts,
+                correlation_id,
+            } => {
                 info!("{service} rotated logs at {ts} (correlation_id={correlation_id})");
             }
             Evt::Fatal { service, msg, ts } => {
                 error!("{service} FATAL at {ts}: {msg}");
+                
+                // Store failure reason in last_state
+                if let Some(state) = self.last_state.get_mut(service.as_ref()) {
+                    state.failure_reason = Some(msg.to_string());
+                }
+                
                 // Schedule restart with longer delay (1000ms), respect max attempts
-                if !self.schedule_restart(service, 1000) {
-                    error!("{} exceeded max restart attempts after fatal error", service);
+                if !self.schedule_restart(service.as_ref(), 1000) {
+                    error!(
+                        "{} exceeded max restart attempts after fatal error",
+                        service
+                    );
                 }
             }
         }
         Ok(())
     }
 
+    /// Handle status query from Unix socket
+    #[cfg(unix)]
+    fn handle_status_query(&self, mut stream: std::os::unix::net::UnixStream) -> Result<()> {
+        use crate::status::{StatusQuery, recv_message, send_message};
+        
+        // Set read timeout to prevent hanging on malicious clients
+        stream.set_read_timeout(Some(Duration::from_secs(5)))
+            .context("Failed to set socket read timeout")?;
+        
+        // Receive query from CLI
+        let query: StatusQuery = recv_message(&mut stream)
+            .context("Failed to receive status query")?;
+        
+        // Build response
+        let response = match query {
+            StatusQuery::All => self.build_full_status(),
+            StatusQuery::Service(name) => self.build_service_status(&name),
+        }?;
+        
+        // Send response back to CLI
+        send_message(&mut stream, &response)
+            .context("Failed to send status response")?;
+        
+        Ok(())
+    }
+
+    /// Build full status response for all services
+    fn build_full_status(&self) -> Result<crate::status::StatusResponse> {
+        use crate::status::{ServiceStatus, ServiceStateKind, StatusResponse};
+        
+        let daemon_uptime = self.lifecycle.start_time().elapsed();
+        
+        let mut services = Vec::new();
+        
+        // Collect status for all registered services
+        for (service_name, _worker_tx) in &self.workers {
+            let restart_state = self.pending_restarts.get(service_name);
+            let policy = self.restart_policies.get(service_name);
+            let last_state = self.last_state.get(service_name);
+            
+            // Convert ServiceState to ServiceStateKind
+            let state_kind = if let Some(last) = last_state {
+                match last.state {
+                    ServiceState::Starting => ServiceStateKind::Starting,
+                    ServiceState::Running => ServiceStateKind::Running,
+                    ServiceState::Stopping => ServiceStateKind::Stopped,
+                    ServiceState::Stopped => ServiceStateKind::Stopped,
+                    ServiceState::StoppedClean => ServiceStateKind::Stopped,
+                    ServiceState::StoppedCrash => ServiceStateKind::Failed,
+                    ServiceState::Restarting => ServiceStateKind::Restarting,
+                }
+            } else {
+                ServiceStateKind::Stopped
+            };
+            
+            // Calculate uptime if running
+            let uptime = if let Some(last) = last_state {
+                if matches!(last.state, ServiceState::Running) {
+                    Some(last.timestamp.elapsed())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            
+            // Get restart count and max
+            let restart_count = restart_state.map(|s| s.attempts).unwrap_or(0);
+            let max_restarts = policy.and_then(|p| p.max_attempts);
+            
+            // Calculate next restart delay if restarting
+            let next_restart_delay = restart_state.and_then(|s| {
+                let now = Instant::now();
+                if s.stop_time > now {
+                    Some(s.stop_time - now)
+                } else {
+                    None
+                }
+            });
+            
+            // Calculate success window remaining
+            let success_window_remaining = if let (Some(rs), Some(pol)) = (restart_state, policy) {
+                rs.last_successful_start.map(|start| {
+                    let window = Duration::from_secs(pol.success_window_secs);
+                    let elapsed = start.elapsed();
+                    window.saturating_sub(elapsed)
+                })
+            } else {
+                None
+            };
+            
+            let status = ServiceStatus {
+                name: service_name.clone(),
+                state: state_kind,
+                pid: last_state.and_then(|s| s.pid),
+                uptime,
+                restart_count,
+                max_restarts,
+                next_restart_delay,
+                success_window_remaining,
+                failure_reason: last_state.and_then(|s| s.failure_reason.clone()),
+            };
+            
+            services.push(status);
+        }
+        
+        Ok(StatusResponse {
+            daemon_running: true,
+            daemon_pid: std::process::id(),
+            daemon_uptime,
+            services,
+        })
+    }
+
+    /// Build status response for a specific service
+    fn build_service_status(&self, service_name: &str) -> Result<crate::status::StatusResponse> {
+        // For now, just build full status and filter
+        // In the future, could optimize to only query specific service
+        let mut response = self.build_full_status()?;
+        response.services.retain(|s| s.name == service_name);
+        Ok(response)
+    }
+
     /// Execute the side-effect requested by a lifecycle state transition.
-    /// 
+    ///
     /// This method maps the pure Action enum returned by the state machine
     /// to concrete side-effects: spawning processes, killing processes, and
     /// sending health notifications.
@@ -535,44 +922,68 @@ impl ServiceManager {
                 // Future: could refactor worker spawn logic here for consistency
                 log::debug!("Lifecycle action: SpawnProcess (handled by caller)");
             }
-            
+
             Action::KillProcess => {
                 log::info!("Lifecycle action: KillProcess - shutting down workers");
-                
-                // Shutdown embedded HTTP servers if running
-                if let Some(servers) = self.embedded_servers.take()
-                    && let Err(e) = shutdown_all_servers(servers).await {
+
+                // Phase 1: Shutdown embedded HTTP servers (has timeout: 30s per server)
+                if let Some(servers) = self.embedded_servers.take() {
+                    log::info!("Shutting down {} embedded HTTP servers", servers.len());
+                    if let Err(e) = shutdown_all_servers(servers).await {
                         log::error!("Error shutting down embedded servers: {}", e);
+                        // Continue anyway - don't let server shutdown failure block worker shutdown
                     }
-                
-                // Send shutdown command to all workers
+                }
+
+                // Phase 2: Send shutdown commands to all workers
+                log::info!("Sending shutdown command to {} workers", self.workers.len());
                 for (name, tx) in &self.workers {
                     if let Err(e) = tx.send(Cmd::Shutdown) {
                         log::error!("Failed to send shutdown to {}: {}", name, e);
                     }
                 }
+
+                // Phase 3: Wait for workers to complete shutdown
+                let timeout = Duration::from_secs(self.config.read().daemon_shutdown_timeout_secs);
+                log::info!("Waiting for workers to complete shutdown (timeout: {:?})", timeout);
+                
+                match self.wait_for_workers_shutdown(timeout) {
+                    Ok(()) => {
+                        log::info!("All workers shutdown successfully");
+                    }
+                    Err(e) => {
+                        log::error!("Worker shutdown timeout: {}", e);
+                        log::warn!("Continuing with daemon shutdown despite worker timeout");
+                        log::warn!("Hung workers may be forcefully terminated by OS");
+                        // Don't return error - allow PID cleanup to proceed
+                    }
+                }
             }
-            
+
             Action::NotifyHealthy => {
                 log::info!("Lifecycle action: NotifyHealthy - manager is healthy");
-                self.bus_tx.send(Evt::Health {
-                    service: "manager".to_string(),
-                    healthy: true,
-                    ts: chrono::Utc::now(),
-                    correlation_id: 0,
-                }).ok();
+                self.bus_tx
+                    .send(Evt::Health {
+                        service: Arc::from("manager"),
+                        healthy: true,
+                        ts: chrono::Utc::now(),
+                        correlation_id: 0,
+                    })
+                    .ok();
             }
-            
+
             Action::NotifyUnhealthy => {
                 log::error!("Lifecycle action: NotifyUnhealthy - manager in failed state");
-                self.bus_tx.send(Evt::Health {
-                    service: "manager".to_string(),
-                    healthy: false,
-                    ts: chrono::Utc::now(),
-                    correlation_id: 0,
-                }).ok();
+                self.bus_tx
+                    .send(Evt::Health {
+                        service: Arc::from("manager"),
+                        healthy: false,
+                        ts: chrono::Utc::now(),
+                        correlation_id: 0,
+                    })
+                    .ok();
             }
-            
+
             Action::Noop => {
                 // Explicitly do nothing - transition completed with no side-effect
                 log::trace!("Lifecycle action: Noop");
@@ -580,20 +991,131 @@ impl ServiceManager {
         }
     }
 
-    /// Schedule a service for restart after a delay with exponential backoff
+    /// Wait for all worker threads to complete shutdown
     /// 
+    /// Workers send ServiceState::StoppedClean or ServiceState::StoppedCrash
+    /// when they finish their shutdown procedures. This method waits for
+    /// all workers to send one of these events.
+    /// 
+    /// # Timeout Behavior
+    /// 
+    /// On timeout, logs which workers are still running and returns an error.
+    /// The caller should continue cleanup (PID file removal) despite timeout.
+    /// 
+    /// # Architecture Note
+    /// 
+    /// This bridges async manager (tokio) with sync workers (OS threads):
+    /// - Workers run in OS threads spawned by thread::spawn()
+    /// - Workers communicate via crossbeam channels (blocking)
+    /// - Manager runs in tokio runtime (async)
+    /// - Uses crossbeam select! for consistent architecture
+    fn wait_for_workers_shutdown(&mut self, timeout: Duration) -> Result<()> {
+        let worker_names: HashSet<_> = self.workers.keys().cloned().collect();
+        if worker_names.is_empty() {
+            log::info!("No workers to wait for");
+            return Ok(());
+        }
+        
+        log::info!(
+            "Waiting for {} workers to shutdown (timeout: {:?})",
+            worker_names.len(),
+            timeout
+        );
+        
+        let mut stopped_workers = HashSet::new();
+        let start = Instant::now();
+        let timeout_tick = tick(timeout);
+        
+        loop {
+            select! {
+                recv(self.bus_rx) -> evt => {
+                    match evt {
+                        Ok(Evt::State { service, state, .. }) 
+                            if worker_names.contains(service.as_ref()) 
+                            && matches!(state, ServiceState::StoppedClean | ServiceState::StoppedCrash) => {
+                            
+                            let elapsed = start.elapsed();
+                            log::info!(
+                                "Worker '{}' stopped {} in {:.2}s",
+                                service,
+                                if state == ServiceState::StoppedClean { "cleanly" } else { "with crash" },
+                                elapsed.as_secs_f64()
+                            );
+                            
+                            stopped_workers.insert(service.as_ref().to_string());
+                            
+                            // Warn about slow shutdowns (>5s)
+                            if elapsed > Duration::from_secs(5) {
+                                log::warn!(
+                                    "Worker '{}' took {:.2}s to shutdown (slow)",
+                                    service,
+                                    elapsed.as_secs_f64()
+                                );
+                            }
+                            
+                            if stopped_workers.len() == worker_names.len() {
+                                log::info!(
+                                    "All {} workers stopped successfully in {:.2}s",
+                                    worker_names.len(),
+                                    start.elapsed().as_secs_f64()
+                                );
+                                return Ok(());
+                            }
+                        }
+                        Ok(_) => {
+                            // Event from non-worker or non-state event, ignore
+                            continue;
+                        }
+                        Err(_) => {
+                            // Channel disconnected
+                            log::warn!("Event bus disconnected during shutdown wait");
+                            break;
+                        }
+                    }
+                }
+                recv(timeout_tick) -> _ => {
+                    // Timeout reached
+                    let still_running: Vec<_> = worker_names
+                        .difference(&stopped_workers)
+                        .collect();
+                    
+                    log::error!(
+                        "Worker shutdown timeout after {:?}. {} workers still running:",
+                        start.elapsed(),
+                        still_running.len()
+                    );
+                    
+                    for worker in &still_running {
+                        log::error!("  - {} (hung or slow shutdown)", worker);
+                    }
+                    
+                    return Err(anyhow::anyhow!(
+                        "Shutdown timeout: {} workers did not stop within {:?}",
+                        still_running.len(),
+                        timeout
+                    ));
+                }
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// Schedule a service for restart after a delay with exponential backoff
+    ///
     /// Implements exponential backoff using the proven formula from
     /// kodegen-bundler-release/retry.rs (line 103):
     ///   delay = initial_delay * multiplier^(attempts-1)
-    /// 
+    ///
     /// Returns true if restart was scheduled, false if max attempts exceeded.
-    /// 
+    ///
     /// # Arguments
     /// * `service` - Service name to restart
     /// * `base_delay_ms` - Minimum delay from failure type (0=crash, 100=health, 1000=fatal)
     fn schedule_restart(&mut self, service: &str, base_delay_ms: u64) -> bool {
         // Get restart policy for this service (or use default)
-        let policy = self.restart_policies
+        let policy = self
+            .restart_policies
             .get(service)
             .cloned()
             .unwrap_or_default();
@@ -611,7 +1133,7 @@ impl ServiceManager {
 
             // Calculate attempts counter with success window reset
             let state = self.pending_restarts.get(service);
-            
+
             // Check if service ran successfully long enough to reset counter
             // This implements the "success window" pattern from circuit_breaker.rs
             let should_reset = state
@@ -623,7 +1145,7 @@ impl ServiceManager {
 
             let attempts = if should_reset {
                 info!(
-                    "{} ran successfully for ≥{}s, resetting restart counter", 
+                    "{} ran successfully for ≥{}s, resetting restart counter",
                     service, policy.success_window_secs
                 );
                 1
@@ -641,17 +1163,20 @@ impl ServiceManager {
                 );
 
                 // Send fatal event to log the permanent failure
-                self.bus_tx.send(Evt::Fatal {
-                    service: service.to_string(),
-                    msg: std::borrow::Cow::Owned(
-                        format!("Service exceeded max restart attempts ({})", max)
-                    ),
-                    ts: chrono::Utc::now(),
-                }).ok();
+                self.bus_tx
+                    .send(Evt::Fatal {
+                        service: Arc::from(service),
+                        msg: std::borrow::Cow::Owned(format!(
+                            "Service exceeded max restart attempts ({})",
+                            max
+                        )),
+                        ts: chrono::Utc::now(),
+                    })
+                    .ok();
 
                 // Remove from pending restarts - permanently failed
                 self.pending_restarts.remove(service);
-                return false;  // Do not restart
+                return false; // Do not restart
             }
 
             // Calculate exponential backoff delay
@@ -660,12 +1185,12 @@ impl ServiceManager {
             // Example with defaults: 100ms, 200ms, 400ms, 800ms, 1600ms, ... up to 60s
             let exponential_delay = (policy.initial_delay_ms as f64
                 * policy.backoff_multiplier.powi((attempts - 1) as i32))
-                .min(policy.max_delay_ms as f64) as u64;
-            
+            .min(policy.max_delay_ms as f64) as u64;
+
             // Use greater of base_delay_ms (from failure type) or exponential backoff
             // This ensures fatal errors still get their 1000ms minimum delay
             let delay_ms = exponential_delay.max(base_delay_ms);
-            
+
             let restart_time = Instant::now() + Duration::from_millis(delay_ms);
 
             self.pending_restarts.insert(
@@ -673,7 +1198,7 @@ impl ServiceManager {
                 RestartState {
                     stop_time: restart_time,
                     attempts,
-                    last_successful_start: None,  // Will be set on successful start
+                    last_successful_start: None, // Will be set on successful start
                 },
             );
 
@@ -682,9 +1207,12 @@ impl ServiceManager {
                 service,
                 delay_ms,
                 attempts,
-                policy.max_attempts.map(|m| m.to_string()).unwrap_or_else(|| "∞".to_string())
+                policy
+                    .max_attempts
+                    .map(|m| m.to_string())
+                    .unwrap_or_else(|| "∞".to_string())
             );
-            
+
             true
         } else {
             error!("Cannot restart {}: service not found in workers", service);
@@ -693,7 +1221,7 @@ impl ServiceManager {
     }
 
     /// Process pending restarts that are ready
-    /// 
+    ///
     /// Executes restarts for services whose backoff delay has elapsed.
     /// Records successful start time to enable success window tracking.
     fn process_pending_restarts(&mut self) {
@@ -713,24 +1241,24 @@ impl ServiceManager {
                 && let Some(tx) = self.workers.get(&service)
             {
                 info!("Restarting {} (attempt #{})", service, state.attempts);
-                
+
                 // Record successful start time for success window tracking
                 // This timestamp will be checked in schedule_restart() to determine
                 // if service ran long enough to reset the attempts counter
                 state.last_successful_start = Some(Instant::now());
-                
+
                 // Re-insert state with updated start time
                 // Keep state in map so next failure can check elapsed time
                 self.pending_restarts.insert(service.clone(), state);
-                
+
                 // Send start command to service worker
                 let correlation_id = self.next_correlation_id();
                 tx.send(Cmd::Start { correlation_id }).ok();
-                
+
                 // Announce restart completion to event bus
                 self.bus_tx
                     .send(Evt::State {
-                        service: "manager".to_string(),
+                        service: Arc::from("manager"),
                         state: ServiceState::RestartedService,
                         ts: chrono::Utc::now(),
                         pid: Some(std::process::id()),
@@ -740,6 +1268,59 @@ impl ServiceManager {
             }
         }
     }
+
+    /// Trigger graceful shutdown
+    /// 
+    /// This method enables external callers (like Windows services) to shut down
+    /// the ServiceManager event loop gracefully. It sends a shutdown signal to
+    /// the run() loop which will then break from its select! and perform cleanup.
+    /// 
+    /// # Shutdown Sequence
+    /// 
+    /// 1. Sends shutdown signal to run() loop (non-blocking)
+    /// 2. run() loop breaks from select! and enters cleanup:
+    ///    - Calls handle_lifecycle_action(Action::KillProcess)
+    ///    - Shuts down embedded HTTP servers
+    ///    - Sends Shutdown commands to all workers
+    ///    - Waits for worker termination
+    /// 3. Returns immediately after sending signal
+    /// 
+    /// # Note on Timeout
+    /// 
+    /// This method returns immediately after sending the shutdown signal.
+    /// The caller (Windows service) is responsible for:
+    /// - Waiting on the run() task to complete (via JoinHandle)
+    /// - Enforcing timeout at the task level
+    /// - Handling timeout by allowing SCM to force-kill if needed
+    /// 
+    /// This design keeps shutdown() simple and avoids complex async/sync bridging.
+    /// 
+    /// # Arguments
+    /// 
+    /// * `_timeout` - Ignored, provided for API compatibility
+    /// 
+    /// # Example
+    /// 
+    /// ```rust
+    /// // Send shutdown signal
+    /// service_manager.shutdown(Duration::from_secs(5))?;
+    /// 
+    /// // Wait for run() task with timeout
+    /// match tokio::time::timeout(Duration::from_secs(5), run_handle).await {
+    ///     Ok(_) => info!("Shutdown complete"),
+    ///     Err(_) => error!("Shutdown timeout"),
+    /// }
+    /// ```
+    pub fn shutdown(&self, _timeout: Duration) -> Result<()> {
+        info!("Sending shutdown signal to ServiceManager");
+        
+        // Send shutdown signal to run() loop
+        // This will cause the select! to break and cleanup to begin
+        self.shutdown_tx
+            .send(())
+            .context("Failed to send shutdown signal - channel disconnected")?;
+        
+        info!("Shutdown signal sent successfully");
+        Ok(())
+    }
 }
-
-

@@ -14,9 +14,7 @@
 ///
 /// The 15 HTTP server binaries are NO LONGER needed as separate processes.
 /// They are now embedded into kodegend and started as internal tasks.
-pub const BINARIES: &[&str] = &[
-    "kodegen",
-];
+pub const BINARIES: &[&str] = &["kodegen"];
 
 /// Total number of binaries (automatically derived from BINARIES.len())
 ///

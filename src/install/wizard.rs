@@ -204,8 +204,22 @@ pub fn run_wizard() -> Result<InstallOptions> {
 
     // Show summary of selections
     println!("\n📋 Installation Summary:");
-    println!("  • Dry-run mode: {}", if dry_run { "Yes (preview only)" } else { "No (will install)" });
-    println!("  • Auto-start: {}", if auto_start { "Yes (on boot)" } else { "No (manual start)" });
+    println!(
+        "  • Dry-run mode: {}",
+        if dry_run {
+            "Yes (preview only)"
+        } else {
+            "No (will install)"
+        }
+    );
+    println!(
+        "  • Auto-start: {}",
+        if auto_start {
+            "Yes (on boot)"
+        } else {
+            "No (manual start)"
+        }
+    );
     println!();
 
     // Final confirmation before proceeding

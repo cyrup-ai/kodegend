@@ -8,6 +8,8 @@ use anyhow::{Context, Result};
 use std::time::Duration;
 use tokio::time::sleep;
 
+use crate::constants::*;
+
 /// Check if a port is available for binding
 ///
 /// Tests port availability by attempting to bind a TcpListener.
@@ -44,8 +46,7 @@ pub async fn check_port_available(port: u16) -> bool {
 /// - `Err(e)` - System error retrieving socket information
 pub async fn find_process_by_port(port: u16) -> Result<Option<u32>> {
     use netstat2::{
-        get_sockets_info, AddressFamilyFlags, ProtocolFlags,
-        ProtocolSocketInfo, TcpState,
+        AddressFamilyFlags, ProtocolFlags, ProtocolSocketInfo, TcpState, get_sockets_info,
     };
 
     // netstat2::get_sockets_info() is blocking - wrap in spawn_blocking for async compatibility
@@ -105,25 +106,29 @@ pub async fn kill_process_graceful(pid: u32) -> Result<()> {
         system.refresh_processes(ProcessesToUpdate::All, true);
 
         let sysinfo_pid = Pid::from(pid as usize);
-        
-        let process = system.process(sysinfo_pid)
+
+        let process = system
+            .process(sysinfo_pid)
             .ok_or_else(|| anyhow::anyhow!("Process {} not found", pid))?;
 
         // Try graceful termination first (SIGTERM on Unix)
         #[cfg(unix)]
         let graceful_result = process.kill_with(Signal::Term);
-        
+
         #[cfg(windows)]
         let graceful_result = Some(true); // Windows doesn't distinguish
 
         if graceful_result.is_some() {
             // Wait a moment for graceful shutdown
-            std::thread::sleep(Duration::from_secs(2));
-            
+            std::thread::sleep(GRACEFUL_KILL_WAIT);
+
             // Refresh and check if still running
             system.refresh_processes(ProcessesToUpdate::All, true);
             if system.process(sysinfo_pid).is_some() {
-                log::warn!("Process {} did not terminate gracefully, force killing", pid);
+                log::warn!(
+                    "Process {} did not terminate gracefully, force killing",
+                    pid
+                );
             } else {
                 log::info!("Process {} terminated gracefully", pid);
                 return Ok(());
@@ -133,7 +138,8 @@ pub async fn kill_process_graceful(pid: u32) -> Result<()> {
         // Force kill with SIGKILL
         system.refresh_processes(ProcessesToUpdate::All, true);
         if let Some(process) = system.process(sysinfo_pid) {
-            process.kill_with(Signal::Kill)
+            process
+                .kill_with(Signal::Kill)
                 .ok_or_else(|| anyhow::anyhow!("Failed to kill process {}", pid))?;
             log::info!("Process {} force killed", pid);
         }
@@ -163,7 +169,7 @@ pub async fn kill_process_graceful(pid: u32) -> Result<()> {
 async fn force_kill_process(pid: u32) -> Result<()> {
     #[cfg(unix)]
     {
-        use nix::sys::signal::{kill, Signal};
+        use nix::sys::signal::{Signal, kill};
         use nix::unistd::Pid;
 
         let nix_pid = Pid::from_raw(pid as i32);
@@ -171,23 +177,31 @@ async fn force_kill_process(pid: u32) -> Result<()> {
         // Send SIGKILL (signal 9 - cannot be caught, blocked, or ignored)
         kill(nix_pid, Signal::SIGKILL)
             .map_err(|e| anyhow::anyhow!("Failed to send SIGKILL to process {}: {}", pid, e))?;
-        
+
         log::debug!("Sent SIGKILL to process {}, waiting for termination", pid);
 
         // Wait for process to actually die (up to 1 second with 10 checks)
-        for attempt in 1..=10 {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+        for attempt in 1..=FORCE_KILL_MAX_ATTEMPTS {
+            tokio::time::sleep(FORCE_KILL_POLL_INTERVAL).await;
 
             // Check if process is gone (kill with signal 0 = existence check, no actual signal)
             match kill(nix_pid, None) {
                 Err(_) => {
                     // ESRCH error means process is dead
-                    log::info!("✓ Process {} successfully force-killed (confirmed dead after {}ms)", pid, attempt * 100);
+                    log::info!(
+                        "✓ Process {} successfully force-killed (confirmed dead after {}ms)",
+                        pid,
+                        attempt * 100
+                    );
                     return Ok(());
                 }
                 Ok(_) => {
                     // Process still exists, keep waiting
-                    log::trace!("Process {} still exists after {}ms, continuing to wait", pid, attempt * 100);
+                    log::trace!(
+                        "Process {} still exists after {}ms, continuing to wait",
+                        pid,
+                        attempt * 100
+                    );
                     continue;
                 }
             }
@@ -203,26 +217,30 @@ async fn force_kill_process(pid: u32) -> Result<()> {
 
     #[cfg(windows)]
     {
-        use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
-        use windows::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows::Win32::System::Threading::TerminateProcess;
+        use crate::platform::windows::{ProcessHandle};
 
+        // Open process with terminate access - handle auto-closed on drop
+        let handle = ProcessHandle::open_terminate(pid)?;
+
+        // Terminate process with exit code 1
         unsafe {
-            // Open process with TERMINATE permission
-            let handle: HANDLE = OpenProcess(PROCESS_TERMINATE, false, pid)
-                .map_err(|e| anyhow::anyhow!("Failed to open process {} for termination: {}", pid, e))?;
-
-            // Terminate process with exit code 1
-            let result = TerminateProcess(handle, 1)
-                .map_err(|e| anyhow::anyhow!("Failed to terminate process {}: {}", pid, e));
-
-            // Always close handle (even if TerminateProcess failed)
-            CloseHandle(handle).ok();
-
-            result?;
+            TerminateProcess(handle.as_raw(), 1).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to terminate process {}: {} (error code: {})",
+                    pid,
+                    std::io::Error::from_raw_os_error(e.code().0),
+                    e.code().0
+                )
+            })?;
         }
+        // Handle automatically closed here when `handle` goes out of scope
 
-        log::info!("✓ Process {} successfully terminated (Windows TerminateProcess)", pid);
-        
+        log::info!(
+            "✓ Process {} successfully terminated (Windows TerminateProcess)",
+            pid
+        );
+
         // Windows TerminateProcess is synchronous - process is dead when it returns
         Ok(())
     }
@@ -233,12 +251,12 @@ async fn force_kill_process(pid: u32) -> Result<()> {
 /// Polls port availability every 100ms until timeout.
 pub async fn wait_for_port_release(port: u16, timeout: Duration) -> Result<()> {
     let start = tokio::time::Instant::now();
-    
+
     while start.elapsed() < timeout {
         if check_port_available(port).await {
             return Ok(());
         }
-        sleep(Duration::from_millis(100)).await;
+        sleep(PORT_POLL_INTERVAL).await;
     }
 
     Err(anyhow::anyhow!(
@@ -265,12 +283,8 @@ pub async fn wait_for_port_release(port: u16, timeout: Duration) -> Result<()> {
 /// - Ok(()) if port is available after cleanup
 /// - Err() only if cleanup fails after all retries (port permanently blocked)
 pub async fn cleanup_port_if_needed(port: u16) -> Result<()> {
-    const MAX_RETRIES: u32 = 5;
-    const INITIAL_DELAY_MS: u64 = 100;
-    const MAX_DELAY_MS: u64 = 5000;
-
     let mut attempt = 0;
-    let mut delay_ms = INITIAL_DELAY_MS;
+    let mut delay_ms = PORT_CLEANUP_INITIAL_DELAY_MS;
 
     loop {
         attempt += 1;
@@ -278,16 +292,20 @@ pub async fn cleanup_port_if_needed(port: u16) -> Result<()> {
         match try_cleanup_port_once(port).await {
             Ok(()) => {
                 if attempt > 1 {
-                    log::info!("✓ Port {} cleanup succeeded after {} attempts", port, attempt);
+                    log::info!(
+                        "✓ Port {} cleanup succeeded after {} attempts",
+                        port,
+                        attempt
+                    );
                 }
                 return Ok(());
             }
-            Err(e) if attempt >= MAX_RETRIES => {
+            Err(e) if attempt >= PORT_CLEANUP_MAX_RETRIES => {
                 log::error!(
                     "✗ Port {} cleanup failed after {} attempts ({}s total): {:#}",
                     port,
-                    MAX_RETRIES,
-                    (INITIAL_DELAY_MS * ((1 << MAX_RETRIES) - 1)) / 1000,  // Geometric series sum
+                    PORT_CLEANUP_MAX_RETRIES,
+                    (PORT_CLEANUP_INITIAL_DELAY_MS * ((1 << PORT_CLEANUP_MAX_RETRIES) - 1)) / 1000, // Geometric series sum
                     e
                 );
                 return Err(e);
@@ -297,15 +315,15 @@ pub async fn cleanup_port_if_needed(port: u16) -> Result<()> {
                     "Port {} cleanup attempt {}/{} failed: {}. Retrying in {}ms...",
                     port,
                     attempt,
-                    MAX_RETRIES,
+                    PORT_CLEANUP_MAX_RETRIES,
                     e,
                     delay_ms
                 );
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                
+
                 // Exponential backoff: 100ms, 200ms, 400ms, 800ms, 1600ms, capped at 5000ms
                 // Formula from kodegen-bundler-release/retry.rs:99-103
-                delay_ms = (delay_ms * 2).min(MAX_DELAY_MS);
+                delay_ms = (delay_ms * 2).min(PORT_CLEANUP_MAX_DELAY_MS);
             }
         }
     }
@@ -342,15 +360,21 @@ async fn try_cleanup_port_once(port: u16) -> Result<()> {
         None => {
             // Race condition: port shows as used but no process found
             // Possible causes: TIME_WAIT state, kernel holding port
-            log::warn!("Port {} in use but no process found - possible TIME_WAIT state", port);
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            
+            log::warn!(
+                "Port {} in use but no process found - possible TIME_WAIT state",
+                port
+            );
+            tokio::time::sleep(TIME_WAIT_TOLERANCE_DELAY).await;
+
             // Verify port actually became available
             if check_port_available(port).await {
-                log::info!("Port {} became available after wait (TIME_WAIT cleared)", port);
+                log::info!(
+                    "Port {} became available after wait (TIME_WAIT cleared)",
+                    port
+                );
                 return Ok(());
             }
-            
+
             return Err(anyhow::anyhow!(
                 "Port {} appears in use but no process found (may be in TIME_WAIT or held by kernel)",
                 port
@@ -358,23 +382,37 @@ async fn try_cleanup_port_once(port: u16) -> Result<()> {
         }
     };
 
-    log::info!("Found process {} using port {}, attempting graceful shutdown (SIGTERM)", pid, port);
+    log::info!(
+        "Found process {} using port {}, attempting graceful shutdown (SIGTERM)",
+        pid,
+        port
+    );
 
     // Try graceful shutdown first (existing function)
     let graceful_result = kill_process_graceful(pid).await;
-    
+
     if graceful_result.is_err() {
-        log::warn!("Graceful kill of process {} failed, attempting force kill (SIGKILL)", pid);
-        
+        log::warn!(
+            "Graceful kill of process {} failed, attempting force kill (SIGKILL)",
+            pid
+        );
+
         // Force kill with SIGKILL (NEW - add this function below)
         force_kill_process(pid).await?;
     }
 
     // Wait for port to be released (existing function - works great)
-    log::debug!("Waiting for port {} to be released after killing PID {}", port, pid);
-    wait_for_port_release(port, Duration::from_secs(3))
+    log::debug!(
+        "Waiting for port {} to be released after killing PID {}",
+        port,
+        pid
+    );
+    wait_for_port_release(port, PORT_RELEASE_VERIFICATION_TIMEOUT)
         .await
-        .context(format!("Port {} still in use after killing process {}", port, pid))?;
+        .context(format!(
+            "Port {} still in use after killing process {}",
+            port, pid
+        ))?;
 
     // CRITICAL: Final verification - port MUST be available now
     if !check_port_available(port).await {
@@ -386,6 +424,180 @@ async fn try_cleanup_port_once(port: u16) -> Result<()> {
         ));
     }
 
-    log::info!("✓ Successfully cleaned up port {} (terminated PID {})", port, pid);
+    log::info!(
+        "✓ Successfully cleaned up port {} (terminated PID {})",
+        port,
+        pid
+    );
     Ok(())
+}
+
+/// Clean up port if needed and immediately bind to reserve it (TOCTOU-safe)
+///
+/// This function eliminates the race condition by returning a bound TcpListener,
+/// ensuring no other process can claim the port between cleanup and server startup.
+///
+/// # Process
+/// 1. Try to bind immediately (port may already be free)
+/// 2. If binding fails, find process using port via netstat2 API
+/// 3. Kill process gracefully (SIGTERM), then force-kill if needed (SIGKILL)
+/// 4. Wait for port release (polls every 100ms, max 3 seconds)
+/// 5. Immediately bind and return listener (atomic reserve)
+///
+/// # Arguments
+/// * `port` - Port number to clean up and reserve (1-65535)
+///
+/// # Returns
+/// - `Ok(TcpListener)` - Bound listener ready to be passed to server
+/// - `Err(e)` - Cleanup failed (process unkillable, port stuck, etc.)
+///
+/// # Example
+/// ```rust
+/// // Reserve port with cleanup
+/// let listener = cleanup_and_reserve_port(30438).await?;
+///
+/// // Pass to server startup (no race window)
+/// let handle = create_http_server_with_listener(listener, ...).await?;
+/// ```
+pub async fn cleanup_and_reserve_port(port: u16) -> Result<tokio::net::TcpListener> {
+    let mut attempt = 0;
+    let mut delay_ms = PORT_CLEANUP_INITIAL_DELAY_MS;
+
+    loop {
+        attempt += 1;
+
+        match try_cleanup_and_reserve_port_once(port).await {
+            Ok(listener) => {
+                if attempt > 1 {
+                    log::info!("✓ Port {} reserved after {} attempts", port, attempt);
+                }
+                return Ok(listener);
+            }
+            Err(e) if attempt >= PORT_CLEANUP_MAX_RETRIES => {
+                log::error!(
+                    "✗ Port {} cleanup/reserve failed after {} attempts: {:#}",
+                    port,
+                    PORT_CLEANUP_MAX_RETRIES,
+                    e
+                );
+                return Err(e);
+            }
+            Err(e) => {
+                log::warn!(
+                    "Port {} cleanup/reserve attempt {}/{} failed: {}. Retrying in {}ms...",
+                    port,
+                    attempt,
+                    PORT_CLEANUP_MAX_RETRIES,
+                    e,
+                    delay_ms
+                );
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+
+                // Exponential backoff: 100ms, 200ms, 400ms, 800ms, 1600ms, capped at 5000ms
+                delay_ms = (delay_ms * 2).min(PORT_CLEANUP_MAX_DELAY_MS);
+            }
+        }
+    }
+}
+
+/// Single attempt at port cleanup with immediate reservation (TOCTOU-safe)
+///
+/// Used internally by cleanup_and_reserve_port() retry loop.
+/// Returns bound TcpListener to prevent race conditions.
+///
+/// # Process
+/// 1. Try to bind immediately (port may already be free)
+/// 2. If bind fails, find process using port
+/// 3. Kill process (graceful then force)
+/// 4. Wait for port release
+/// 5. Immediately bind and return listener (critical - minimizes race window)
+async fn try_cleanup_and_reserve_port_once(port: u16) -> Result<tokio::net::TcpListener> {
+    let addr = ("127.0.0.1", port);
+
+    // Quick attempt: port might already be free
+    match tokio::net::TcpListener::bind(addr).await {
+        Ok(listener) => {
+            log::debug!("Port {} was already available, reserved successfully", port);
+            return Ok(listener);
+        }
+        Err(_) => {
+            log::warn!("Port {} is in use, attempting cleanup", port);
+        }
+    }
+
+    // Port is occupied - find the process
+    let pid = match find_process_by_port(port).await? {
+        Some(pid) => pid,
+        None => {
+            // Race: port shows used but no process found (TIME_WAIT state)
+            log::warn!(
+                "Port {} in use but no process found - possible TIME_WAIT state",
+                port
+            );
+            tokio::time::sleep(TIME_WAIT_TOLERANCE_DELAY).await;
+
+            // Retry bind after wait
+            match tokio::net::TcpListener::bind(addr).await {
+                Ok(listener) => {
+                    log::info!(
+                        "Port {} became available after wait (TIME_WAIT cleared)",
+                        port
+                    );
+                    return Ok(listener);
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "Port {} in use but no process found (may be in TIME_WAIT or kernel-held): {}",
+                        port,
+                        e
+                    ));
+                }
+            }
+        }
+    };
+
+    log::info!(
+        "Found process {} using port {}, attempting termination",
+        pid,
+        port
+    );
+
+    // Try graceful shutdown first (SIGTERM)
+    let graceful_result = kill_process_graceful(pid).await;
+
+    if graceful_result.is_err() {
+        log::warn!(
+            "Graceful kill of process {} failed, attempting force kill (SIGKILL)",
+            pid
+        );
+        force_kill_process(pid).await?;
+    }
+
+    // Wait for port to be released (polls every 100ms, max 3 seconds)
+    log::debug!(
+        "Waiting for port {} to be released after killing PID {}",
+        port,
+        pid
+    );
+    wait_for_port_release(port, PORT_RELEASE_VERIFICATION_TIMEOUT)
+        .await
+        .context(format!(
+            "Port {} still in use after killing process {}",
+            port, pid
+        ))?;
+
+    // CRITICAL: Immediately bind to reserve the port
+    // This is the key to preventing TOCTOU - we bind immediately after confirming
+    // the port is free, minimizing the race window to a single syscall
+    let listener = tokio::net::TcpListener::bind(addr).await.context(format!(
+        "Port {} still occupied after cleanup (another process may have claimed it)",
+        port
+    ))?;
+
+    log::info!(
+        "✓ Successfully freed and reserved port {} (terminated PID {})",
+        port,
+        pid
+    );
+    Ok(listener)
 }

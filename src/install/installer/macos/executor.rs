@@ -6,7 +6,7 @@ use anyhow::Context;
 
 use super::{CommandBuilder, InstallerError};
 
-use super::helper::{verify_code_signature, HELPER_PATH};
+use super::helper::{HELPER_PATH, verify_code_signature};
 
 /// Execute script using the signed helper app with elevated privileges
 pub(super) fn run_helper(script: &str) -> Result<(), InstallerError> {
@@ -47,9 +47,9 @@ pub(super) fn run_helper(script: &str) -> Result<(), InstallerError> {
 
     // Write the script to the helper's stdin
     if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(script.as_bytes()).map_err(|e| {
-            InstallerError::System(format!("Failed to send script to helper: {e}"))
-        })?;
+        stdin
+            .write_all(script.as_bytes())
+            .map_err(|e| InstallerError::System(format!("Failed to send script to helper: {e}")))?;
         stdin.flush().map_err(|e| {
             InstallerError::System(format!("Failed to flush script to helper: {e}"))
         })?;

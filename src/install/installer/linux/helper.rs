@@ -24,9 +24,9 @@ const HELPER_BINARY_DATA: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kode
 /// Ensure helper executable is extracted and available
 pub(super) fn ensure_helper_path() -> Result<(), InstallerError> {
     // Acquire lock FIRST (released automatically when _guard drops)
-    let _guard = HELPER_EXTRACTION_LOCK.lock().map_err(|e| {
-        InstallerError::System(format!("Failed to acquire extraction lock: {}", e))
-    })?;
+    let _guard = HELPER_EXTRACTION_LOCK
+        .lock()
+        .map_err(|e| InstallerError::System(format!("Failed to acquire extraction lock: {}", e)))?;
 
     // Double-check pattern: check again after acquiring lock
     if HELPER_PATH.get().is_some() {
@@ -61,16 +61,15 @@ pub(super) fn ensure_helper_path() -> Result<(), InstallerError> {
             .map_err(|e| InstallerError::System(format!("Failed to get helper metadata: {}", e)))?
             .permissions();
         perms.set_mode(0o700);
-        helper_file
-            .as_file()
-            .set_permissions(perms)
-            .map_err(|e| InstallerError::System(format!("Failed to set helper permissions: {}", e)))?;
+        helper_file.as_file().set_permissions(perms).map_err(|e| {
+            InstallerError::System(format!("Failed to set helper permissions: {}", e))
+        })?;
     }
 
     // Persist the temp file and get the path
-    let (_file, helper_path) = helper_file
-        .keep()
-        .map_err(|e| InstallerError::System(format!("Failed to persist helper executable: {}", e)))?;
+    let (_file, helper_path) = helper_file.keep().map_err(|e| {
+        InstallerError::System(format!("Failed to persist helper executable: {}", e))
+    })?;
 
     // Verify the helper is properly signed (if signing is available)
     #[cfg(target_os = "macos")]

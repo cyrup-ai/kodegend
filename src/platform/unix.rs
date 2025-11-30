@@ -6,31 +6,34 @@
 //! - POSIX signals for process management
 //! - XDG Base Directory Specification for paths
 
-use std::path::{Path, PathBuf};
+use anyhow::{Context, Result, bail};
+use kodegen_config::KodegenConfig;
+use nix::sys::signal::kill;
+use nix::unistd::{Pid, Uid, geteuid, getpid};
 use std::fs::{self, DirBuilder};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
-use kodegen_config::KodegenConfig;
-use nix::unistd::{Pid, getpid, geteuid, Uid};
-use nix::sys::signal::kill;
-use anyhow::{Context, Result, bail};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::OnceLock;
+use sysinfo::{Pid as SysinfoPid, ProcessesToUpdate, System};
 
 /// Securely ensure a directory exists with correct ownership and permissions
-/// 
+///
 /// This function prevents symlink attacks by:
 /// 1. Attempting atomic creation with restrictive permissions (0o700)
 /// 2. If directory exists, validating it is NOT a symlink
 /// 3. Verifying ownership matches expected UID
 /// 4. Verifying permissions are 0o700 (owner-only access)
-/// 
+///
 /// # Security Properties
 /// - Fails-secure: Returns error rather than using unsafe directory
 /// - TOCTOU-resistant: Validates after creation attempt, not before
 /// - Defense-in-depth: Multiple validation layers
-/// 
+///
 /// # Arguments
 /// - `path`: Directory path to create/validate
 /// - `expected_uid`: Expected owner UID (typically current user)
-/// 
+///
 /// # Errors
 /// Returns security error if:
 /// - Path is a symlink (CWE-59 prevention)
@@ -40,7 +43,7 @@ fn ensure_secure_directory(path: &Path, expected_uid: Uid) -> Result<()> {
     // Step 1: Attempt atomic directory creation with restrictive permissions
     let mut builder = DirBuilder::new();
     builder.mode(0o700); // Owner-only: rwx------
-    
+
     match builder.create(path) {
         Ok(_) => {
             // Successfully created - we own it with correct permissions
@@ -56,12 +59,12 @@ fn ensure_secure_directory(path: &Path, expected_uid: Uid) -> Result<()> {
             return Err(e).context(format!("Failed to create directory: {}", path.display()));
         }
     }
-    
+
     // Step 2: Validate existing directory is NOT a symlink (CRITICAL)
     // Use symlink_metadata to avoid following symlinks
     let metadata = fs::symlink_metadata(path)
         .context(format!("Failed to read metadata for: {}", path.display()))?;
-    
+
     if metadata.file_type().is_symlink() {
         bail!(
             "SECURITY: Directory is a symlink - potential attack detected: {}\n\
@@ -69,17 +72,17 @@ fn ensure_secure_directory(path: &Path, expected_uid: Uid) -> Result<()> {
             path.display()
         );
     }
-    
+
     if !metadata.is_dir() {
         bail!(
             "SECURITY: Path exists but is not a directory: {}",
             path.display()
         );
     }
-    
+
     // Step 3: Verify ownership matches expected UID
     let file_uid = Uid::from_raw(metadata.uid());
-    
+
     if file_uid != expected_uid {
         bail!(
             "SECURITY: Directory ownership mismatch: {}\n\
@@ -90,11 +93,11 @@ fn ensure_secure_directory(path: &Path, expected_uid: Uid) -> Result<()> {
             file_uid
         );
     }
-    
+
     // Step 4: Verify permissions are sufficiently restrictive (0o700)
     let perms = metadata.permissions();
     let mode = perms.mode() & 0o777; // Extract permission bits
-    
+
     if mode != 0o700 {
         bail!(
             "SECURITY: Directory has unsafe permissions: {}\n\
@@ -104,9 +107,13 @@ fn ensure_secure_directory(path: &Path, expected_uid: Uid) -> Result<()> {
             mode
         );
     }
-    
-    log::debug!("Validated secure directory: {} (uid={}, mode=0o{:o})", 
-                path.display(), expected_uid, mode);
+
+    log::debug!(
+        "Validated secure directory: {} (uid={}, mode=0o{:o})",
+        path.display(),
+        expected_uid,
+        mode
+    );
     Ok(())
 }
 
@@ -130,11 +137,53 @@ pub fn platform_running_under_service_manager() -> bool {
     // macOS launchd detection (daemon.rs:32)
     if cfg!(target_os = "macos")
         && (std::env::var_os("LAUNCHED_BY_LAUNCHD").is_some()
-            || std::env::var_os("XPC_SERVICE_NAME").is_some()) {
-            return true;
-        }
+            || std::env::var_os("XPC_SERVICE_NAME").is_some())
+    {
+        return true;
+    }
 
     false
+}
+
+/// Cache for systemd availability detection (checked once, used forever)
+static SYSTEMD_AVAILABLE: OnceLock<bool> = OnceLock::new();
+
+/// Detect if systemd is the init system on this machine
+///
+/// Uses the official detection method from systemd documentation:
+/// checks if /run/systemd/system directory exists.
+///
+/// This is cached globally because systemd availability never changes at runtime.
+/// First call: ~0.01ms (filesystem stat)
+/// Subsequent calls: ~0.000001ms (cached value)
+///
+/// # Returns
+///
+/// - `true` if systemd is the init system (PID 1)
+/// - `false` on non-systemd systems (Alpine/OpenRC, Void/runit, Devuan/sysvinit, etc.)
+///
+/// # References
+///
+/// - [sd_booted(3) man page](https://www.freedesktop.org/software/systemd/man/sd_booted.html)
+/// - Official systemd detection method since systemd v44 (2011)
+///
+/// # Examples
+///
+/// ```rust
+/// use kodegend::platform;
+///
+/// if platform::is_systemd_available() {
+///     // Use systemctl commands, create .service files
+///     install_systemd_unit()?;
+/// } else {
+///     // Fallback to traditional daemon mode or show error
+///     eprintln!("systemd not detected - manual daemon management required");
+/// }
+/// ```
+pub fn is_systemd_available() -> bool {
+    *SYSTEMD_AVAILABLE.get_or_init(|| {
+        std::path::Path::new("/run/systemd/system").exists()
+    })
 }
 
 /// Get current process PID
@@ -145,21 +194,135 @@ pub fn platform_current_process_id() -> i32 {
     getpid().as_raw()
 }
 
-/// Check if process is running using POSIX kill() with signal 0
+/// Check if process exists and is NOT a zombie
 ///
-/// Preserves exact logic from daemon.rs:83-108
+/// Uses platform-specific methods to verify process is alive and operational:
+/// - Linux: Reads /proc/PID/stat to check process state
+/// - macOS: Uses `ps -p PID -o state=` to check state
+/// - Other Unix: Fallback to `ps` command parsing
 ///
 /// Returns:
-/// - Ok(true): Process exists (kill succeeded or EPERM)
-/// - Ok(false): Process doesn't exist (ESRCH)
-/// - Err: System error
+/// - Ok(true): Process exists and is running (not zombie)
+/// - Ok(false): Process doesn't exist or is zombie
+/// - Err: System error (permission denied, etc.)
 pub fn platform_is_process_running(pid: i32) -> Result<bool, std::io::Error> {
+    // Quick existence check using kill(pid, 0)
     match kill(Pid::from_raw(pid), None) {
-        Ok(_) => Ok(true),  // Process exists and we can signal it
-        Err(nix::errno::Errno::ESRCH) => Ok(false),  // No such process
-        Err(nix::errno::Errno::EPERM) => Ok(true),   // Process exists but permission denied
-        Err(e) => Err(std::io::Error::from_raw_os_error(e as i32)),
+        Err(nix::errno::Errno::ESRCH) => {
+            // Process definitely doesn't exist
+            return Ok(false);
+        }
+        Err(e) => {
+            // System error (permission denied, invalid argument, etc.)
+            return Err(std::io::Error::from_raw_os_error(e as i32));
+        }
+        Ok(_) => {
+            // Process exists - now check if it's a zombie
+            // Fall through to platform-specific checks
+        }
     }
+
+    // Platform-specific zombie detection
+    #[cfg(target_os = "linux")]
+    {
+        is_process_alive_linux(pid)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        is_process_alive_ps(pid)
+    }
+}
+
+/// Linux-specific: Check /proc/PID/stat for zombie state
+///
+/// The /proc/PID/stat format (from proc(5) man page):
+/// ```
+/// pid (comm) state ppid pgrp session tty_nr tpgid flags ...
+/// ```
+/// The 3rd field is the process state:
+/// - R: Running
+/// - S: Sleeping
+/// - D: Disk sleep (uninterruptible)
+/// - Z: Zombie ❌
+/// - T: Stopped
+/// - t: Tracing stop
+/// - X: Dead
+///
+/// See: https://man7.org/linux/man-pages/man5/proc_pid_stat.5.html
+#[cfg(target_os = "linux")]
+fn is_process_alive_linux(pid: i32) -> Result<bool, std::io::Error> {
+    let stat_path = format!("/proc/{}/stat", pid);
+    
+    // Read /proc/PID/stat file
+    let stat_content = match fs::read_to_string(&stat_path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Process disappeared between kill(0) and stat read
+            return Ok(false);
+        }
+        Err(e) => {
+            // Permission denied or other I/O error
+            return Err(e);
+        }
+    };
+    
+    // Parse the state field (third whitespace-separated field)
+    // We need to handle process names with spaces, which are enclosed in parentheses
+    // Example: "1234 (my process) S ..."
+    
+    // Find the last ')' which closes the process name
+    let close_paren = stat_content.rfind(')').ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Invalid /proc/{}/stat format: no closing paren", pid)
+        )
+    })?;
+    
+    // State is the first character after ") "
+    let state_char = stat_content[close_paren + 2..]
+        .chars()
+        .next()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Invalid /proc/{}/stat format: no state field", pid)
+            )
+        })?;
+    
+    // Return false for zombie processes, true otherwise
+    Ok(state_char != 'Z')
+}
+
+/// macOS/BSD/other Unix: Use `ps` command to check state
+///
+/// The `ps -p PID -o state=` command outputs the process state code.
+/// On macOS/BSD, zombie processes show as 'Z' in the state field.
+///
+/// This is less efficient than Linux's /proc but works across all Unix variants.
+/// The command runs in ~2-5ms which is acceptable for non-hot-path status checks.
+///
+/// See: BSD ps(1) man page
+#[cfg(not(target_os = "linux"))]
+fn is_process_alive_ps(pid: i32) -> Result<bool, std::io::Error> {
+    // Run: ps -p PID -o state=
+    // This outputs only the state code without headers
+    let output = Command::new("ps")
+        .args(&["-p", &pid.to_string(), "-o", "state="])
+        .output()?;
+    
+    if !output.status.success() {
+        // ps command failed - process likely doesn't exist
+        return Ok(false);
+    }
+    
+    // Parse state output (should be a single character or short code)
+    let state = String::from_utf8_lossy(&output.stdout);
+    let state = state.trim();
+    
+    // Check if state contains 'Z' (zombie)
+    // On some systems it's just "Z", on others "Z+", "Zs", etc.
+    Ok(!state.contains('Z'))
 }
 
 /// System configuration directory: /etc/kodegend
@@ -182,7 +345,7 @@ pub fn platform_user_config_dir() -> PathBuf {
 /// User: $XDG_RUNTIME_DIR/kodegend or /tmp/kodegend-{uid}/kodegend (securely created)
 ///
 /// # Security
-/// 
+///
 /// When falling back to /tmp, this function ensures both the base directory
 /// and subdirectory are created securely to prevent CWE-59 symlink attacks.
 pub fn platform_runtime_dir(is_elevated: bool) -> PathBuf {
@@ -193,17 +356,17 @@ pub fn platform_runtime_dir(is_elevated: bool) -> PathBuf {
         if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR") {
             return PathBuf::from(xdg_runtime).join("kodegend");
         }
-        
+
         // Try dirs::runtime_dir() (platform-specific secure runtime directory)
         if let Some(runtime) = dirs::runtime_dir() {
             return runtime.join("kodegend");
         }
-        
+
         // Fallback: /tmp/kodegend-{uid}/kodegend with security validation
         let current_uid = geteuid();
         let base_dir = PathBuf::from(format!("/tmp/kodegend-{}", current_uid));
         let runtime_dir = base_dir.join("kodegend");
-        
+
         // Securely create both base and subdirectory
         // This prevents symlink attacks at ANY level of the path
         if let Err(e) = ensure_secure_directory(&base_dir, current_uid) {
@@ -220,7 +383,7 @@ pub fn platform_runtime_dir(is_elevated: bool) -> PathBuf {
                 e
             );
         }
-        
+
         if let Err(e) = ensure_secure_directory(&runtime_dir, current_uid) {
             log::error!(
                 "Failed to create secure runtime subdirectory: {}\n\
@@ -235,8 +398,11 @@ pub fn platform_runtime_dir(is_elevated: bool) -> PathBuf {
                 e
             );
         }
-        
-        log::info!("Using secure fallback runtime directory: {}", runtime_dir.display());
+
+        log::info!(
+            "Using secure fallback runtime directory: {}",
+            runtime_dir.display()
+        );
         runtime_dir
     }
 }
@@ -252,5 +418,232 @@ pub fn platform_log_dir(is_elevated: bool) -> PathBuf {
         // Use kodegen-config's log_dir for consistency
         kodegen_config::KodegenConfig::log_dir()
             .unwrap_or_else(|_| PathBuf::from("/tmp/kodegend/logs"))
+    }
+}
+
+/// Status socket path for daemon queries
+///
+/// Elevated: /var/run/kodegend/status.sock
+/// User: $XDG_RUNTIME_DIR/kodegend/status.sock or /tmp/kodegend-{uid}/kodegend/status.sock
+///
+/// Uses same base directory as runtime_dir for consistency
+pub fn platform_status_socket_path(is_elevated: bool) -> PathBuf {
+    platform_runtime_dir(is_elevated).join("status.sock")
+}
+
+/// Platform-specific PID validation for Unix systems
+///
+/// Validates that a PID is within the safe range for this platform.
+/// This prevents dangerous operations like signaling init (PID 1), the kernel
+/// (PID 0), or using process group semantics (negative PIDs).
+///
+/// # Validation Rules
+/// 1. PID must be positive (> 0)
+/// 2. PID must not exceed platform-specific maximum:
+///    - Linux: Reads /proc/sys/kernel/pid_max at runtime, fallback to 4,194,303
+///    - macOS: Hard limit of 99,999 (PID wrap point)
+///    - FreeBSD: Reads kern.pid_max sysctl, fallback to 99,999
+///    - Other Unix: Conservative limit of 99,999
+///
+/// # Returns
+/// - Ok(()) if PID is valid and safe to use
+/// - Err with detailed error message if invalid
+pub(super) fn platform_validate_pid_range(pid: i32) -> Result<(), anyhow::Error> {
+    // Check 1: PID must be positive
+    if pid <= 0 {
+        bail!(
+            "Invalid PID: {} (PIDs must be positive integers)\n\
+             \n\
+             Special cases:\n\
+             - PID 0: Reserved for kernel scheduler\n\
+             - Negative PIDs: Used for process groups in kill()\n\
+             \n\
+             This likely indicates a corrupted or malicious PID file.",
+            pid
+        );
+    }
+    
+    // Check 2: Platform-specific maximum
+    #[cfg(target_os = "linux")]
+    {
+        // Try to read runtime limit from /proc/sys/kernel/pid_max
+        let max_pid = if let Ok(pid_max_str) = fs::read_to_string("/proc/sys/kernel/pid_max") {
+            if let Ok(max) = pid_max_str.trim().parse::<i32>() {
+                // Note: pid_max is one GREATER than actual max PID
+                max - 1
+            } else {
+                // Fallback to absolute maximum for 64-bit Linux
+                4_194_303
+            }
+        } else {
+            // Fallback to absolute maximum for 64-bit Linux
+            4_194_303
+        };
+        
+        if pid > max_pid {
+            bail!(
+                "Invalid PID: {} exceeds Linux maximum {}\n\
+                 \n\
+                 Linux PID limits:\n\
+                 - Default: 32,767 (2^15 - 1)\n\
+                 - Your system: {} (from /proc/sys/kernel/pid_max)\n\
+                 - Absolute max: 4,194,303 (2^22 - 1 on 64-bit)\n\
+                 \n\
+                 This PID is outside the valid range for this system.",
+                pid,
+                max_pid,
+                max_pid
+            );
+        }
+    }
+    
+    #[cfg(target_os = "macos")]
+    {
+        const MACOS_PID_MAX: i32 = 99_999;
+        
+        if pid > MACOS_PID_MAX {
+            bail!(
+                "Invalid PID: {} exceeds macOS maximum {}\n\
+                 \n\
+                 macOS PIDs wrap at 99,999. This PID is invalid.",
+                pid,
+                MACOS_PID_MAX
+            );
+        }
+    }
+    
+    #[cfg(target_os = "freebsd")]
+    {
+        // Try to read kern.pid_max via sysctl
+        // Fallback to typical maximum if unavailable
+        let max_pid = get_freebsd_pid_max().unwrap_or(99_999);
+        
+        if pid > max_pid {
+            bail!(
+                "Invalid PID: {} exceeds FreeBSD maximum {}\n\
+                 \n\
+                 FreeBSD PID limit: {} (from kern.pid_max sysctl)\n\
+                 Typical maximum: 99,999",
+                pid,
+                max_pid,
+                max_pid
+            );
+        }
+    }
+    
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
+    {
+        // Generic Unix: use conservative maximum
+        const GENERIC_UNIX_MAX: i32 = 99_999;
+        
+        if pid > GENERIC_UNIX_MAX {
+            bail!(
+                "Invalid PID: {} exceeds maximum {} for this platform",
+                pid,
+                GENERIC_UNIX_MAX
+            );
+        }
+    }
+    
+    Ok(())
+}
+
+/// Read FreeBSD kern.pid_max sysctl value
+///
+/// Attempts to read the kern.pid_max sysctl using the sysctl command.
+/// This is a fallback method that works without additional dependencies.
+///
+/// Returns Some(max_pid) if successful, None otherwise.
+#[cfg(target_os = "freebsd")]
+fn get_freebsd_pid_max() -> Option<i32> {
+    let output = Command::new("sysctl")
+        .arg("-n")
+        .arg("kern.pid_max")
+        .output()
+        .ok()?;
+    
+    let pid_max_str = String::from_utf8(output.stdout).ok()?;
+    pid_max_str.trim().parse().ok()
+}
+
+/// Verify PID belongs to kodegend using sysinfo
+///
+/// Uses sysinfo::System to get process info and check executable path.
+/// This is the cross-platform approach that works on Linux, macOS, FreeBSD.
+///
+/// Pattern copied from service/port_cleanup.rs:128-138
+///
+/// # Implementation Details
+/// 1. Quick check: Does PID exist at all? (via kill signal 0)
+/// 2. Use sysinfo to get Process object
+/// 3. Extract executable path via Process::exe()
+/// 4. Verify filename is "kodegend" or starts with "kodegend"
+///
+/// # Race Conditions
+/// A process could exit between the existence check and sysinfo lookup.
+/// This is safe - we return false (process not kodegend), allowing daemon startup.
+///
+/// # Performance
+/// - System::new(): ~0.5ms
+/// - refresh_processes(): ~1-5ms depending on system load
+/// - Total: ~1-5ms per call (acceptable for daemon control operations)
+///
+/// # Security
+/// Prevents CVE-2023-30328 class attacks (CVSS 9.8 CRITICAL)
+pub(super) fn platform_verify_kodegend_running(pid: i32) -> Result<bool, std::io::Error> {
+    // First check if process exists at all (fast path)
+    if !platform_is_process_running(pid)? {
+        return Ok(false);
+    }
+
+    // Use sysinfo to get process details
+    let mut system = System::new();
+    system.refresh_processes(ProcessesToUpdate::All, true);
+
+    let sysinfo_pid = SysinfoPid::from(pid as usize);
+    let process = match system.process(sysinfo_pid) {
+        Some(p) => p,
+        None => {
+            // Race condition: process exited between kill(0) check and sysinfo lookup
+            // This is safe - process is gone, not kodegend
+            log::debug!(
+                "Process {} exited between existence check and verification",
+                pid
+            );
+            return Ok(false);
+        }
+    };
+
+    // Check executable path (most reliable method)
+    match process.exe() {
+        Some(exe_path) => {
+            // Extract filename from path
+            let exe_name = exe_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+            // Verify it's kodegend
+            // Accept both "kodegend" and "kodegend-debug" or similar variants
+            let is_kodegend = exe_name == "kodegend" || exe_name.starts_with("kodegend");
+
+            if is_kodegend {
+                log::debug!(
+                    "Verified PID {} is kodegend (exe: {})",
+                    pid,
+                    exe_path.display()
+                );
+            } else {
+                log::debug!("PID {} is NOT kodegend (exe: {})", pid, exe_path.display());
+            }
+
+            Ok(is_kodegend)
+        }
+        None => {
+            // Cannot read executable path (permission denied or process characteristics)
+            // This could happen with kernel threads or special system processes
+            // Fail-safe: assume it's NOT kodegend
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("Cannot read executable path for PID {}", pid),
+            ))
+        }
     }
 }

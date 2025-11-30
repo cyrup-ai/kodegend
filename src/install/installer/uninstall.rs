@@ -242,7 +242,7 @@ fn get_installation_directories() -> Vec<PathBuf> {
         },
         #[cfg(target_os = "windows")]
         {
-            use crate::install::installer::windows::paths::{install_dir, InstallScope};
+            use crate::install::installer::windows::paths::{InstallScope, install_dir};
             install_dir(InstallScope::System)
         },
         // Common directories
@@ -313,7 +313,7 @@ fn add_kodegen_host_entries() -> Result<()> {
 fn get_installed_daemon_path() -> PathBuf {
     #[cfg(target_os = "windows")]
     {
-        use crate::install::installer::windows::paths::{kodegend_exe, InstallScope};
+        use crate::install::installer::windows::paths::{InstallScope, kodegend_exe};
         // Windows installs to Program Files or System32
         kodegend_exe(InstallScope::System)
     }

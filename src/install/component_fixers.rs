@@ -123,7 +123,10 @@ pub async fn fix_certificates(executor: &mut PrivilegedExecutor) -> ComponentFix
         }
     }
 
-    log::info!("Certificate generated and written to {}", cert_path.display());
+    log::info!(
+        "Certificate generated and written to {}",
+        cert_path.display()
+    );
     ComponentFixResult {
         component: "certificates",
         success: true,
@@ -133,6 +136,21 @@ pub async fn fix_certificates(executor: &mut PrivilegedExecutor) -> ComponentFix
 }
 
 /// Generate certificate content in memory without writing to disk
+///
+/// Creates a 2-year self-signed certificate for mcp.kodegen.ai.
+/// Auto-renewed by daemon startup checks when <1 year validity remains.
+///
+/// # Certificate Lifecycle
+///
+/// - Validity: 2 years (730 days)
+/// - Renewal threshold: 1 year (50% of validity)
+/// - Renewal mechanism: Automatic on daemon startup via `ensure_installed()`
+///
+/// # References
+///
+/// - NIST SP 800-57 Part 1 Rev. 5: Key Management Guidelines
+/// - CA/Browser Forum Baseline Requirements
+/// - Microsoft PKI Best Practices
 fn generate_certificate_content_only() -> Result<String> {
     use rcgen::string::Ia5String;
     use rcgen::{CertificateParams, DistinguishedName, DnType, SanType};
@@ -153,11 +171,12 @@ fn generate_certificate_content_only() -> Result<String> {
     dn.push(DnType::CommonName, "mcp.kodegen.ai");
     params.distinguished_name = dn;
 
-    // Set non-expiring validity period (100 years)
+    // Set 2-year validity period with automatic renewal
+    // Follows industry best practice: renew at 50% of validity (1 year)
     use time::OffsetDateTime;
     let now = OffsetDateTime::now_utc();
     params.not_before = now;
-    params.not_after = now + time::Duration::seconds(100 * 365 * 24 * 60 * 60);
+    params.not_after = now + time::Duration::days(730);  // 2 years (730 days)
 
     let key_pair = rcgen::KeyPair::generate()?;
     let cert = params.self_signed(&key_pair)?;
@@ -210,7 +229,7 @@ pub async fn fix_kodegen_version(executor: &mut PrivilegedExecutor) -> Component
     });
 
     let binary_paths = match download::download_all_binaries(tx).await {
-        Ok(paths) => paths,
+        Ok((paths, _download_dir)) => paths,
         Err(e) => {
             return ComponentFixResult {
                 component: "kodegen_version",
@@ -256,7 +275,11 @@ pub async fn fix_kodegen_version(executor: &mut PrivilegedExecutor) -> Component
     }
 
     // Copy each staged binary
-    for entry in std::fs::read_dir(&staging_dir).into_iter().flatten().flatten() {
+    for entry in std::fs::read_dir(&staging_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
         let src = entry.path();
         let filename = src.file_name().unwrap();
         let dst = PathBuf::from("/usr/local/bin").join(filename);
@@ -358,10 +381,7 @@ pub async fn fix_all_components() -> Result<super::detection::InstallationFixRep
 
     // Fix certificates if needed (FAIL-FAST)
     if status.certificates != ComponentStatus::Ok {
-        log::info!(
-            "Fixing certificates (status: {:?})...",
-            status.certificates
-        );
+        log::info!("Fixing certificates (status: {:?})...", status.certificates);
         let result = if let Some(ref mut exec) = executor {
             fix_certificates(exec).await
         } else {

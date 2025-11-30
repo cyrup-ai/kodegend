@@ -1,0 +1,69 @@
+# kodegend.service - KODEGEN Daemon Service Manager
+#
+# Installation:
+#   sudo cp kodegend.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable kodegend
+#   sudo systemctl start kodegend
+#
+# Documentation:
+#   https://www.freedesktop.org/software/systemd/man/systemd.service.html
+
+[Unit]
+Description=KODEGEN.ᴀɪ Daemon Service Manager
+Documentation=https://kodegen.ai/docs/kodegend
+After=network.target
+Wants=network-online.target
+
+[Service]
+# Service type - wait for READY=1 notification
+Type=notify
+
+# Security: Only main process can send notifications
+# Prevents child processes from spoofing readiness
+NotifyAccess=main
+
+# Process execution
+ExecStart=/usr/local/bin/kodegend --system
+ExecStop=/usr/local/bin/kodegend --stop
+
+# Runtime directory for PID file and sockets
+RuntimeDirectory=kodegend
+RuntimeDirectoryMode=0755
+
+# PID file location (created by kodegend itself)
+PIDFile=/var/run/kodegend/kodegend.pid
+
+# Startup timeout - fail if no READY=1 within 60 seconds
+# Increase if service has many workers or slow startup
+TimeoutStartSec=60s
+
+# Shutdown timeout - allow graceful cleanup
+TimeoutStopSec=30s
+
+# Restart policy - restart on failure but not on clean exit
+Restart=on-failure
+RestartSec=5s
+
+# Watchdog configuration - kodegend sends WATCHDOG=1 every 15s
+# If no watchdog received within 30s, systemd restarts service
+WatchdogSec=30s
+
+# Security hardening
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/kodegend /var/run/kodegend
+NoNewPrivileges=true
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=512
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=kodegend
+
+[Install]
+WantedBy=multi-user.target

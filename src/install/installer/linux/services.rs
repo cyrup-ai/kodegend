@@ -14,9 +14,8 @@ pub(super) fn install_services(
     services: &[crate::config::ServiceDefinition],
 ) -> Result<(), InstallerError> {
     for service in services {
-        let service_toml = toml::to_string_pretty(service).map_err(|e| {
-            InstallerError::System(format!("Failed to serialize service: {}", e))
-        })?;
+        let service_toml = toml::to_string_pretty(service)
+            .map_err(|e| InstallerError::System(format!("Failed to serialize service: {}", e)))?;
 
         // Create services directory
         let services_dir = PathBuf::from("/etc/kodegen/services");
@@ -34,10 +33,7 @@ pub(super) fn install_services(
             use std::os::unix::fs::PermissionsExt;
             let mut perms = fs::metadata(&service_file)
                 .map_err(|e| {
-                    InstallerError::System(format!(
-                        "Failed to get service file metadata: {}",
-                        e
-                    ))
+                    InstallerError::System(format!("Failed to get service file metadata: {}", e))
                 })?
                 .permissions();
             perms.set_mode(0o644);

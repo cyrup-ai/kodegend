@@ -3,10 +3,10 @@
 /// Download phase tracking for individual binary downloads
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DownloadPhase {
-    Discovering,  // Fetching latest release from GitHub API
-    Downloading,  // Downloading package bytes
-    Extracting,   // Extracting binary from package
-    Complete,     // Binary extracted and ready
+    Discovering, // Fetching latest release from GitHub API
+    Downloading, // Downloading package bytes
+    Extracting,  // Extracting binary from package
+    Complete,    // Binary extracted and ready
 }
 
 /// Metadata for tracking individual binary downloads

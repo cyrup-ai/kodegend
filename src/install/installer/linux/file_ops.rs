@@ -14,9 +14,8 @@ pub(super) fn write_file_atomic(path: &Path, content: &str) -> Result<(), Instal
     let temp_path = path.with_extension("tmp");
 
     {
-        let mut file = fs::File::create(&temp_path).map_err(|e| {
-            InstallerError::System(format!("Failed to create temp file: {}", e))
-        })?;
+        let mut file = fs::File::create(&temp_path)
+            .map_err(|e| InstallerError::System(format!("Failed to create temp file: {}", e)))?;
 
         file.write_all(content.as_bytes())
             .map_err(|e| InstallerError::System(format!("Failed to write temp file: {}", e)))?;

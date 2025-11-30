@@ -17,23 +17,20 @@ use x509_parser;
 use super::super::core::InstallContext;
 
 #[cfg(windows)]
-use windows::Win32::Security::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW,
-    SECURITY_DESCRIPTOR,
-};
-#[cfg(windows)]
 use windows::Win32::Foundation::LocalFree;
 #[cfg(windows)]
+use windows::Win32::Security::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, SECURITY_DESCRIPTOR,
+};
+#[cfg(windows)]
 use windows::Win32::Storage::FileSystem::{
-    SetFileAttributesW, 
-    FILE_ATTRIBUTE_HIDDEN,
-    FILE_FLAGS_AND_ATTRIBUTES,
+    FILE_ATTRIBUTE_HIDDEN, FILE_FLAGS_AND_ATTRIBUTES, SetFileAttributesW,
 };
 #[cfg(windows)]
 use windows::core::PCWSTR;
 
 /// Set Windows ACL permissions on certificate file
-/// 
+///
 /// Security policy: Owner read/write only (equivalent to Unix 0o600)
 /// - SYSTEM: Full Control (allows Windows services to function)
 /// - Administrators: Full Control (allows admin maintenance)
@@ -43,13 +40,13 @@ use windows::core::PCWSTR;
 /// Uses SDDL (Security Descriptor Definition Language) for clarity and maintainability.
 #[cfg(windows)]
 fn set_windows_certificate_permissions(path: &Path) -> Result<()> {
+    use windows::Win32::Foundation::{HLOCAL, LocalFree};
     use windows::Win32::Security::{
-        ConvertStringSecurityDescriptorToSecurityDescriptorW,
-        PSECURITY_DESCRIPTOR, SECURITY_DESCRIPTOR_REVISION,
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, PSECURITY_DESCRIPTOR,
+        SECURITY_DESCRIPTOR_REVISION,
     };
-    use windows::Win32::Foundation::{LocalFree, HLOCAL};
     use windows::core::PCWSTR;
-    
+
     // SDDL string breakdown:
     // D:           - DACL (Discretionary Access Control List)
     // P            - Protected (don't inherit from parent)
@@ -61,14 +58,14 @@ fn set_windows_certificate_permissions(path: &Path) -> Result<()> {
     // This matches Unix 0o600: owner can read/write, nobody else
     // SYSTEM and Administrators are Windows equivalents of root
     let sddl = "D:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFW;;;OW)";
-    
+
     // Convert to UTF-16 (Windows native string format)
     let sddl_wide = super::super::windows::utils::to_wide_string(sddl);
-    
+
     // Convert SDDL string to security descriptor
     let mut sd_ptr: PSECURITY_DESCRIPTOR = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
     let mut sd_size: u32 = 0;
-    
+
     unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
             PCWSTR(sddl_wide.as_ptr()),
@@ -78,39 +75,38 @@ fn set_windows_certificate_permissions(path: &Path) -> Result<()> {
         )
         .context("Failed to convert SDDL string to security descriptor")?;
     }
-    
+
     // Ensure we free the allocated security descriptor
     let _guard = scopeguard::guard(sd_ptr, |sd| {
         if !sd.0.is_null() {
             unsafe { LocalFree(HLOCAL(sd.0 as _)) };
         }
     });
-    
+
     // Apply security descriptor to file
     let path_wide = super::super::windows::utils::to_wide_string(
         path.to_str()
             .ok_or_else(|| anyhow::anyhow!("Invalid path: non-UTF8 characters"))?,
     );
-    
+
     use windows::Win32::Security::Authorization::SetNamedSecurityInfoW;
     use windows::Win32::Security::{
-        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
-        SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, SE_FILE_OBJECT,
     };
-    
+
     unsafe {
         SetNamedSecurityInfoW(
             PCWSTR(path_wide.as_ptr()),
             SE_FILE_OBJECT,
             DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            None,  // Don't change owner
-            None,  // Don't change group
-            Some(std::mem::transmute(sd_ptr)),  // Set DACL from security descriptor
-            None,  // Don't change SACL
+            None,                              // Don't change owner
+            None,                              // Don't change group
+            Some(std::mem::transmute(sd_ptr)), // Set DACL from security descriptor
+            None,                              // Don't change SACL
         )
         .context("Failed to apply ACL to certificate file")?;
     }
-    
+
     // Defense-in-depth: Mark file as hidden
     // This makes it less likely to be accidentally accessed
     let attributes = FILE_FLAGS_AND_ATTRIBUTES(FILE_ATTRIBUTE_HIDDEN.0);
@@ -118,8 +114,11 @@ fn set_windows_certificate_permissions(path: &Path) -> Result<()> {
         SetFileAttributesW(PCWSTR(path_wide.as_ptr()), attributes)
             .context("Failed to set hidden attribute on certificate file")?;
     }
-    
-    info!("Applied Windows ACL permissions to certificate file: {:?}", path);
+
+    info!(
+        "Applied Windows ACL permissions to certificate file: {:?}",
+        path
+    );
     Ok(())
 }
 
@@ -129,6 +128,17 @@ fn set_windows_certificate_permissions(path: &Path) -> Result<()> {
 /// - mcp.kodegen.ai
 /// - *.kodegen.dev
 /// - Other Kodegen domains
+///
+/// # Certificate Validity
+///
+/// Certificates are valid for **2 years (730 days)** from generation.
+/// The daemon automatically checks certificate validity on startup and regenerates
+/// certificates when less than 1 year (50% of validity period) remains.
+///
+/// This approach follows industry best practices:
+/// - NIST SP 800-57: Renew at 50% of cryptoperiod
+/// - Microsoft PKI Guidance: Regular automated renewal
+/// - CA/Browser Forum: Trend toward shorter validity periods
 ///
 /// Certificate import to system trust store is deferred to install_with_elevated_privileges()
 /// in main.rs, which executes privileged operations at the end of installation.
@@ -152,11 +162,11 @@ pub async fn generate_wildcard_certificate_only() -> Result<String> {
         let existing_content = tokio::fs::read_to_string(&wildcard_cert_path)
             .await
             .context("Failed to read existing certificate")?;
-        
+
         // Validate the content
         if let Ok(()) = validate_cert_content(&existing_content) {
             info!("Valid wildcard certificate already exists");
-            return Ok(existing_content);  // Return validated content
+            return Ok(existing_content); // Return validated content
         }
         info!("Existing wildcard certificate is invalid, regenerating");
     }
@@ -185,11 +195,12 @@ pub async fn generate_wildcard_certificate_only() -> Result<String> {
     dn.push(DnType::CommonName, "mcp.kodegen.ai");
     params.distinguished_name = dn;
 
-    // Set non-expiring validity period (100 years)
+    // Set 2-year validity period with automatic renewal
+    // Follows industry best practice: renew at 50% of validity (1 year)
     use time::OffsetDateTime;
     let now = OffsetDateTime::now_utc();
     params.not_before = now;
-    params.not_after = now + time::Duration::seconds(100 * 365 * 24 * 60 * 60);
+    params.not_after = now + time::Duration::days(730);  // 2 years (730 days)
 
     // Generate self-signed certificate with key pair
     let key_pair = rcgen::KeyPair::generate()?;
@@ -226,8 +237,27 @@ pub async fn generate_wildcard_certificate_only() -> Result<String> {
             .context("Failed to set Windows ACL permissions on certificate")?;
     }
 
+    // Log certificate lifecycle information
+    let validity_days = (params.not_after - params.not_before).whole_days();
+    let expiry_date = params.not_after
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "unknown".to_string());
+    let renewal_date = (params.not_before + time::Duration::days(365))
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "unknown".to_string());
+
     info!(
-        "Kodegen certificate generated successfully at {}",
+        "Generated self-signed certificate for mcp.kodegen.ai\n  \
+         Valid from: {}\n  \
+         Valid until: {}\n  \
+         Validity period: {} days ({} years)\n  \
+         Auto-renewal at: {} (50% of validity period)\n  \
+         Certificate path: {}",
+        params.not_before,
+        expiry_date,
+        validity_days,
+        validity_days / 365,
+        renewal_date,
         wildcard_cert_path.display()
     );
 
@@ -242,11 +272,11 @@ pub async fn generate_wildcard_certificate_only() -> Result<String> {
 pub async fn generate_and_import_wildcard_certificate() -> Result<()> {
     // First generate the certificate
     generate_wildcard_certificate_only().await?;
-    
+
     // Then import it (requires root)
     let cert_path = get_cert_dir().join("wildcard.pem");
     import_certificate_to_system(&cert_path).await?;
-    
+
     Ok(())
 }
 
@@ -270,7 +300,7 @@ pub async fn import_certificate_to_system(cert_path: &Path) -> Result<()> {
 #[cfg(target_os = "macos")]
 async fn import_certificate_macos(cert_path: &Path) -> Result<()> {
     use security_framework::certificate::SecCertificate;
-    use security_framework::trust_settings::{TrustSettings, Domain};
+    use security_framework::trust_settings::{Domain, TrustSettings};
 
     info!("Importing certificate to macOS keychain via Security.framework...");
 
@@ -287,11 +317,14 @@ async fn import_certificate_macos(cert_path: &Path) -> Result<()> {
     };
 
     // Parse PEM to DER format (reusing existing pem crate)
-    let cert_pem_parsed = pem::parse(cert_only)
-        .context("Failed to parse certificate PEM format")?;
+    let cert_pem_parsed =
+        pem::parse(cert_only).context("Failed to parse certificate PEM format")?;
 
     if cert_pem_parsed.tag() != "CERTIFICATE" {
-        return Err(anyhow::anyhow!("Invalid PEM tag: expected CERTIFICATE, got {}", cert_pem_parsed.tag()));
+        return Err(anyhow::anyhow!(
+            "Invalid PEM tag: expected CERTIFICATE, got {}",
+            cert_pem_parsed.tag()
+        ));
     }
 
     let cert_der = cert_pem_parsed.contents();
@@ -312,7 +345,9 @@ async fn import_certificate_macos(cert_path: &Path) -> Result<()> {
         // When trust_settings parameter is null, it means "always trust"
         trust_settings
             .set_trust_settings_always(&certificate)
-            .map_err(|e| anyhow::anyhow!("Failed to set trust settings: {} (code: {})", e, e.code()))?;
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to set trust settings: {} (code: {})", e, e.code())
+            })?;
 
         info!("✓ Certificate imported to macOS Admin trust domain (accessible system-wide)");
         Ok(())
@@ -343,8 +378,8 @@ async fn import_certificate_linux(cert_path: &Path) -> Result<()> {
     };
 
     // Validate PEM format before copying to system directory (using existing pem crate)
-    let cert_pem_parsed = pem::parse(cert_only)
-        .context("Failed to parse certificate PEM - file may be corrupted")?;
+    let cert_pem_parsed =
+        pem::parse(cert_only).context("Failed to parse certificate PEM - file may be corrupted")?;
 
     if cert_pem_parsed.tag() != "CERTIFICATE" {
         return Err(anyhow::anyhow!(
@@ -354,13 +389,17 @@ async fn import_certificate_linux(cert_path: &Path) -> Result<()> {
     }
 
     // Validate X.509 structure (using existing x509-parser crate)
-    let (_remainder, x509_cert) = x509_parser::parse_x509_certificate(cert_pem_parsed.contents())
-        .map_err(|e| anyhow::anyhow!("Invalid X.509 certificate structure: {}", e))?;
+    let (_remainder, x509_cert) =
+        x509_parser::parse_x509_certificate(cert_pem_parsed.contents())
+            .map_err(|e| anyhow::anyhow!("Invalid X.509 certificate structure: {}", e))?;
 
     // Log certificate details for troubleshooting
     info!("Certificate subject: {}", x509_cert.subject());
     info!("Certificate issuer: {}", x509_cert.issuer());
-    info!("Certificate valid until: {:?}", x509_cert.validity().not_after);
+    info!(
+        "Certificate valid until: {:?}",
+        x509_cert.validity().not_after
+    );
 
     // Determine the correct CA update command for this distribution
     let (ca_dir, ca_update_cmd, ca_update_args) = detect_linux_ca_tool().await?;
@@ -431,17 +470,18 @@ async fn detect_linux_ca_tool() -> Result<(PathBuf, &'static str, Vec<&'static s
         return Ok((
             PathBuf::from("/usr/local/share/ca-certificates"),
             "update-ca-certificates",
-            vec![]  // No additional args
+            vec![], // No additional args
         ));
     }
 
     // RHEL/Fedora/CentOS: /etc/pki/ca-trust/source/anchors + update-ca-trust
     if tokio::fs::metadata("/etc/redhat-release").await.is_ok()
-        || tokio::fs::metadata("/etc/fedora-release").await.is_ok() {
+        || tokio::fs::metadata("/etc/fedora-release").await.is_ok()
+    {
         return Ok((
             PathBuf::from("/etc/pki/ca-trust/source/anchors"),
             "update-ca-trust",
-            vec![]  // No additional args
+            vec![], // No additional args
         ));
     }
 
@@ -450,7 +490,7 @@ async fn detect_linux_ca_tool() -> Result<(PathBuf, &'static str, Vec<&'static s
         return Ok((
             PathBuf::from("/etc/ca-certificates/trust-source/anchors"),
             "trust",
-            vec!["extract-compat"]  // Arch requires this argument
+            vec!["extract-compat"], // Arch requires this argument
         ));
     }
 
@@ -459,7 +499,7 @@ async fn detect_linux_ca_tool() -> Result<(PathBuf, &'static str, Vec<&'static s
     Ok((
         PathBuf::from("/usr/local/share/ca-certificates"),
         "update-ca-certificates",
-        vec![]
+        vec![],
     ))
 }
 
@@ -467,12 +507,11 @@ async fn detect_linux_ca_tool() -> Result<(PathBuf, &'static str, Vec<&'static s
 #[cfg(target_os = "windows")]
 async fn import_certificate_windows(cert_path: &Path) -> Result<()> {
     use windows::Win32::Security::Cryptography::{
-        CertOpenStore, CertAddEncodedCertificateToStore, CertCloseStore,
-        CERT_STORE_ADD_REPLACE_EXISTING, CERT_STORE_PROV_SYSTEM_W,
-        CERT_SYSTEM_STORE_LOCAL_MACHINE, X509_ASN_ENCODING, PKCS_7_ASN_ENCODING,
-        HCERTSTORE,
+        CERT_STORE_ADD_REPLACE_EXISTING, CERT_STORE_PROV_SYSTEM_W, CERT_SYSTEM_STORE_LOCAL_MACHINE,
+        CertAddEncodedCertificateToStore, CertCloseStore, CertOpenStore, HCERTSTORE,
+        PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
     };
-    use windows::core::{PCWSTR, HSTRING};
+    use windows::core::{HSTRING, PCWSTR};
 
     info!("Importing certificate to Windows Root certificate store via CryptoAPI...");
 
@@ -489,8 +528,8 @@ async fn import_certificate_windows(cert_path: &Path) -> Result<()> {
     };
 
     // Parse PEM and validate structure (using existing pem crate)
-    let cert_pem_parsed = pem::parse(cert_only)
-        .context("Failed to parse certificate PEM format")?;
+    let cert_pem_parsed =
+        pem::parse(cert_only).context("Failed to parse certificate PEM format")?;
 
     if cert_pem_parsed.tag() != "CERTIFICATE" {
         return Err(anyhow::anyhow!(
@@ -567,7 +606,7 @@ fn get_cert_dir() -> PathBuf {
 }
 
 /// Validate existing wildcard certificate with fast validation
-/// 
+///
 /// Called internally by validate_cert_content() during certificate generation.
 /// Checks X.509 structure, expiration dates, and SAN entries.
 #[allow(dead_code)]
@@ -603,21 +642,25 @@ fn validate_cert_content(cert_pem: &str) -> Result<()> {
         return Err(anyhow::anyhow!("Certificate has expired"));
     }
 
-    // Check if certificate expires within 30 days
-    if now + (30 * 24 * 60 * 60) > not_after {
-        warn!("Certificate expires within 30 days, consider regenerating");
+    // Auto-renewal threshold: 50% of validity period (industry best practice)
+    const ONE_YEAR_SECONDS: u64 = 365 * 24 * 60 * 60;
+    if now + ONE_YEAR_SECONDS > not_after {
+        let days_remaining = (not_after - now) / (24 * 60 * 60);
+        warn!(
+            "Certificate expires within 1 year ({} days remaining), triggering auto-renewal",
+            days_remaining
+        );
+        // Return error to trigger regeneration
+        return Err(anyhow::anyhow!(
+            "Certificate approaching expiration, auto-renewal required"
+        ));
     }
 
     // Validate required SANs are present
-    let required_sans = vec![
-        "mcp.kodegen.ai",
-        "localhost",
-        "127.0.0.1",
-        "::1",
-    ];
-    
+    let required_sans = vec!["mcp.kodegen.ai", "localhost", "127.0.0.1", "::1"];
+
     let actual_sans = extract_sans_from_cert(&cert)?;
-    
+
     // Check each required SAN is present
     for required_san in &required_sans {
         if !actual_sans.iter().any(|san| san == required_san) {
@@ -627,14 +670,15 @@ fn validate_cert_content(cert_pem: &str) -> Result<()> {
             ));
         }
     }
-    
+
     // Also validate Common Name matches
-    let cn = cert.subject()
+    let cn = cert
+        .subject()
         .iter_common_name()
         .next()
         .and_then(|cn| cn.as_str().ok())
         .unwrap_or("");
-    
+
     if cn != "mcp.kodegen.ai" {
         warn!(
             "Certificate has Common Name '{}' (expected 'mcp.kodegen.ai'), but SANs are correct",
@@ -642,15 +686,23 @@ fn validate_cert_content(cert_pem: &str) -> Result<()> {
         );
     }
 
+    // Log validation success with expiry information
+    let days_until_expiry = (not_after - now) / (24 * 60 * 60);
+    info!(
+        "Certificate validation successful. Expires in {} days ({} years)",
+        days_until_expiry,
+        days_until_expiry / 365
+    );
+
     Ok(())
 }
 
 /// Extract Subject Alternative Names from X.509 certificate
 fn extract_sans_from_cert(cert: &x509_parser::certificate::X509Certificate) -> Result<Vec<String>> {
     use x509_parser::extensions::GeneralName;
-    
+
     let mut sans = Vec::new();
-    
+
     // Get SAN extension (returns Option)
     if let Some(san_ext) = cert.subject_alternative_name()? {
         // san_ext.value is &SubjectAlternativeName which has general_names field
@@ -664,15 +716,30 @@ fn extract_sans_from_cert(cert: &x509_parser::certificate::X509Certificate) -> R
                     let ip_str = match ip_bytes.len() {
                         4 => {
                             // IPv4
-                            format!("{}.{}.{}.{}", ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3])
+                            format!(
+                                "{}.{}.{}.{}",
+                                ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]
+                            )
                         }
                         16 => {
                             // IPv6 - format as compressed notation
                             let ip = std::net::Ipv6Addr::from([
-                                ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3],
-                                ip_bytes[4], ip_bytes[5], ip_bytes[6], ip_bytes[7],
-                                ip_bytes[8], ip_bytes[9], ip_bytes[10], ip_bytes[11],
-                                ip_bytes[12], ip_bytes[13], ip_bytes[14], ip_bytes[15],
+                                ip_bytes[0],
+                                ip_bytes[1],
+                                ip_bytes[2],
+                                ip_bytes[3],
+                                ip_bytes[4],
+                                ip_bytes[5],
+                                ip_bytes[6],
+                                ip_bytes[7],
+                                ip_bytes[8],
+                                ip_bytes[9],
+                                ip_bytes[10],
+                                ip_bytes[11],
+                                ip_bytes[12],
+                                ip_bytes[13],
+                                ip_bytes[14],
+                                ip_bytes[15],
                             ]);
                             ip.to_string()
                         }
@@ -684,6 +751,6 @@ fn extract_sans_from_cert(cert: &x509_parser::certificate::X509Certificate) -> R
             }
         }
     }
-    
+
     Ok(sans)
 }

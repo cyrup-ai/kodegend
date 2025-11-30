@@ -178,7 +178,7 @@ fn validate_c_compiler() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("Build: C compiler installed successfully");
                     Ok(())
                 }
-                Err(e) => Err(format!("Failed to install C compiler: {}", e).into())
+                Err(e) => Err(format!("Failed to install C compiler: {}", e).into()),
             }
         }
     }
@@ -194,21 +194,44 @@ fn install_build_dependencies() -> Result<(), Box<dyn std::error::Error>> {
         if Command::new("apt-get").arg("--version").output().is_ok() {
             eprintln!("Build: Installing build dependencies via apt-get...");
             Command::new("sudo").args(&["apt-get", "update"]).status()?;
-            Command::new("sudo").args(&["apt-get", "install", "-y",
-                "build-essential", "gcc-mingw-w64-x86-64", "g++-mingw-w64-x86-64"]).status()?;
+            Command::new("sudo")
+                .args(&[
+                    "apt-get",
+                    "install",
+                    "-y",
+                    "build-essential",
+                    "gcc-mingw-w64-x86-64",
+                    "g++-mingw-w64-x86-64",
+                ])
+                .status()?;
         } else if Command::new("dnf").arg("--version").output().is_ok() {
             eprintln!("Build: Installing build dependencies via dnf...");
-            Command::new("sudo").args(&["dnf", "install", "-y",
-                "gcc", "gcc-c++", "make", "mingw64-gcc", "mingw64-gcc-c++"]).status()?;
+            Command::new("sudo")
+                .args(&[
+                    "dnf",
+                    "install",
+                    "-y",
+                    "gcc",
+                    "gcc-c++",
+                    "make",
+                    "mingw64-gcc",
+                    "mingw64-gcc-c++",
+                ])
+                .status()?;
         } else if Command::new("pacman").arg("--version").output().is_ok() {
             eprintln!("Build: Installing build dependencies via pacman...");
-            Command::new("sudo").args(&["pacman", "-S", "--noconfirm",
-                "base-devel", "mingw-w64-gcc"]).status()?;
+            Command::new("sudo")
+                .args(&["pacman", "-S", "--noconfirm", "base-devel", "mingw-w64-gcc"])
+                .status()?;
         } else if Command::new("apk").arg("--version").output().is_ok() {
             eprintln!("Build: Installing build dependencies via apk...");
-            Command::new("sudo").args(&["apk", "add", "build-base"]).status()?;
+            Command::new("sudo")
+                .args(&["apk", "add", "build-base"])
+                .status()?;
         } else {
-            return Err("No supported package manager found for automatic compiler installation".into());
+            return Err(
+                "No supported package manager found for automatic compiler installation".into(),
+            );
         }
     }
 

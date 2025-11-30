@@ -1,18 +1,18 @@
 //! Platform detection for package format selection
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
+use log::warn;
 use once_cell::sync::OnceCell;
 use std::process::Command;
-use log::warn;
 
 /// Platform detection for package format selection
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Platform {
-    DebianAmd64,      // Ubuntu, Debian (x86_64)
-    RpmX8664,         // RHEL, Fedora, CentOS (x86_64)
-    MacOsArm64,       // macOS Apple Silicon
-    MacOsX8664,       // macOS Intel
-    WindowsX8664,     // Windows (x86_64)
+    DebianAmd64,  // Ubuntu, Debian (x86_64)
+    RpmX8664,     // RHEL, Fedora, CentOS (x86_64)
+    MacOsArm64,   // macOS Apple Silicon
+    MacOsX8664,   // macOS Intel
+    WindowsX8664, // Windows (x86_64)
 }
 
 /// Global cache for platform detection (initialized once, used everywhere)
@@ -21,9 +21,9 @@ static PLATFORM_CACHE: OnceCell<Platform> = OnceCell::new();
 impl Platform {
     /// Detect current platform (cached after first call)
     pub fn detect() -> Result<Self> {
-        PLATFORM_CACHE.get_or_try_init(|| {
-            Self::detect_uncached()
-        }).copied()
+        PLATFORM_CACHE
+            .get_or_try_init(|| Self::detect_uncached())
+            .copied()
     }
 
     /// Internal uncached detection - called only once

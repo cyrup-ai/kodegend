@@ -10,10 +10,10 @@
 //! NOTE: We do NOT check for kodegend binary because kodegend is already
 //! running when this code executes! It's kodegend calling ensure_installed().
 
-use std::path::Path;
 use once_cell::sync::Lazy;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -127,7 +127,7 @@ pub fn check_installation_state() -> InstallationState {
     let service_ok = check_service_configured();
     let certs_ok = check_certificates_present();
     let chromium_ok = check_chromium_installed();
-    
+
     match (binaries_ok, service_ok, certs_ok, chromium_ok) {
         (0, false, false, false) => InstallationState::NotInstalled,
         (1, true, true, true) => InstallationState::FullyInstalled,
@@ -143,17 +143,18 @@ pub fn check_installation_state() -> InstallationState {
 /// NOTE: We do NOT check for kodegend because it's already running!
 fn check_binaries_installed() -> usize {
     use super::binaries::BINARIES;
-    
+
     #[cfg(unix)]
     let bin_dir = Path::new("/usr/local/bin");
-    
+
     #[cfg(windows)]
     let bin_dir = {
-        use crate::install::installer::windows::paths::{install_dir, InstallScope};
+        use crate::install::installer::windows::paths::{InstallScope, install_dir};
         install_dir(InstallScope::System)
     };
-    
-    BINARIES.iter()
+
+    BINARIES
+        .iter()
         .filter(|name| bin_dir.join(name).exists())
         .count()
 }
@@ -169,62 +170,77 @@ fn check_service_configured() -> bool {
     {
         Path::new("/Library/LaunchDaemons/com.kodegen.daemon.plist").exists()
     }
-    
+
     #[cfg(target_os = "linux")]
     {
-        Path::new("/etc/systemd/system/kodegend.service").exists()
+        use crate::platform;
+        
+        // Only check for service file if systemd is the init system
+        if platform::is_systemd_available() {
+            Path::new("/etc/systemd/system/kodegend.service").exists()
+        } else {
+            // Non-systemd systems: check for running process via PID file
+            // (Traditional daemon detection method)
+            let pid_file = crate::platform::runtime_dir(true).join("kodegend.pid");
+            if let Ok(pid_str) = std::fs::read_to_string(&pid_file) {
+                if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                    return crate::platform::is_process_running(pid).unwrap_or(false);
+                }
+            }
+            false
+        }
     }
-    
+
     #[cfg(target_os = "windows")]
     {
         // Check if kodegend service exists in Windows Service Manager
         // Uses minimal permissions for read-only detection
         use windows::Win32::System::Services::{
-            OpenSCManagerW, OpenServiceW, CloseServiceHandle,
-            SC_MANAGER_CONNECT, SERVICE_QUERY_STATUS,
+            CloseServiceHandle, OpenSCManagerW, OpenServiceW, SC_MANAGER_CONNECT,
+            SERVICE_QUERY_STATUS,
         };
         use windows::core::PCWSTR;
-        
+
         // Service name to check
         let service_name = "kodegend";
-        
+
         // Convert to UTF-16 (Windows native string format)
         let wide_name: Vec<u16> = service_name
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
-        
+
         unsafe {
             // Open Service Control Manager with minimal permissions
             let scm = OpenSCManagerW(
-                PCWSTR::null(),           // Local machine
-                PCWSTR::null(),           // Default database
-                SC_MANAGER_CONNECT,       // Minimal read-only access
+                PCWSTR::null(),     // Local machine
+                PCWSTR::null(),     // Default database
+                SC_MANAGER_CONNECT, // Minimal read-only access
             );
-            
+
             if scm.is_invalid() {
-                return false;  // SCM not available or no permissions
+                return false; // SCM not available or no permissions
             }
-            
+
             // Try to open the kodegend service
             let service = OpenServiceW(
                 scm,
                 PCWSTR::from_raw(wide_name.as_ptr()),
-                SERVICE_QUERY_STATUS,     // Minimal read-only access
+                SERVICE_QUERY_STATUS, // Minimal read-only access
             );
-            
+
             let exists = !service.is_invalid();
-            
+
             // Clean up handles (RAII pattern)
             if !service.is_invalid() {
                 let _ = CloseServiceHandle(service);
             }
             let _ = CloseServiceHandle(scm);
-            
-            exists  // Return true if service was opened successfully
+
+            exists // Return true if service was opened successfully
         }
     }
-    
+
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         false
@@ -239,17 +255,21 @@ fn check_certificates_present() -> bool {
     #[cfg(unix)]
     {
         let cert_dir = Path::new("/usr/local/var/kodegen/certs");
-        cert_dir.exists() && cert_dir.read_dir()
-            .map(|mut d| d.next().is_some())
-            .unwrap_or(false)
+        cert_dir.exists()
+            && cert_dir
+                .read_dir()
+                .map(|mut d| d.next().is_some())
+                .unwrap_or(false)
     }
 
     #[cfg(windows)]
     {
         let cert_dir = crate::platform::user_config_dir().join("certs");
-        cert_dir.exists() && cert_dir.read_dir()
-            .map(|mut d| d.next().is_some())
-            .unwrap_or(false)
+        cert_dir.exists()
+            && cert_dir
+                .read_dir()
+                .map(|mut d| d.next().is_some())
+                .unwrap_or(false)
     }
 }
 
@@ -294,15 +314,15 @@ fn check_chromium_installed() -> bool {
 /// More robust than string splitting (handles various output formats)
 pub async fn get_installed_binary_version(binary_name: &str) -> Option<String> {
     use tokio::process::Command;
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
 
     // Run with 2-second timeout to prevent hanging
     let output = match timeout(
         Duration::from_secs(2),
-        Command::new(binary_name)
-            .arg("--version")
-            .output()
-    ).await {
+        Command::new(binary_name).arg("--version").output(),
+    )
+    .await
+    {
         Ok(Ok(output)) => output,
         Ok(Err(e)) => {
             log::debug!("Failed to execute {}: {}", binary_name, e);
@@ -329,13 +349,11 @@ pub async fn get_installed_binary_version(binary_name: &str) -> Option<String> {
     // Matches: 0.3.1, 1.0.0-beta, 2.1.3-rc.1, etc.
     let re = regex::Regex::new(r"\b(\d+\.\d+\.\d+(?:-[a-zA-Z0-9.-]+)?)\b").ok()?;
 
-    re.captures(&stdout)
-        .and_then(|cap| cap.get(1))
-        .map(|m| {
-            let version = m.as_str().to_string();
-            log::info!("Detected version for {}: {}", binary_name, version);
-            version
-        })
+    re.captures(&stdout).and_then(|cap| cap.get(1)).map(|m| {
+        let version = m.as_str().to_string();
+        log::info!("Detected version for {}: {}", binary_name, version);
+        version
+    })
 }
 
 /// Cache entry for crate version lookups
@@ -354,10 +372,14 @@ static VERSION_CACHE: Lazy<Mutex<HashMap<String, VersionCacheEntry>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 const CACHE_TTL: Duration = Duration::from_secs(300); // 5 minutes
-const USER_AGENT: &str = concat!("kodegend/", env!("CARGO_PKG_VERSION"), " (https://github.com/kodegen-ai/kodegen)");
+const USER_AGENT: &str = concat!(
+    "kodegend/",
+    env!("CARGO_PKG_VERSION"),
+    " (https://github.com/kodegen-ai/kodegen)"
+);
 
 /// Crates.io API response structures
-/// 
+///
 /// Matches the proven pattern from kodegen-tools-github/src/github/search_repositories/metrics/dependencies/types.rs
 #[derive(Deserialize)]
 struct CratesIoResponse {
@@ -403,13 +425,20 @@ pub async fn get_crates_io_version(crate_name: &str) -> Option<String> {
                 );
                 return Some(entry.version.clone());
             } else {
-                log::debug!("Cache expired for {} (age: {:?})", crate_name, entry.fetched_at.elapsed());
+                log::debug!(
+                    "Cache expired for {} (age: {:?})",
+                    crate_name,
+                    entry.fetched_at.elapsed()
+                );
             }
         }
     }
 
     // Fetch from crates.io API
-    log::debug!("Fetching latest version for {} from crates.io API", crate_name);
+    log::debug!(
+        "Fetching latest version for {} from crates.io API",
+        crate_name
+    );
 
     let url = format!("https://crates.io/api/v1/crates/{}", crate_name);
 
@@ -424,7 +453,11 @@ pub async fn get_crates_io_version(crate_name: &str) -> Option<String> {
     let response = match client.get(&url).send().await {
         Ok(resp) => resp,
         Err(e) => {
-            log::warn!("Network error fetching crate info for {}: {}", crate_name, e);
+            log::warn!(
+                "Network error fetching crate info for {}: {}",
+                crate_name,
+                e
+            );
             return None;
         }
     };
@@ -443,7 +476,11 @@ pub async fn get_crates_io_version(crate_name: &str) -> Option<String> {
     let crate_data: CratesIoResponse = match response.json().await {
         Ok(data) => data,
         Err(e) => {
-            log::warn!("Failed to parse crates.io response for {}: {}", crate_name, e);
+            log::warn!(
+                "Failed to parse crates.io response for {}: {}",
+                crate_name,
+                e
+            );
             return None;
         }
     };
@@ -464,7 +501,11 @@ pub async fn get_crates_io_version(crate_name: &str) -> Option<String> {
         }
     }
 
-    log::info!("Latest version for {} from crates.io: {}", crate_name, version);
+    log::info!(
+        "Latest version for {} from crates.io: {}",
+        crate_name,
+        version
+    );
     Some(version)
 }
 
@@ -490,7 +531,10 @@ pub async fn binary_needs_installation(binary_name: &str) -> bool {
     let installed_version_str = match get_installed_binary_version(binary_name).await {
         Some(v) => v,
         None => {
-            log::info!("{} not found or version unavailable, needs installation", binary_name);
+            log::info!(
+                "{} not found or version unavailable, needs installation",
+                binary_name
+            );
             return true; // Binary not installed
         }
     };
@@ -640,7 +684,11 @@ pub async fn check_kodegen_version_status() -> ComponentStatus {
                         log::info!("kodegen version OK: {} >= {}", installed_str, latest_str);
                         ComponentStatus::Ok
                     } else {
-                        log::info!("kodegen version outdated: {} < {}", installed_str, latest_str);
+                        log::info!(
+                            "kodegen version outdated: {} < {}",
+                            installed_str,
+                            latest_str
+                        );
                         ComponentStatus::NeedsUpdate
                     }
                 }

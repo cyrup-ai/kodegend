@@ -16,9 +16,9 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::Parser;
 use kodegen_config::KodegenConfig;
+use kodegend::install::ensure_installed;
 use log::{error, info};
 use manager::ServiceManager;
-use kodegend::install::ensure_installed;
 
 fn main() {
     // Windows service mode detection
@@ -68,15 +68,15 @@ async fn real_main() -> Result<()> {
             config,
             system,
         } => run_daemon(foreground, config, system).await,
-        cli::Cmd::Status => handle_status(),
-        cli::Cmd::Start => handle_start(),
-        cli::Cmd::Stop => handle_stop(),
-        cli::Cmd::Restart => handle_restart(),
+        cli::Cmd::Status => handle_status().await,
+        cli::Cmd::Start => handle_start().await,
+        cli::Cmd::Stop => handle_stop().await,
+        cli::Cmd::Restart => handle_restart().await,
     }
 }
 
 async fn run_daemon(
-    _force_foreground: bool,  // NOTE: Parameter kept for API compatibility but unused
+    _force_foreground: bool, // NOTE: Parameter kept for API compatibility but unused
     config_path: Option<String>,
     use_system: bool,
 ) -> Result<()> {
@@ -91,92 +91,206 @@ async fn run_daemon(
         PathBuf::from("/etc/kodegend/kodegend.toml")
     } else {
         // Default to user config directory
-        let config_dir = KodegenConfig::user_config_dir()?
-            .join("kodegend");
+        let config_dir = KodegenConfig::user_config_dir()?.join("kodegend");
         fs::create_dir_all(&config_dir)?;
         config_dir.join("kodegend.toml")
     };
 
     // Auto-generate config file if it doesn't exist
     if !cfg_path.exists() {
-        info!("Config not found at {}, creating default configuration", cfg_path.display());
-        
+        info!(
+            "Config not found at {}, creating default configuration",
+            cfg_path.display()
+        );
+
         // Create parent directory if needed
         if let Some(parent) = cfg_path.parent() {
-            fs::create_dir_all(parent)
-                .context("Failed to create config directory")?;
+            fs::create_dir_all(parent).context("Failed to create config directory")?;
         }
-        
+
         // Serialize and write default config
         let default_toml = toml::to_string_pretty(&config::ServiceConfig::default())
             .context("Failed to serialize default config")?;
-        fs::write(&cfg_path, default_toml)
-            .context("Failed to write config file")?;
-        
+        fs::write(&cfg_path, default_toml).context("Failed to write config file")?;
+
         info!("Created default configuration at {}", cfg_path.display());
     }
 
     // Load config from disk
-    let cfg_str = fs::read_to_string(&cfg_path)
-        .context("Failed to read config file")?;
-    let cfg: config::ServiceConfig = toml::from_str(&cfg_str)
-        .context("Failed to parse config")?;
+    let cfg_str = fs::read_to_string(&cfg_path).context("Failed to read config file")?;
+    let cfg: config::ServiceConfig = toml::from_str(&cfg_str).context("Failed to parse config")?;
 
     info!("Using config from: {}", cfg_path.display());
 
     // Create PID file AFTER daemonization and config loading
     // Store in variable to keep it alive for entire daemon lifetime
-    let pid_file = daemon::PidFile::create(cfg.pid_file.clone())
-        .context("Failed to create PID file")?;
+    let pid_file =
+        daemon::PidFile::create(cfg.pid_file.clone()).context("Failed to create PID file")?;
     // PID file will be automatically cleaned up when pid_file is dropped
 
     info!("kodegen daemon starting (pid {})", std::process::id());
     info!("PID file location: {}", pid_file.path().display());
-    
+
     // Installation must complete before starting services
     // This creates TLS certificates and installs required components
     ensure_installed().await?;
-    
+
     // Create and run service manager
     // Note: Signal handlers are now installed within ServiceManager::run()
     // HTTP servers will be started gracefully inside the service loop
     let mgr = ServiceManager::new(cfg)?;
-    
-    // Notify systemd we're ready (if running under systemd)
-    daemon::systemd_ready();
-    
+
     info!("kodegen daemon started successfully");
 
     // Run daemon main loop - blocks until shutdown signal
     mgr.run().await?;
-    
+
     info!("kodegen daemon exiting - PID file will be cleaned up automatically");
     // _pid_file drops here, automatically removing the PID file
-    
+
     Ok(())
 }
 
-/// Handle status command - check if daemon is running
-fn handle_status() -> Result<()> {
-    match control::check_status() {
-        Ok(true) => {
-            println!("kodegend is running");
-            std::process::exit(0);
+/// Handle status command - check if daemon is running with detailed info
+async fn handle_status() -> Result<()> {
+    use crate::daemon::ServiceStatus;
+    
+    // First check if daemon is running via PID file
+    match control::check_status().await {
+        Ok(ServiceStatus::Running { pid }) => {
+            // Daemon is running, try to query detailed status via socket
+            #[cfg(unix)]
+            {
+                use kodegend::status::{StatusQuery, send_message, recv_message, format_duration};
+                use std::os::unix::net::UnixStream;
+                
+                let is_elevated = kodegend::platform::is_elevated();
+                let socket_path = kodegend::platform::status_socket_path(is_elevated);
+                
+                match UnixStream::connect(&socket_path) {
+                    Ok(mut stream) => {
+                        // Set timeout to prevent hanging
+                        stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                            .context("Failed to set socket timeout")?;
+                        
+                        // Send query
+                        if let Err(e) = send_message(&mut stream, &StatusQuery::All) {
+                            eprintln!("kodegend is running (PID: {}) but status query failed: {}", pid, e);
+                            std::process::exit(0);
+                        }
+                        
+                        // Receive response
+                        let response: kodegend::status::StatusResponse = match recv_message(&mut stream) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                eprintln!("kodegend is running (PID: {}) but failed to receive status: {}", pid, e);
+                                std::process::exit(0);
+                            }
+                        };
+                        
+                        // Display formatted output
+                        println!("● kodegend.service - KODEGEN Daemon");
+                        println!("   Active: active (running)");
+                        println!("   Main PID: {}", response.daemon_pid);
+                        println!("   Uptime: {}", format_duration(response.daemon_uptime));
+                        println!();
+                        
+                        if response.services.is_empty() {
+                            println!("   No services configured");
+                        } else {
+                            println!("   Services:");
+                            for svc in response.services {
+                                let state_str = format!("{:?}", svc.state).to_lowercase();
+                                print!("     {:24} {:10}", svc.name, state_str);
+                                
+                                if let Some(uptime) = svc.uptime {
+                                    print!("  uptime={}", format_duration(uptime));
+                                }
+                                
+                                let restarts_display = if let Some(max) = svc.max_restarts {
+                                    format!("{}/{}", svc.restart_count, max)
+                                } else {
+                                    format!("{}/∞", svc.restart_count)
+                                };
+                                print!("  restarts={}", restarts_display);
+                                
+                                if let Some(delay) = svc.next_restart_delay {
+                                    print!("  (restarting in {})", format_duration(delay));
+                                }
+                                
+                                if let Some(remaining) = svc.success_window_remaining {
+                                    if remaining.as_secs() > 0 {
+                                        print!("  (counter resets in {})", format_duration(remaining));
+                                    }
+                                }
+                                
+                                if let Some(reason) = svc.failure_reason {
+                                    print!("  reason=\"{}\"", reason);
+                                }
+                                
+                                println!();
+                            }
+                        }
+                        
+                        std::process::exit(0);
+                    }
+                    Err(_) => {
+                        // Socket not available, fall back to basic status
+                        println!("● kodegend.service - KODEGEN Daemon");
+                        println!("   Active: active (running)");
+                        println!("   Main PID: {}", pid);
+                        println!("   Note: Detailed status not available (socket unavailable)");
+                        std::process::exit(0);
+                    }
+                }
+            }
+            
+            #[cfg(not(unix))]
+            {
+                // Windows: Basic status only for now
+                println!("● kodegend.service - KODEGEN Daemon");
+                println!("   Active: active (running)");
+                println!("   Main PID: {}", pid);
+                std::process::exit(0);
+            }
         }
-        Ok(false) => {
-            println!("kodegend is stopped");
+        Ok(ServiceStatus::Stopped) => {
+            println!("● kodegend.service - KODEGEN Daemon");
+            println!("   Active: inactive (dead)");
+            std::process::exit(1);
+        }
+        Ok(ServiceStatus::StaleFile { pid }) => {
+            println!("● kodegend.service - KODEGEN Daemon");
+            println!("   Active: inactive (dead)");
+            println!("   Warning: Stale PID file found (PID: {})", pid);
+            println!("   Cleanup: Remove PID file to clear this warning");
+            std::process::exit(1);
+        }
+        Ok(ServiceStatus::InvalidFile { error }) => {
+            println!("● kodegend.service - KODEGEN Daemon");
+            println!("   Active: inactive (dead)");
+            println!("   Error: Invalid PID file: {}", error);
+            println!("   Cleanup: Remove corrupted PID file");
+            std::process::exit(1);
+        }
+        Ok(ServiceStatus::Zombie { pid }) => {
+            println!("● kodegend.service - KODEGEN Daemon");
+            println!("   Active: failed (zombie process)");
+            println!("   Main PID: {} (zombie/defunct)", pid);
+            println!("   Note: Process has exited but parent hasn't reaped it");
+            println!("   Action: Wait for parent process to reap, or reboot");
             std::process::exit(1);
         }
         Err(e) => {
-            eprintln!("Error checking status: {e:#}");
+            eprintln!("✗ Error checking status: {e:#}");
             std::process::exit(1);
         }
     }
 }
 
 /// Handle start command - start the daemon service
-fn handle_start() -> Result<()> {
-    match control::start_daemon() {
+async fn handle_start() -> Result<()> {
+    match control::start_daemon().await {
         Ok(()) => {
             println!("kodegend started successfully");
             std::process::exit(0);
@@ -189,8 +303,8 @@ fn handle_start() -> Result<()> {
 }
 
 /// Handle stop command - stop the daemon service
-fn handle_stop() -> Result<()> {
-    match control::stop_daemon() {
+async fn handle_stop() -> Result<()> {
+    match control::stop_daemon().await {
         Ok(()) => {
             println!("kodegend stopped successfully");
             std::process::exit(0);
@@ -203,8 +317,8 @@ fn handle_stop() -> Result<()> {
 }
 
 /// Handle restart command - restart the daemon service
-fn handle_restart() -> Result<()> {
-    match control::restart_daemon() {
+async fn handle_restart() -> Result<()> {
+    match control::restart_daemon().await {
         Ok(()) => {
             println!("kodegend restarted successfully");
             std::process::exit(0);

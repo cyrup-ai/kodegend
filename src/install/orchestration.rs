@@ -13,15 +13,20 @@ use tokio::sync::mpsc;
 use super::binaries::BINARY_COUNT;
 use super::binary_staging;
 use super::chromium;
+use super::cleanup::InstallationCleanupContext;
 use super::cli::Cli;
 use super::download;
-use crate::install;
 use super::privilege;
 use super::wizard;
+use crate::install;
 
 /// Run installation with wizard-collected options
 pub async fn run_install_with_options(options: &wizard::InstallOptions, _cli: &Cli) -> Result<()> {
     use crate::install::core::DownloadPhase;
+
+    // Create cleanup context - will automatically clean up on any failure
+    // This uses the Drop trait to ensure cleanup even on panic
+    let mut cleanup_ctx = InstallationCleanupContext::new();
 
     // Use termcolor for starting message
     let mut stdout = StandardStream::stdout(ColorChoice::Always);
@@ -62,14 +67,18 @@ pub async fn run_install_with_options(options: &wizard::InstallOptions, _cli: &C
                 // Handle download progress with detailed metadata
                 match meta.phase {
                     DownloadPhase::Discovering => {
-                        pb_overall_clone.set_position((meta.binary_index * 100 / BINARY_COUNT) as u64);
-                        pb_overall_clone.set_message(format!("Binary {}/{}", meta.binary_index, BINARY_COUNT));
+                        pb_overall_clone
+                            .set_position((meta.binary_index * 100 / BINARY_COUNT) as u64);
+                        pb_overall_clone
+                            .set_message(format!("Binary {}/{}", meta.binary_index, BINARY_COUNT));
                         pb_download_clone.set_message(format!("🔍 Checking {}", meta.binary_name));
                         pb_download_clone.set_position(0);
                     }
                     DownloadPhase::Downloading => {
-                        pb_overall_clone.set_position((meta.binary_index * 100 / BINARY_COUNT) as u64);
-                        pb_overall_clone.set_message(format!("Binary {}/{}", meta.binary_index, BINARY_COUNT));
+                        pb_overall_clone
+                            .set_position((meta.binary_index * 100 / BINARY_COUNT) as u64);
+                        pb_overall_clone
+                            .set_message(format!("Binary {}/{}", meta.binary_index, BINARY_COUNT));
                         pb_download_clone.set_length(meta.total_bytes);
                         pb_download_clone.set_position(meta.bytes_downloaded);
                         let percent = if meta.total_bytes > 0 {
@@ -77,27 +86,35 @@ pub async fn run_install_with_options(options: &wizard::InstallOptions, _cli: &C
                         } else {
                             0
                         };
-                        pb_download_clone.set_message(format!("📥 {} - {}%", meta.binary_name, percent));
+                        pb_download_clone
+                            .set_message(format!("📥 {} - {}%", meta.binary_name, percent));
                     }
                     DownloadPhase::Extracting => {
-                        pb_overall_clone.set_position((meta.binary_index * 100 / BINARY_COUNT) as u64);
-                        pb_overall_clone.set_message(format!("Binary {}/{}", meta.binary_index, BINARY_COUNT));
-                        pb_download_clone.set_message(format!("📦 Extracting {}", meta.binary_name));
+                        pb_overall_clone
+                            .set_position((meta.binary_index * 100 / BINARY_COUNT) as u64);
+                        pb_overall_clone
+                            .set_message(format!("Binary {}/{}", meta.binary_index, BINARY_COUNT));
+                        pb_download_clone
+                            .set_message(format!("📦 Extracting {}", meta.binary_name));
                     }
                     DownloadPhase::Complete => {
-                        pb_overall_clone.set_position((meta.binary_index * 100 / BINARY_COUNT) as u64);
-                        pb_overall_clone.set_message(format!("Binary {}/{}", meta.binary_index, BINARY_COUNT));
+                        pb_overall_clone
+                            .set_position((meta.binary_index * 100 / BINARY_COUNT) as u64);
+                        pb_overall_clone
+                            .set_message(format!("Binary {}/{}", meta.binary_index, BINARY_COUNT));
                         pb_download_clone.set_message(format!("✅ {}", meta.binary_name));
                     }
                 }
             } else {
                 // Non-download progress (daemon install, etc.)
                 if progress.is_error {
-                    pb_overall_clone.set_message(format!("❌ [{}] {}", progress.step, progress.message));
+                    pb_overall_clone
+                        .set_message(format!("❌ [{}] {}", progress.step, progress.message));
                 } else {
                     let pos = (progress.progress * 40.0) as u64 + 60; // Map 0-1 to 60-100
                     pb_overall_clone.set_position(pos);
-                    pb_overall_clone.set_message(format!("[{}] {}", progress.step, progress.message));
+                    pb_overall_clone
+                        .set_message(format!("[{}] {}", progress.step, progress.message));
                 }
             }
         }
@@ -113,7 +130,10 @@ pub async fn run_install_with_options(options: &wizard::InstallOptions, _cli: &C
     let binary_paths = if options.dry_run {
         Vec::new()
     } else {
-        download::download_all_binaries(tx.clone()).await?
+        // Unpack tuple and register download dir in cleanup context
+        let (binaries, download_dir) = download::download_all_binaries(tx.clone()).await?;
+        cleanup_ctx.downloaded_binaries_dir = Some(download_dir);
+        binaries
     };
 
     pb_overall.set_message("All binaries downloaded");
@@ -125,6 +145,9 @@ pub async fn run_install_with_options(options: &wizard::InstallOptions, _cli: &C
         pb_overall.set_position(55);
 
         let dir = binary_staging::stage_binaries_for_install(&binary_paths).await?;
+        
+        // Register staging dir in cleanup context
+        cleanup_ctx.staging_dir = Some(dir.clone());
 
         pb_overall.set_message("Binaries staged");
         pb_overall.set_position(60);
@@ -143,7 +166,7 @@ pub async fn run_install_with_options(options: &wizard::InstallOptions, _cli: &C
 
         #[cfg(windows)]
         let path = {
-            use crate::install::installer::windows::paths::{kodegend_exe, InstallScope};
+            use crate::install::installer::windows::paths::{InstallScope, kodegend_exe};
             kodegend_exe(InstallScope::System)
         };
 
@@ -151,8 +174,7 @@ pub async fn run_install_with_options(options: &wizard::InstallOptions, _cli: &C
     };
 
     // Determine config path
-    let config_path = crate::platform::user_config_dir()
-        .join("config.toml");
+    let config_path = crate::platform::user_config_dir().join("config.toml");
 
     pb_overall.set_message("Configuring daemon service...");
     pb_overall.set_position(65);
@@ -194,7 +216,8 @@ pub async fn run_install_with_options(options: &wizard::InstallOptions, _cli: &C
             let _ = stdout.reset();
         }
         Err(e) => {
-            // Chromium is REQUIRED - fail installation
+            // Cleanup context will automatically clean up via Drop
+            // But we explicitly call cleanup() for better logging context
             pb_overall.set_message("Chromium installation FAILED");
             pb_overall.finish_and_clear();
             pb_download.finish_and_clear();
@@ -207,13 +230,11 @@ pub async fn run_install_with_options(options: &wizard::InstallOptions, _cli: &C
             let _ = writeln!(stderr, "   Error: {e}");
             let _ = stderr.reset();
             let _ = writeln!(stderr, "   Chromium is required for kodegen functionality.");
-            let _ = writeln!(stderr, "   Please check:");
-            let _ = writeln!(stderr, "   • Network connection is available");
-            let _ = writeln!(stderr, "   • ~100MB free disk space");
-            let _ = writeln!(
-                stderr,
-                "   • Firewall allows access to chromium download servers\n"
-            );
+            let _ = writeln!(stderr, "   Cleaning up installation artifacts...");
+            
+            // Explicitly cleanup for better error logging (Drop will also cleanup as backup)
+            cleanup_ctx.cleanup();
+            
             return Err(e);
         }
     }
@@ -232,6 +253,7 @@ pub async fn run_install_with_options(options: &wizard::InstallOptions, _cli: &C
             &install_result.data_dir,
         )
         .await?;
+        // NOTE: If this fails, cleanup_ctx Drop will handle cleanup automatically
 
         pb_overall.set_message("System installation complete");
         pb_overall.set_position(98);
@@ -243,6 +265,9 @@ pub async fn run_install_with_options(options: &wizard::InstallOptions, _cli: &C
     pb_download.finish_and_clear();
 
     wizard::show_completion(options, &install_result);
+
+    // SUCCESS: Defuse cleanup context to prevent cleanup of successfully installed files
+    cleanup_ctx.defuse();
 
     Ok(())
 }

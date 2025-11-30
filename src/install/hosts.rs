@@ -82,8 +82,8 @@ fi
         .to_string();
 
         // Write script to temp file using tempfile for security
-        use tempfile::Builder;
         use std::io::Write;
+        use tempfile::Builder;
 
         let mut script_file = Builder::new()
             .prefix("kodegen_hosts_")
@@ -94,9 +94,7 @@ fi
         script_file
             .write_all(script.as_bytes())
             .context("Failed to write hosts setup script")?;
-        script_file
-            .flush()
-            .context("Failed to flush script data")?;
+        script_file.flush().context("Failed to flush script data")?;
 
         // Make executable
         #[cfg(unix)]

@@ -15,9 +15,8 @@ pub(super) fn create_dropin_config(config: &SystemdConfig) -> Result<(), Install
     let dropin_dir = if unsafe { libc::getuid() } == 0 {
         PathBuf::from("/etc/systemd/system").join(format!("{}.service.d", config.service_name))
     } else {
-        let home_dir = std::env::var("HOME").map_err(|_| {
-            InstallerError::System("HOME environment variable not set".to_string())
-        })?;
+        let home_dir = std::env::var("HOME")
+            .map_err(|_| InstallerError::System("HOME environment variable not set".to_string()))?;
         PathBuf::from(home_dir)
             .join(".config/systemd/user")
             .join(format!("{}.service.d", config.service_name))
@@ -67,9 +66,8 @@ pub(super) fn cleanup_dropin_config(service_name: &str) -> Result<(), InstallerE
     let dropin_dir = if unsafe { libc::getuid() } == 0 {
         PathBuf::from("/etc/systemd/system").join(format!("{}.service.d", service_name))
     } else {
-        let home_dir = std::env::var("HOME").map_err(|_| {
-            InstallerError::System("HOME environment variable not set".to_string())
-        })?;
+        let home_dir = std::env::var("HOME")
+            .map_err(|_| InstallerError::System("HOME environment variable not set".to_string()))?;
         PathBuf::from(home_dir)
             .join(".config/systemd/user")
             .join(format!("{}.service.d", service_name))

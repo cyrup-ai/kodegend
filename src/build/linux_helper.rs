@@ -209,12 +209,15 @@ int main(int argc, char *argv[]) {
     build.file(&c_path);
     build.flag("-std=c99");
     build.define("_GNU_SOURCE", None);
-    
+
     // Get the compiler to invoke it manually for full control over output path
     let compiler = build.try_get_compiler().map_err(|e| {
-        format!("Failed to find C compiler for Linux helper compilation: {}", e)
+        format!(
+            "Failed to find C compiler for Linux helper compilation: {}",
+            e
+        )
     })?;
-    
+
     // Build the compile command with explicit output path
     let mut cmd = compiler.to_command();
     cmd.arg("-std=c99");
@@ -222,18 +225,15 @@ int main(int argc, char *argv[]) {
     cmd.arg("-o");
     cmd.arg(&exe_path);
     cmd.arg(&c_path);
-    
+
     // Execute compilation
-    let output = cmd.output().map_err(|e| {
-        format!("Failed to execute C compiler: {}", e)
-    })?;
-    
+    let output = cmd
+        .output()
+        .map_err(|e| format!("Failed to execute C compiler: {}", e))?;
+
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "Failed to compile Linux helper: {}",
-            stderr
-        ).into());
+        return Err(format!("Failed to compile Linux helper: {}", stderr).into());
     }
 
     // Clean up temporary C file

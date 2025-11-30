@@ -9,22 +9,10 @@ use anyhow::Result;
 use log::LevelFilter;
 
 pub fn platform_init_logging() -> Result<()> {
-    // Preserve exact format from src/main.rs:36-50
     env_logger::Builder::from_default_env()
-        .format(|buf, record| {
-            use std::io::Write;
-            writeln!(
-                buf,
-                "[{} {} {}:{}] {}",
-                buf.timestamp_millis(),
-                record.level(),
-                record.file().unwrap_or("unknown"),
-                record.line().unwrap_or(0),
-                record.args()
-            )
-        })
+        .format(super::kodegend_log_format)
         .filter_level(LevelFilter::Info)
         .init();
-    
+
     Ok(())
 }

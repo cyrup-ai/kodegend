@@ -16,8 +16,8 @@
 //!   - User config: %APPDATA%\kodegend\
 //!   - Logs: C:\ProgramData\kodegend\logs\
 
-use std::path::PathBuf;
 use anyhow::{Context, Result};
+use std::path::PathBuf;
 
 /// Installation scope (system-wide vs user-specific)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,12 +128,12 @@ pub fn temp_dir() -> PathBuf {
 }
 
 /// Create a unique temp file for certificate import
-/// 
+///
 /// Returns a NamedTempFile that will be automatically cleaned up when dropped.
 /// The caller can write certificate content to it and use .path() to get the path.
 pub fn temp_cert_file() -> Result<tempfile::NamedTempFile> {
     use tempfile::Builder;
-    
+
     Builder::new()
         .prefix("kodegen_cert_")
         .suffix(".crt")
@@ -160,20 +160,10 @@ pub fn create_installer_directories(scope: InstallScope) -> Result<()> {
     Ok(())
 }
 
-/// Get platform-specific delete command for batch scripts
-pub fn delete_file_command(path: &std::path::Path) -> String {
-    format!("del /F /Q \"{}\" 2>nul", path.display())
-}
-
-/// Get platform-specific copy command for batch scripts
-pub fn copy_file_command(src: &std::path::Path, dest_dir: &std::path::Path) -> String {
-    format!("copy /Y \"{}\" \"{}\\\"", src.display(), dest_dir.display())
-}
-
-/// Get platform-specific mkdir command for batch scripts
-pub fn mkdir_command(dir: &std::path::Path) -> String {
-    format!("mkdir \"{}\" 2>nul || echo Directory exists", dir.display())
-}
+// SECURITY: Unsafe batch command builders removed (CVE-2024-24576 - BatBadBut)
+// These functions generated batch scripts that cannot be safely escaped on Windows.
+// Replaced with structured command protocol that uses Windows APIs directly.
+// See: task/04_HIGH_windows_script_injection_uac.md
 
 #[cfg(test)]
 mod tests {
@@ -206,11 +196,6 @@ mod tests {
         assert!(path.extension().and_then(|s| s.to_str()) == Some("crt"));
     }
 
-    #[test]
-    fn test_batch_commands() {
-        let path = PathBuf::from(r"C:\test\file.txt");
-        let del_cmd = delete_file_command(&path);
-        assert!(del_cmd.contains("del /F /Q"));
-        assert!(del_cmd.contains("2>nul"));
-    }
+    // Test for batch commands removed - those unsafe functions have been deleted
+    // for security reasons (BatBadBut vulnerability)
 }

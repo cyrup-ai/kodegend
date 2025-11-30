@@ -8,14 +8,16 @@ use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
-use crate::install::core::InstallProgress;
 use super::super::wizard::InstallationResult;
+use crate::install::core::InstallProgress;
 
 use super::types::INSTALL_TIMEOUT;
 use super::window::InstallWindow;
 
 /// Run GUI installation with progress window
-pub async fn run_gui_installation(cli: &super::super::cli::Cli) -> anyhow::Result<InstallationResult> {
+pub async fn run_gui_installation(
+    cli: &super::super::cli::Cli,
+) -> anyhow::Result<InstallationResult> {
     let mut stdout = StandardStream::stdout(ColorChoice::Always);
     let _ = stdout.set_color(ColorSpec::new().set_fg(Some(Color::Cyan)));
     let _ = writeln!(stdout, "🎨 Launching GUI installer...");
@@ -50,7 +52,9 @@ pub async fn run_gui_installation(cli: &super::super::cli::Cli) -> anyhow::Resul
             format!("Installing {} binaries to system", binary_paths.len()),
         ));
 
-        if let Err(e) = crate::install::binary_staging::install_binaries_to_system(&binary_paths).await {
+        if let Err(e) =
+            crate::install::binary_staging::install_binaries_to_system(&binary_paths).await
+        {
             let _ = tx.try_send(InstallProgress::error(
                 "binary_install".to_string(),
                 format!("Failed to install binaries: {}", e),
@@ -71,7 +75,7 @@ pub async fn run_gui_installation(cli: &super::super::cli::Cli) -> anyhow::Resul
 
         #[cfg(windows)]
         let kodegend_path = {
-            use crate::install::installer::windows::paths::{kodegend_exe, InstallScope};
+            use crate::install::installer::windows::paths::{InstallScope, kodegend_exe};
             kodegend_exe(InstallScope::System)
         };
 
@@ -87,8 +91,7 @@ pub async fn run_gui_installation(cli: &super::super::cli::Cli) -> anyhow::Resul
         }
 
         // Get config path (platform-specific)
-        let config_path = crate::platform::user_config_dir()
-            .join("config.toml");
+        let config_path = crate::platform::user_config_dir().join("config.toml");
 
         // Run daemon installation (function already accepts progress channel!)
         let auto_start = !cli_clone.no_start;

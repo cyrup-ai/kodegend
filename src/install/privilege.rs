@@ -9,14 +9,14 @@ use log::info;
 
 // Windows-specific imports for UAC elevation
 #[cfg(windows)]
-use crate::install::installer::windows::privileges::{ensure_helper_path, HELPER_PATH};
+use crate::install::installer::windows::privileges::{HELPER_PATH, ensure_helper_path};
 
 #[cfg(windows)]
 use windows::{
-    Win32::UI::Shell::{ShellExecuteExW, SHELLEXECUTEINFOW, SEE_MASK_NOCLOSEPROCESS},
+    Win32::Foundation::{CloseHandle, GetLastError, HWND},
+    Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject},
+    Win32::UI::Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW},
     Win32::UI::WindowsAndMessaging::SW_HIDE,
-    Win32::Foundation::{HWND, CloseHandle, GetLastError},
-    Win32::System::Threading::{WaitForSingleObject, GetExitCodeProcess, INFINITE},
     core::PCWSTR,
 };
 
@@ -40,15 +40,18 @@ use windows::{
 /// ```
 fn shell_escape(path: &std::path::Path) -> Result<String> {
     // Convert path to string (reject non-UTF8 paths)
-    let path_str = path
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!(
+    let path_str = path.to_str().ok_or_else(|| {
+        anyhow::anyhow!(
             "Path contains invalid UTF-8: {}. This may be a security issue.",
             path.display()
-        ))?;
+        )
+    })?;
 
     // Reject paths with control characters (potential terminal injection)
-    if path_str.chars().any(|c| c.is_control() && c != '\n' && c != '\t') {
+    if path_str
+        .chars()
+        .any(|c| c.is_control() && c != '\n' && c != '\t')
+    {
         return Err(anyhow::anyhow!(
             "Path contains control characters: {}. Possible attack attempt.",
             path.display()
@@ -92,10 +95,7 @@ fn validate_binary_filename(path: &std::path::Path) -> Result<()> {
     let filename = path
         .file_name()
         .and_then(|n| n.to_str())
-        .ok_or_else(|| anyhow::anyhow!(
-            "Invalid filename in path: {}",
-            path.display()
-        ))?;
+        .ok_or_else(|| anyhow::anyhow!("Invalid filename in path: {}", path.display()))?;
 
     // Check for safe characters only
     let is_safe = filename
@@ -164,7 +164,12 @@ pub async fn install_with_elevated_privileges(
 
     // Get list of files in staging directory
     let staged_files: Vec<String> = std::fs::read_dir(staging_dir)
-        .with_context(|| format!("Failed to read staging directory: {}", staging_dir.display()))?
+        .with_context(|| {
+            format!(
+                "Failed to read staging directory: {}",
+                staging_dir.display()
+            )
+        })?
         .filter_map(|entry| {
             entry.ok().and_then(|e| {
                 let path = e.path();
@@ -190,16 +195,16 @@ pub async fn install_with_elevated_privileges(
     #[cfg(unix)]
     {
         script.push_str("mkdir -p /usr/local/bin\n");
-        
+
         for file in &staged_files {
             let path = std::path::Path::new(file);
-            
+
             // LAYER 1: Validate filename (reject malicious names)
             validate_binary_filename(path)?;
-            
+
             // LAYER 2: Escape for shell safety (handle remaining edge cases)
             let escaped_path = shell_escape(path)?;
-            
+
             // Now safe to use in shell script
             script.push_str(&format!("cp -f {} /usr/local/bin/\n", escaped_path));
         }
@@ -216,17 +221,38 @@ pub async fn install_with_elevated_privileges(
         use crate::install::installer::windows::paths::{self, InstallScope};
 
         let install_dir = paths::install_dir(InstallScope::System);
-        
-        script.push_str(&paths::mkdir_command(&install_dir));
-        script.push_str("\n");
 
+        // Build structured commands instead of batch script
+        let mut commands = Vec::new();
+
+        // Create installation directory
+        commands.push(format!("MKDIR|{}", install_dir.display()));
+
+        // Copy all staged files
         for file in &staged_files {
-            script.push_str(&paths::copy_file_command(
-                std::path::Path::new(file),
-                &install_dir
+            let file_path = std::path::Path::new(file);
+            let file_name = file_path
+                .file_name()
+                .ok_or_else(|| anyhow::anyhow!("Invalid file path: {}", file))?;
+            let dest_path = install_dir.join(file_name);
+
+            commands.push(format!(
+                "COPY|{}|{}",
+                file_path.display(),
+                dest_path.display()
             ));
-            script.push_str("\n");
         }
+
+        // Update hosts file (idempotent check done in helper)
+        commands.push("APPEND_HOSTS|127.0.0.1 mcp.kodegen.ai".to_string());
+
+        // Flush DNS cache
+        commands.push("FLUSHDNS".to_string());
+
+        // Join commands with newlines
+        script = commands.join("\n");
+
+        log::debug!("Windows installation commands:\n{}", script);
     }
 
     // Update hosts file (idempotent)
@@ -244,41 +270,12 @@ pub async fn install_with_elevated_privileges(
         }
     }
 
-    // Update hosts file (idempotent)
-    #[cfg(windows)]
-    {
-        use crate::install::installer::windows::paths;
-
-        script.push_str("\n@REM Update Windows hosts file\n");
-        script.push_str("echo Updating hosts file...\n");
-
-        let hosts_path = paths::hosts_file();
-        
-        // Check if entry exists (case-insensitive search)
-        // findstr /i = case-insensitive, /c: = exact string match
-        // errorlevel 1 means NOT found
-        script.push_str(&format!(
-            r#"findstr /i /c:"mcp.kodegen.ai" "{}" >nul 2>&1
-if errorlevel 1 (
-    echo 127.0.0.1 mcp.kodegen.ai >> "{}"
-    echo Hosts entry added
-) else (
-    echo Hosts entry already exists
-)
-
-"#,
-            hosts_path.display(), hosts_path.display()
-        ));
-        
-        // Flush DNS cache so changes take effect immediately
-        script.push_str("ipconfig /flushdns >nul 2>&1\n");
-        script.push_str("echo DNS cache flushed\n");
-    }
-
     // Import certificate to system trust store (if provided)
     if let Some(cert_content) = cert_content {
         // Note in script that certificate import happens via native API
-        script.push_str("\n# Certificate import handled by native platform API (not shell command)\n");
+        script.push_str(
+            "\n# Certificate import handled by native platform API (not shell command)\n",
+        );
         script.push_str("echo 'Certificate import: native API...'\n");
 
         // Certificate import happens OUTSIDE the shell script using native APIs
@@ -297,16 +294,16 @@ if errorlevel 1 (
         #[cfg(windows)]
         let (temp_cert_file, temp_cert_path) = {
             use crate::install::installer::windows::paths;
-            let temp_cert = paths::temp_cert_file()
-                .context("Failed to create temp certificate file")?;
+            let temp_cert =
+                paths::temp_cert_file().context("Failed to create temp certificate file")?;
             let path = temp_cert.path().to_path_buf();
             (Some(temp_cert), path)
         };
 
         #[cfg(unix)]
         let (temp_cert_file, temp_cert_path) = {
-            use tempfile::Builder;
             use std::io::Write;
+            use tempfile::Builder;
 
             let mut temp_cert = Builder::new()
                 .prefix("kodegen_cert_")
@@ -315,23 +312,40 @@ if errorlevel 1 (
                 .context("Failed to create temp certificate file")?;
 
             // Write certificate content using synchronous I/O
-            temp_cert.write_all(cert_only.as_bytes())
+            temp_cert
+                .write_all(cert_only.as_bytes())
                 .context("Failed to write certificate content")?;
-            temp_cert.flush()
+            temp_cert
+                .flush()
                 .context("Failed to flush certificate data")?;
 
             // Set restrictive permissions atomically (owner-only read/write)
             use std::os::unix::fs::PermissionsExt;
-            let mut perms = temp_cert.as_file().metadata()
+            let mut perms = temp_cert
+                .as_file()
+                .metadata()
                 .context("Failed to get temp cert metadata")?
                 .permissions();
             perms.set_mode(0o600); // rw------- (owner only)
-            temp_cert.as_file().set_permissions(perms)
+            temp_cert
+                .as_file()
+                .set_permissions(perms)
                 .context("Failed to set temp cert permissions")?;
 
             let path = temp_cert.path().to_path_buf();
             (Some(temp_cert), path)
         };
+
+        // Add scopeguard for defense-in-depth cleanup
+        // This ensures temp cert is deleted even if import_certificate_to_system panics
+        // Pattern follows existing usage in certificates.rs:82
+        let cert_cleanup_guard = scopeguard::guard(temp_cert_path.clone(), |path| {
+            if let Err(e) = std::fs::remove_file(&path) {
+                log::warn!("Failed to cleanup temp certificate during scopeguard: {}", e);
+            } else {
+                log::debug!("Scopeguard cleaned up temp certificate: {}", path.display());
+            }
+        });
 
         // CRITICAL CHANGE: Call native API instead of shell command
         // This function is in install/installer/config/certificates.rs
@@ -340,6 +354,9 @@ if errorlevel 1 (
         import_certificate_to_system(&temp_cert_path)
             .await
             .context("Failed to import certificate via native API")?;
+
+        // Success: defuse scopeguard (temp_cert_file Drop will still clean up)
+        scopeguard::ScopeGuard::into_inner(cert_cleanup_guard);
 
         // Temp file auto-deleted when temp_cert_file drops
         drop(temp_cert_file);
@@ -355,7 +372,7 @@ if errorlevel 1 (
             // Validate and escape service file path
             validate_binary_filename(&plist_src)?;
             let escaped_plist = shell_escape(&plist_src)?;
-            
+
             script.push_str("\n# Install launchd service\n");
             script.push_str("echo 'Installing service...'\n");
             script.push_str(&format!(
@@ -373,7 +390,7 @@ if errorlevel 1 (
             // Validate and escape service file path
             validate_binary_filename(&service_src)?;
             let escaped_service = shell_escape(&service_src)?;
-            
+
             script.push_str("\n# Install systemd service\n");
             script.push_str("echo 'Installing service...'\n");
             script.push_str(&format!(
@@ -401,9 +418,9 @@ if errorlevel 1 (
     {
         // SECURITY FIX: Use tempfile crate for atomic, unpredictable temp file creation
         // This prevents TOCTOU attacks where attacker pre-creates malicious scripts
-        use tempfile::Builder;
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
+        use tempfile::Builder;
 
         let mut script_file = Builder::new()
             .prefix("kodegen_install_")
@@ -412,17 +429,21 @@ if errorlevel 1 (
             .context("Failed to create temp script file")?;
 
         // Write script content using synchronous I/O
-        script_file.write_all(script.as_bytes())
+        script_file
+            .write_all(script.as_bytes())
             .context("Failed to write installation script")?;
-        script_file.flush()
-            .context("Failed to flush script data")?;
+        script_file.flush().context("Failed to flush script data")?;
 
         // Set executable permissions atomically (owner read/execute only)
-        let mut perms = script_file.as_file().metadata()
+        let mut perms = script_file
+            .as_file()
+            .metadata()
             .context("Failed to get script metadata")?
             .permissions();
-        perms.set_mode(0o700);  // rwx------ (owner only)
-        script_file.as_file().set_permissions(perms)
+        perms.set_mode(0o700); // rwx------ (owner only)
+        script_file
+            .as_file()
+            .set_permissions(perms)
             .context("Failed to set script permissions")?;
 
         // Execute script file (NOT via sh -c)
@@ -466,20 +487,17 @@ if errorlevel 1 (
             .collect();
 
         // Encode script content directly as wide string (helper expects content, not path)
-        let script_wide: Vec<u16> = script
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
+        let script_wide: Vec<u16> = script.encode_utf16().chain(std::iter::once(0)).collect();
 
         let mut sei = SHELLEXECUTEINFOW {
             cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
-            fMask: SEE_MASK_NOCLOSEPROCESS,  // Get process handle for waiting
+            fMask: SEE_MASK_NOCLOSEPROCESS, // Get process handle for waiting
             hwnd: HWND::default(),
             lpVerb: PCWSTR(verb.as_ptr()),
             lpFile: PCWSTR(helper_path_wide.as_ptr()),
-            lpParameters: PCWSTR(script_wide.as_ptr()),  // Pass script content, not path
+            lpParameters: PCWSTR(script_wide.as_ptr()), // Pass script content, not path
             lpDirectory: PCWSTR::null(),
-            nShow: SW_HIDE.0 as i32,  // Hide console window
+            nShow: SW_HIDE.0 as i32, // Hide console window
             hInstApp: Default::default(),
             lpIDList: std::ptr::null_mut(),
             lpClass: PCWSTR::null(),
@@ -490,9 +508,7 @@ if errorlevel 1 (
         };
 
         // Step 5: Execute with UAC elevation (shows UAC prompt to user)
-        let elevation_result = unsafe {
-            ShellExecuteExW(&mut sei)
-        };
+        let elevation_result = unsafe { ShellExecuteExW(&mut sei) };
 
         if elevation_result.is_err() || sei.hProcess.is_invalid() {
             // Check if user cancelled UAC (ERROR_CANCELLED = 1223)
@@ -502,7 +518,7 @@ if errorlevel 1 (
                     "UAC elevation cancelled by user. Administrator privileges are required to install kodegen."
                 ));
             }
-            
+
             return Err(anyhow::anyhow!(
                 "Failed to launch elevated helper process (error code: {})",
                 error_code.0
@@ -510,23 +526,23 @@ if errorlevel 1 (
         }
 
         // Step 6: Wait for elevated process to complete
-        let wait_result = unsafe {
-            WaitForSingleObject(sei.hProcess, INFINITE)
-        };
+        let wait_result = unsafe { WaitForSingleObject(sei.hProcess, INFINITE) };
 
         if wait_result.0 != 0 {
-            unsafe { let _ = CloseHandle(sei.hProcess); }
+            unsafe {
+                let _ = CloseHandle(sei.hProcess);
+            }
             return Err(anyhow::anyhow!("Wait for elevated process failed"));
         }
 
         // Step 7: Get exit code
         let mut exit_code: u32 = 0;
-        let exit_code_result = unsafe {
-            GetExitCodeProcess(sei.hProcess, &mut exit_code)
-        };
+        let exit_code_result = unsafe { GetExitCodeProcess(sei.hProcess, &mut exit_code) };
 
         // Step 8: Cleanup
-        unsafe { let _ = CloseHandle(sei.hProcess); }
+        unsafe {
+            let _ = CloseHandle(sei.hProcess);
+        }
 
         if exit_code_result.is_err() || exit_code != 0 {
             return Err(anyhow::anyhow!(
@@ -536,14 +552,18 @@ if errorlevel 1 (
         }
 
         // Register Windows service (requires elevation, uses Windows API)
-        use crate::install::installer::windows::paths::{kodegend_exe, InstallScope};
+        use crate::install::installer::windows::paths::{InstallScope, kodegend_exe};
         let binary_path = kodegend_exe(InstallScope::System);
         register_windows_service(&binary_path).await?;
     }
 
     // Cleanup staging directory
-    std::fs::remove_dir_all(staging_dir)
-        .with_context(|| format!("Failed to cleanup staging directory: {}", staging_dir.display()))?;
+    std::fs::remove_dir_all(staging_dir).with_context(|| {
+        format!(
+            "Failed to cleanup staging directory: {}",
+            staging_dir.display()
+        )
+    })?;
 
     Ok(())
 }
@@ -566,8 +586,8 @@ if errorlevel 1 (
 /// PlatformExecutor::install() is a blocking operation that makes Windows API calls.
 #[cfg(windows)]
 async fn register_windows_service(binary_path: &std::path::Path) -> Result<()> {
-    use crate::install::installer::windows::PlatformExecutor;
     use crate::install::installer::InstallerBuilder;
+    use crate::install::installer::windows::PlatformExecutor;
 
     eprintln!("🔧 Registering Windows service...");
 
@@ -583,11 +603,11 @@ async fn register_windows_service(binary_path: &std::path::Path) -> Result<()> {
     // Note: InstallerBuilder is defined in ../installer/builder.rs
     let installer = InstallerBuilder::new("kodegend", binary_path)
         .description("KODEGEN MCP Tool Server Daemon")
-        .args(["run", "--foreground"])  // --service flag added automatically by service_creation.rs
+        .args(["run", "--foreground"]) // --service flag added automatically by service_creation.rs
         .env("RUST_LOG", "info")
-        .auto_restart(true)         // Configure automatic restart on failure
-        .network(true)              // Service requires network (depends on Tcpip/Afd)
-        .auto_start(true);          // Start service automatically on boot (delayed start)
+        .auto_restart(true) // Configure automatic restart on failure
+        .network(true) // Service requires network (depends on Tcpip/Afd)
+        .auto_start(true); // Start service automatically on boot (delayed start)
 
     // Call Windows service creation API
     // This is a blocking operation, so wrap in spawn_blocking
@@ -893,4 +913,3 @@ impl PrivilegedExecutor {
         Ok(())
     }
 }
-

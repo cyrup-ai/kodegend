@@ -15,30 +15,40 @@ use std::path::PathBuf;
 /// Returns the staging directory path for use in privileged installation phase.
 pub async fn stage_binaries_for_install(binary_paths: &[PathBuf]) -> Result<PathBuf> {
     use std::fs;
-    
+
     // Create staging directory with SECURE, CRYPTOGRAPHICALLY RANDOM name
     // tempfile::TempDir provides atomic creation with O_EXCL and 128+ bits of entropy
     use tempfile::Builder;
-    
+
     let temp_dir = Builder::new()
         .prefix("kodegen_install_")
         .tempdir()
         .context("Failed to create staging directory")?;
-    
-    // Persist the directory (prevent auto-cleanup) and get the path
-    let staging_dir = temp_dir.keep();
+
+    // Persist the directory and return path for cleanup tracking
+    // Use into_path() instead of keep() so caller can track for cleanup
+    let staging_dir = temp_dir.into_path();
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        
+
         // Set restrictive permissions immediately: rwx------ (mode 0700)
         let mut perms = fs::metadata(&staging_dir)
-            .with_context(|| format!("Failed to read staging dir metadata: {}", staging_dir.display()))?
+            .with_context(|| {
+                format!(
+                    "Failed to read staging dir metadata: {}",
+                    staging_dir.display()
+                )
+            })?
             .permissions();
-        perms.set_mode(0o700);  // Owner only
-        fs::set_permissions(&staging_dir, perms)
-            .with_context(|| format!("Failed to set staging dir permissions: {}", staging_dir.display()))?;
+        perms.set_mode(0o700); // Owner only
+        fs::set_permissions(&staging_dir, perms).with_context(|| {
+            format!(
+                "Failed to set staging dir permissions: {}",
+                staging_dir.display()
+            )
+        })?;
 
         // Copy binaries to staging (no root needed)
         for binary_path in binary_paths {
@@ -49,7 +59,11 @@ pub async fn stage_binaries_for_install(binary_paths: &[PathBuf]) -> Result<Path
             let dest_path = staging_dir.join(binary_name);
 
             fs::copy(binary_path, &dest_path).with_context(|| {
-                format!("Failed to copy {} to staging: {}", binary_path.display(), dest_path.display())
+                format!(
+                    "Failed to copy {} to staging: {}",
+                    binary_path.display(),
+                    dest_path.display()
+                )
             })?;
 
             // Set executable permissions (755) in staging
@@ -73,7 +87,11 @@ pub async fn stage_binaries_for_install(binary_paths: &[PathBuf]) -> Result<Path
             let dest_path = staging_dir.join(binary_name);
 
             fs::copy(binary_path, &dest_path).with_context(|| {
-                format!("Failed to copy {} to staging: {}", binary_path.display(), dest_path.display())
+                format!(
+                    "Failed to copy {} to staging: {}",
+                    binary_path.display(),
+                    dest_path.display()
+                )
             })?;
         }
     }
@@ -102,8 +120,7 @@ pub async fn install_binaries_to_system(binary_paths: &[PathBuf]) -> Result<()> 
 
         // Ensure bin directory exists
         if !bin_dir.exists() {
-            fs::create_dir_all(&bin_dir)
-                .context("Failed to create /usr/local/bin directory")?;
+            fs::create_dir_all(&bin_dir).context("Failed to create /usr/local/bin directory")?;
         }
 
         // Copy each binary and set executable permissions
@@ -115,7 +132,11 @@ pub async fn install_binaries_to_system(binary_paths: &[PathBuf]) -> Result<()> 
             let dest_path = bin_dir.join(binary_name);
 
             fs::copy(binary_path, &dest_path).with_context(|| {
-                format!("Failed to copy {} to {}", binary_path.display(), dest_path.display())
+                format!(
+                    "Failed to copy {} to {}",
+                    binary_path.display(),
+                    dest_path.display()
+                )
             })?;
 
             // Set executable permissions (755)
@@ -131,7 +152,7 @@ pub async fn install_binaries_to_system(binary_paths: &[PathBuf]) -> Result<()> 
     #[cfg(windows)]
     {
         use crate::install::installer::windows::paths::{self, InstallScope};
-        
+
         let bin_dir = paths::install_dir(InstallScope::System);
 
         if !bin_dir.exists() {
@@ -147,7 +168,11 @@ pub async fn install_binaries_to_system(binary_paths: &[PathBuf]) -> Result<()> 
             let dest_path = bin_dir.join(binary_name);
 
             fs::copy(binary_path, &dest_path).with_context(|| {
-                format!("Failed to copy {} to {}", binary_path.display(), dest_path.display())
+                format!(
+                    "Failed to copy {} to {}",
+                    binary_path.display(),
+                    dest_path.display()
+                )
             })?;
         }
     }

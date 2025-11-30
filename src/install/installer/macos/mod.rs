@@ -2,7 +2,7 @@
 
 use std::{path::PathBuf, process::Command};
 
-use super::{builder::CommandBuilder, InstallerBuilder, InstallerError};
+use super::{InstallerBuilder, InstallerError, builder::CommandBuilder};
 
 mod executor;
 mod helper;
@@ -77,10 +77,7 @@ impl PlatformExecutor {
             .to_str()
             .ok_or_else(|| InstallerError::System("Invalid temp plist path".to_string()))?;
 
-        let mut script = format!(
-            "set -e\n{}",
-            executor::command_to_script(&mkdir_cmd)
-        );
+        let mut script = format!("set -e\n{}", executor::command_to_script(&mkdir_cmd));
         script.push_str(&format!(" && {}", executor::command_to_script(&cp_cmd)));
         if needs_sudo {
             script.push_str(&format!(" && {}", executor::command_to_script(&chown_cmd)));

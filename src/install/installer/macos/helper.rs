@@ -174,7 +174,10 @@ fn extract_from_embedded_data(helper_path: &PathBuf) -> Result<bool, InstallerEr
         }
         Err(e) => {
             let _ = std::fs::remove_dir_all(&temp_extract);
-            return Err(InstallerError::System(format!("Helper validation error: {}", e)));
+            return Err(InstallerError::System(format!(
+                "Helper validation error: {}",
+                e
+            )));
         }
     };
 
@@ -190,7 +193,10 @@ fn extract_from_embedded_data(helper_path: &PathBuf) -> Result<bool, InstallerEr
         }
         Err(e) => {
             let _ = std::fs::remove_dir_all(&temp_extract);
-            return Err(InstallerError::System(format!("Signature validation error: {}", e)));
+            return Err(InstallerError::System(format!(
+                "Signature validation error: {}",
+                e
+            )));
         }
     };
 
@@ -263,8 +269,7 @@ fn validate_zip_central_directory() -> Result<(), &'static str> {
     let _cd_start_disk = u16::from_le_bytes([eocd_data[6], eocd_data[7]]);
     let cd_entries_this_disk = u16::from_le_bytes([eocd_data[8], eocd_data[9]]);
     let cd_total_entries = u16::from_le_bytes([eocd_data[10], eocd_data[11]]);
-    let cd_size =
-        u32::from_le_bytes([eocd_data[12], eocd_data[13], eocd_data[14], eocd_data[15]]);
+    let cd_size = u32::from_le_bytes([eocd_data[12], eocd_data[13], eocd_data[14], eocd_data[15]]);
     let cd_offset =
         u32::from_le_bytes([eocd_data[16], eocd_data[17], eocd_data[18], eocd_data[19]]);
 
@@ -304,9 +309,9 @@ fn extract_zip_data(zip_data: &[u8], target_path: &Path) -> Result<(), Installer
 
     // Extract all files
     for i in 0..archive.len() {
-        let mut file = archive.by_index(i).map_err(|e| {
-            InstallerError::System(format!("Failed to access file in ZIP: {e}"))
-        })?;
+        let mut file = archive
+            .by_index(i)
+            .map_err(|e| InstallerError::System(format!("Failed to access file in ZIP: {e}")))?;
 
         let file_path = match file.enclosed_name() {
             Some(path) => path.clone(),
@@ -370,11 +375,7 @@ fn extract_zip_data(zip_data: &[u8], target_path: &Path) -> Result<(), Installer
 
             // Sync to ensure data is written
             outfile.sync_all().map_err(|e| {
-                InstallerError::System(format!(
-                    "Failed to sync file {}: {}",
-                    out_path.display(),
-                    e
-                ))
+                InstallerError::System(format!("Failed to sync file {}: {}", out_path.display(), e))
             })?;
 
             // Set file permissions on Unix
@@ -452,9 +453,8 @@ pub(super) fn verify_code_signature(helper_path: &Path) -> Result<bool, Installe
     }
 
     // Check executable permissions (should be executable)
-    let metadata = std::fs::metadata(&executable).map_err(|e| {
-        InstallerError::System(format!("Failed to get executable metadata: {e}"))
-    })?;
+    let metadata = std::fs::metadata(&executable)
+        .map_err(|e| InstallerError::System(format!("Failed to get executable metadata: {e}")))?;
 
     #[cfg(unix)]
     {

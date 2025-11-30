@@ -27,6 +27,8 @@ use std::path::PathBuf;
 mod unix;
 #[cfg(unix)]
 pub use unix::*;
+#[cfg(target_os = "linux")]
+pub use unix::is_systemd_available as platform_is_systemd_available;
 
 #[cfg(windows)]
 mod windows;
@@ -73,6 +75,40 @@ pub fn running_under_service_manager() -> bool {
     platform_running_under_service_manager()
 }
 
+/// Detect if systemd is available as the init system
+///
+/// Returns true if systemd is PID 1, false on non-systemd Linux systems.
+/// Cached globally for performance.
+///
+/// # Platform Behavior
+///
+/// - **Linux**: Checks /run/systemd/system directory (official sd_booted method)
+/// - **macOS**: Always returns false (uses launchd)
+/// - **Windows**: Always returns false (uses Service Control Manager)
+///
+/// # Use Cases
+///
+/// - Installation: Decide whether to create .service files
+/// - Service control: Decide whether to use systemctl commands  
+/// - Detection: Show appropriate setup instructions to user
+#[cfg(unix)]
+pub fn is_systemd_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        platform_is_systemd_available()
+    }
+    
+    #[cfg(not(target_os = "linux"))]
+    {
+        false // macOS, FreeBSD, etc. don't use systemd
+    }
+}
+
+#[cfg(windows)]
+pub fn is_systemd_available() -> bool {
+    false // Windows uses Service Control Manager
+}
+
 /// Current process identifier
 ///
 /// - Unix: getpid()
@@ -92,6 +128,64 @@ pub fn is_process_running(pid: ProcessId) -> Result<bool, std::io::Error> {
     platform_is_process_running(pid)
 }
 
+/// Validate that a PID is within platform-specific valid range
+///
+/// Checks:
+/// - PID is positive (> 0) on Unix platforms  
+/// - PID does not exceed platform-specific maximum
+/// - On Linux: reads runtime /proc/sys/kernel/pid_max with fallback
+/// - On macOS: enforces 99,999 limit
+/// - On FreeBSD: uses kern.pid_max sysctl with fallback
+/// - On Windows: validates against zero and reasonable maximum
+///
+/// Returns:
+/// - Ok(()) if PID is valid
+/// - Err with detailed message if invalid
+///
+/// # Security
+/// This function prevents dangerous PID values from being used with kill() and other
+/// process APIs. It protects against:
+/// - Negative PIDs (process group signals)
+/// - Zero PID (kernel scheduler / current process group)
+/// - Out-of-range PIDs (corrupted or malicious PID files)
+///
+/// # Example
+/// ```no_run
+/// use kodegend::platform;
+///
+/// let pid = 12345;
+/// platform::validate_pid_range(pid)?;
+/// // PID is now safe to use with kill() or other APIs
+/// # Ok::<(), anyhow::Error>(())
+/// ```
+pub fn validate_pid_range(pid: ProcessId) -> Result<(), anyhow::Error> {
+    platform_validate_pid_range(pid)
+}
+
+/// Verify that a PID belongs to kodegend process
+///
+/// This prevents PID reuse attacks by checking:
+/// 1. Process exists (via is_process_running)
+/// 2. Process executable path contains "kodegend"
+///
+/// Uses sysinfo crate (already a dependency) for cross-platform process introspection.
+/// Pattern copied from service/port_cleanup.rs:128-172
+///
+/// # Arguments
+/// * `pid` - Process ID to verify
+///
+/// # Returns
+/// - `Ok(true)`: Process exists AND is kodegend
+/// - `Ok(false)`: Process doesn't exist OR is not kodegend (safe to proceed)
+/// - `Err`: System error (permission denied, etc.)
+///
+/// # Security
+/// This function is critical for preventing CVE-class PID reuse vulnerabilities.
+/// See task/05_daemon_pid_reuse_vulnerability.md for attack scenarios and CVE references.
+pub fn verify_kodegend_running(pid: ProcessId) -> Result<bool, std::io::Error> {
+    platform_verify_kodegend_running(pid)
+}
+
 /// System-wide configuration directory
 ///
 /// - Unix: /etc/kodegend
@@ -104,7 +198,7 @@ pub fn system_config_dir() -> PathBuf {
 ///
 /// - Unix: ~/.config/kodegen/kodegend
 /// - Windows: %APPDATA%\kodegen\kodegend
-/// 
+///
 /// Delegates to kodegen-config for base path, then appends 'kodegend' subdirectory
 pub fn user_config_dir() -> PathBuf {
     platform_user_config_dir()
@@ -128,6 +222,15 @@ pub fn runtime_dir(is_elevated: bool) -> PathBuf {
 /// - Windows (user): %LOCALAPPDATA%\kodegend\logs
 pub fn log_dir(is_elevated: bool) -> PathBuf {
     platform_log_dir(is_elevated)
+}
+
+/// Status socket path for daemon queries
+///
+/// - Unix (elevated): /var/run/kodegend/status.sock
+/// - Unix (user): $XDG_RUNTIME_DIR/kodegend/status.sock or /tmp/kodegend-{uid}/kodegend/status.sock
+/// - Windows: \\.\pipe\kodegend\status (named pipe, privilege-independent)
+pub fn status_socket_path(is_elevated: bool) -> PathBuf {
+    platform_status_socket_path(is_elevated)
 }
 
 // Signal handling abstraction

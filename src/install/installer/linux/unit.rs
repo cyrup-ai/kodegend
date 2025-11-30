@@ -164,18 +164,16 @@ pub(super) fn remove_systemd_unit(service_name: &str) -> Result<(), InstallerErr
     let unit_path = if unsafe { libc::getuid() } == 0 {
         PathBuf::from("/etc/systemd/system").join(format!("{}.service", service_name))
     } else {
-        let home_dir = std::env::var("HOME").map_err(|_| {
-            InstallerError::System("HOME environment variable not set".to_string())
-        })?;
+        let home_dir = std::env::var("HOME")
+            .map_err(|_| InstallerError::System("HOME environment variable not set".to_string()))?;
         PathBuf::from(home_dir)
             .join(".config/systemd/user")
             .join(format!("{}.service", service_name))
     };
 
     if unit_path.exists() {
-        fs::remove_file(&unit_path).map_err(|e| {
-            InstallerError::System(format!("Failed to remove unit file: {}", e))
-        })?;
+        fs::remove_file(&unit_path)
+            .map_err(|e| InstallerError::System(format!("Failed to remove unit file: {}", e)))?;
     }
 
     Ok(())

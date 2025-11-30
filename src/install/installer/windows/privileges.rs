@@ -5,9 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use once_cell::sync::{Lazy, OnceCell};
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
-use windows::Win32::Security::{TOKEN_ELEVATION, TOKEN_QUERY};
-use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows::Win32::Security::TOKEN_ELEVATION;
 
 use super::InstallerError;
 
@@ -22,17 +20,18 @@ const HELPER_EXE_DATA: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/Kodegen
 
 /// Check if we have sufficient privileges for service operations
 pub(super) fn check_privileges() -> Result<(), InstallerError> {
-    let mut token_handle: HANDLE = HANDLE::default();
+    use crate::platform::windows::TokenHandle;
+    
+    // Open current process token - handle auto-closed on drop
+    let token = TokenHandle::open_current_process_query()
+        .map_err(|_| InstallerError::PermissionDenied)?;
 
     unsafe {
-        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token_handle)
-            .map_err(|e| InstallerError::PermissionDenied)?;
-
         let mut elevation: TOKEN_ELEVATION = mem::zeroed();
         let mut return_length: u32 = 0;
 
         windows::Win32::Security::GetTokenInformation(
-            token_handle,
+            token.as_raw(),
             windows::Win32::Security::TokenElevation,
             Some(&mut elevation as *mut _ as *mut std::ffi::c_void),
             mem::size_of::<TOKEN_ELEVATION>() as u32,
@@ -40,12 +39,11 @@ pub(super) fn check_privileges() -> Result<(), InstallerError> {
         )
         .map_err(|_| InstallerError::PermissionDenied)?;
 
-        CloseHandle(token_handle);
-
         if elevation.TokenIsElevated == 0 {
             return Err(InstallerError::PermissionDenied);
         }
     }
+    // Token handle automatically closed here
 
     Ok(())
 }
@@ -53,9 +51,9 @@ pub(super) fn check_privileges() -> Result<(), InstallerError> {
 /// Ensure helper executable is extracted and available
 pub(super) fn ensure_helper_path() -> Result<(), InstallerError> {
     // Acquire lock FIRST (released automatically when _guard drops)
-    let _guard = HELPER_EXTRACTION_LOCK.lock().map_err(|e| {
-        InstallerError::System(format!("Failed to acquire extraction lock: {}", e))
-    })?;
+    let _guard = HELPER_EXTRACTION_LOCK
+        .lock()
+        .map_err(|e| InstallerError::System(format!("Failed to acquire extraction lock: {}", e)))?;
 
     // Double-check pattern: check again after acquiring lock
     if HELPER_PATH.get().is_some() {
@@ -81,9 +79,9 @@ pub(super) fn ensure_helper_path() -> Result<(), InstallerError> {
         .map_err(|e| InstallerError::System(format!("Failed to flush helper data: {}", e)))?;
 
     // Persist the temp file and get the path
-    let (_file, helper_path) = helper_file
-        .keep()
-        .map_err(|e| InstallerError::System(format!("Failed to persist helper executable: {}", e)))?;
+    let (_file, helper_path) = helper_file.keep().map_err(|e| {
+        InstallerError::System(format!("Failed to persist helper executable: {}", e))
+    })?;
 
     // Verify the helper is properly signed
     verify_helper_signature(&helper_path)?;

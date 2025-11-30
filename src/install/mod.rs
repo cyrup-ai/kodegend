@@ -6,6 +6,7 @@
 mod binaries;
 mod binary_staging;
 mod chromium;
+mod cleanup;
 mod cli;
 mod component_fixers;
 mod download;
@@ -27,26 +28,16 @@ pub use detection::{InstallationState, check_installation_state};
 pub use environment::{is_cli_environment, is_desktop_environment};
 
 // Public exports - Granular component system
+pub use component_fixers::{fix_all_components, fix_certificates, fix_hosts, fix_kodegen_version};
 pub use detection::{
-    ComponentStatus,
-    ComponentStatusReport,
-    ComponentFixResult,
-    InstallationFixReport,
-    check_all_components,
-    check_hosts_status,
-    check_certificates_status,
+    ComponentFixResult, ComponentStatus, ComponentStatusReport, InstallationFixReport,
+    check_all_components, check_certificates_status, check_hosts_status,
     check_kodegen_version_status,
-};
-pub use component_fixers::{
-    fix_hosts,
-    fix_certificates,
-    fix_kodegen_version,
-    fix_all_components,
 };
 
 // Re-export installer types and modules for internal use
 pub use installer::{InstallerBuilder, InstallerError};
-pub(crate) use installer::{core, config, uninstall};
+pub(crate) use installer::{config, core, uninstall};
 
 use anyhow::Result;
 use cli::Cli;
@@ -127,11 +118,11 @@ pub async fn ensure_installed_granular() -> Result<InstallationFixReport> {
 /// Called when user explicitly runs `kodegen_install` from command line.
 pub async fn install_interactive() -> Result<()> {
     let cli = Cli::parse_args();
-    
+
     if cli.is_uninstall() {
         return runners::run_uninstall(&cli).await;
     }
-    
+
     // Wizard or non-interactive based on CLI args
     if wizard::is_non_interactive(&cli) {
         runners::run_install(&cli).await

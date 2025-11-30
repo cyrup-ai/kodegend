@@ -8,11 +8,12 @@
 //! - Integration with kodegend's ServiceManager and ServiceStateMachine
 
 use anyhow::{Context, Result};
-use crossbeam_channel::{bounded, Sender};
+use crossbeam_channel::{Sender, bounded};
 use log::{error, info, warn};
 use std::ffi::OsString;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::runtime::Runtime;
 use windows_service::{
     define_windows_service,
     service::{
@@ -45,56 +46,116 @@ fn service_main(_arguments: Vec<OsString>) {
 
 /// Core service runtime implementation
 ///
-/// This function:
-/// 1. Registers the service control handler with SCM
-/// 2. Reports service status changes to SCM
-/// 3. Initializes and runs the ServiceManager
-/// 4. Handles graceful shutdown on Stop events
+/// This function implements the Windows service lifecycle:
+/// 1. Creates tokio runtime for async operations
+/// 2. Registers service control handler with SCM
+/// 3. Reports service status changes to SCM with appropriate wait_hint values
+/// 4. Initializes and runs ServiceManager in background task
+/// 5. Blocks on shutdown signal from SCM
+/// 6. Triggers graceful shutdown with 5-second timeout matching wait_hint
+/// 7. Handles timeout by logging error (SCM will force-kill after 30s total)
+/// 
+/// # SCM Interaction Protocol
+/// 
+/// Windows SCM requires specific status reporting sequence:
+/// - StartPending → Running: Must complete within wait_hint (3 seconds)
+/// - StopPending → Stopped: Must complete within wait_hint (5 seconds)
+/// - If wait_hint expires: SCM sends TerminateProcess (force-kill)
+/// 
+/// See: https://learn.microsoft.com/en-us/windows/win32/services/service-control-manager
 fn run_service() -> Result<()> {
+    // Create tokio runtime for async ServiceManager
+    // ServiceManager::run() is async, so we need a runtime to execute it
+    // Uses multi-threaded runtime (required for block_in_place in shutdown())
+    let rt = Runtime::new()
+        .context("Failed to create tokio runtime for Windows service")?;
+    
     // Create shutdown channel for coordinating service stop
+    // SCM sends stop events to control handler, which signals via this channel
     let (shutdown_tx, shutdown_rx) = bounded::<()>(1);
 
-    // Shared state for service lifecycle
+    // Shared state for service lifecycle tracking
+    // Used by control handler to update state when SCM sends control events
     let lifecycle = Arc::new(Mutex::new(ServiceLifecycle::Starting));
 
     // Register service control handler with SCM
+    // This handler receives SERVICE_CONTROL_STOP, PAUSE, etc. events
     let status_handle = register_service_handler(shutdown_tx.clone(), lifecycle.clone())?;
 
-    // Report service is starting
+    // Report service is starting (3-second wait_hint for initialization)
+    // SCM will wait up to 3 seconds for us to report Running status
     report_service_status(
         &status_handle,
         ServiceState::StartPending,
         Duration::from_secs(3),
-        0,
+        0,  // exit_code: 0 = success
     )?;
 
     info!("kodegend Windows service starting...");
 
-    // Initialize ServiceManager
-    // The ServiceManager will spawn and manage all MCP server processes
-    let service_manager = match ServiceManager::new() {
+    // Load configuration from standard Windows location
+    // Platform-specific paths: C:\ProgramData\kodegend or %APPDATA%\kodegend
+    let config_path = crate::platform::system_config_dir().join("kodegend.toml");
+    
+    // Load config with graceful fallback to defaults
+    // If config file missing/corrupt, use default config to ensure service starts
+    let config = if config_path.exists() {
+        match crate::config::ServiceConfig::load_from_file(&config_path) {
+            Ok(cfg) => {
+                info!("Loaded configuration from: {}", config_path.display());
+                cfg
+            }
+            Err(e) => {
+                warn!("Failed to load config from {} ({}), using defaults", 
+                    config_path.display(), e);
+                crate::config::ServiceConfig::default()
+            }
+        }
+    } else {
+        info!("No config file at {}, using defaults", config_path.display());
+        crate::config::ServiceConfig::default()
+    };
+
+    // Initialize ServiceManager with loaded config
+    // This creates worker channels and prepares for service startup
+    let service_manager = match ServiceManager::new(config) {
         Ok(mgr) => {
             info!("ServiceManager initialized successfully");
-            mgr
+            Arc::new(mgr)  // Wrap in Arc for shared ownership
         }
         Err(e) => {
             error!("Failed to initialize ServiceManager: {}", e);
+            // Report failure to SCM with exit code 1
             report_service_status(
                 &status_handle,
                 ServiceState::Stopped,
                 Duration::from_secs(0),
-                1,
+                1,  // exit_code: 1 = initialization failed
             )?;
             return Err(e.into());
         }
     };
 
-    // Update lifecycle state
+    // Clone Arc for background task
+    // Background task gets its own reference, caller keeps one for shutdown
+    let mgr_clone = Arc::clone(&service_manager);
+    
+    // Spawn ServiceManager::run() in background tokio task
+    // This allows the service thread to remain responsive to SCM control events
+    // run() consumes ServiceManager, which is why we need Arc
+    let run_handle = rt.spawn(async move {
+        if let Err(e) = mgr_clone.run().await {
+            error!("ServiceManager run() error: {}", e);
+        }
+    });
+
+    // Update lifecycle state to Running
     if let Ok(mut lc) = lifecycle.lock() {
         *lc = ServiceLifecycle::Running;
     }
 
-    // Report service is running
+    // Report service is running to SCM
+    // wait_hint = 0 means we're in steady state (no pending operations)
     report_service_status(
         &status_handle,
         ServiceState::Running,
@@ -104,19 +165,23 @@ fn run_service() -> Result<()> {
 
     info!("kodegend Windows service running");
 
-    // Block until shutdown signal received
+    // Block until shutdown signal received from SCM
+    // This keeps the service thread alive while ServiceManager runs in background
+    // Control handler sends () on this channel when SCM sends SERVICE_CONTROL_STOP
     if let Err(e) = shutdown_rx.recv() {
         warn!("Shutdown channel error: {}", e);
     }
 
     info!("kodegend Windows service stopping...");
 
-    // Update lifecycle state
+    // Update lifecycle state to Stopping
     if let Ok(mut lc) = lifecycle.lock() {
         *lc = ServiceLifecycle::Stopping;
     }
 
-    // Report service is stopping
+    // Report service is stopping with 5-second wait_hint
+    // SCM will wait 5 seconds for us to report Stopped status
+    // If we exceed 5 seconds, SCM may force-kill (but gives us until ~30s total)
     report_service_status(
         &status_handle,
         ServiceState::StopPending,
@@ -124,17 +189,50 @@ fn run_service() -> Result<()> {
         0,
     )?;
 
-    // Perform graceful shutdown of all MCP servers
-    if let Err(e) = service_manager.shutdown() {
-        error!("Error during ServiceManager shutdown: {}", e);
+    // Send shutdown signal to ServiceManager
+    // This triggers the run() loop to break and begin cleanup
+    if let Err(e) = service_manager.shutdown(Duration::from_secs(5)) {
+        error!("Failed to send shutdown signal: {}", e);
     }
 
-    // Update lifecycle state
+    // Wait for background task to complete with 5-second timeout
+    // Timeout MUST match wait_hint above to prevent SCM force-kill
+    // 
+    // Shutdown sequence in run() loop:
+    // 1. Receives shutdown signal on channel
+    // 2. Breaks from select! loop
+    // 3. Shuts down embedded HTTP servers
+    // 4. Sends Shutdown to all workers
+    // 5. Waits for worker termination
+    // 6. run() returns
+    // 
+    // If any step hangs, timeout triggers and we log error
+    match rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(5), run_handle).await
+    }) {
+        Ok(Ok(())) => {
+            info!("ServiceManager shutdown completed successfully");
+        }
+        Ok(Err(e)) => {
+            error!("ServiceManager task panicked: {}", e);
+        }
+        Err(_) => {
+            error!("ServiceManager shutdown timed out after 5 seconds");
+            error!("One or more MCP servers failed to stop gracefully");
+            error!("Windows SCM may force-kill this process in ~25 seconds");
+            // Note: We don't return error here - allow service to report Stopped
+            // SCM will force-kill if we exceed the 30-second absolute deadline
+            // Better to report Stopped cleanly than leave service in StopPending limbo
+        }
+    }
+
+    // Update lifecycle state to Stopped
     if let Ok(mut lc) = lifecycle.lock() {
         *lc = ServiceLifecycle::Stopped;
     }
 
-    // Report service stopped
+    // Report service stopped to SCM
+    // wait_hint = 0 means we're done (no more pending operations)
     report_service_status(
         &status_handle,
         ServiceState::Stopped,
@@ -189,7 +287,10 @@ fn register_service_handler(
                 ServiceControlHandlerResult::NotImplemented
             }
             _ => {
-                warn!("Received unsupported service control event: {:?}", control_event);
+                warn!(
+                    "Received unsupported service control event: {:?}",
+                    control_event
+                );
                 ServiceControlHandlerResult::NotImplemented
             }
         }

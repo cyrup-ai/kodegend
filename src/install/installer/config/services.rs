@@ -5,8 +5,8 @@
 
 use anyhow::Result;
 
-use super::super::core::{InstallContext, InstallProgress, ServiceConfig};
 use super::super::InstallerBuilder;
+use super::super::core::{InstallContext, InstallProgress, ServiceConfig};
 
 /// Configure services for the installer with optimized service configuration
 pub fn configure_services(context: &mut InstallContext, _auto_start: bool) -> Result<()> {
