@@ -72,6 +72,7 @@ pub fn build_installer_config(
 }
 
 /// Convert `ServiceConfig` to service definition with optimized conversion
+#[allow(dead_code)] // False positive: Called via build_installer_config() loop, consumed by all platform executors
 fn convert_to_service_definition(
     service: &ServiceConfig,
 ) -> Result<crate::config::ServiceDefinition> {

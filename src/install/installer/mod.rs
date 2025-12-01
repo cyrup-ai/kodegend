@@ -30,7 +30,7 @@ pub use error::InstallerError;
 use anyhow::Result;
 
 /// Install daemon asynchronously using platform-specific implementation
-pub async fn install_daemon_async(builder: InstallerBuilder) -> Result<(), InstallerError> {
+pub(crate) async fn install_daemon_async(builder: InstallerBuilder) -> Result<(), InstallerError> {
     #[cfg(target_os = "macos")]
     return macos::PlatformExecutor::install(builder);
 

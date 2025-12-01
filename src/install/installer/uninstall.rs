@@ -15,6 +15,7 @@ use super::config::remove_kodegen_host_entries;
 use super::fluent_voice;
 
 /// Uninstall Kodegen daemon with comprehensive cleanup
+#[allow(dead_code)] // Function IS used via install::uninstall re-export in runners.rs:run_uninstall()
 pub async fn uninstall_kodegen_daemon() -> Result<()> {
     info!("Starting Kodegen daemon uninstallation");
 
@@ -133,6 +134,7 @@ fn import_wildcard_certificate_linux(cert_path: &str) -> Result<()> {
 }
 
 /// Remove wildcard certificate from system trust store
+#[allow(dead_code)] // Function IS used at line 51, but compiler doesn't track async usage correctly
 async fn remove_wildcard_certificate_from_system() -> Result<()> {
     cfg_if::cfg_if! {
         if #[cfg(target_os = "macos")] {
@@ -148,6 +150,7 @@ async fn remove_wildcard_certificate_from_system() -> Result<()> {
 
 /// Remove wildcard certificate from macOS keychain
 #[cfg(target_os = "macos")]
+#[allow(dead_code)] // Used at line 140 via cfg_if!, but compiler doesn't track platform-specific usage
 async fn remove_wildcard_certificate_macos() -> Result<()> {
     info!("Removing Kodegen certificate from macOS System keychain");
 
@@ -206,6 +209,7 @@ async fn remove_wildcard_certificate_linux() -> Result<()> {
 }
 
 /// Clean up installation directories with comprehensive cleanup
+#[allow(dead_code)] // Function IS used at line 56, but compiler doesn't track usage correctly
 fn cleanup_installation_directories() -> Result<()> {
     let directories_to_remove = get_installation_directories();
 
@@ -227,6 +231,7 @@ fn cleanup_installation_directories() -> Result<()> {
 }
 
 /// Get list of installation directories to clean up
+#[allow(dead_code)] // Function IS used at line 211, but compiler doesn't track call chain correctly
 fn get_installation_directories() -> Vec<PathBuf> {
     vec![
         #[cfg(target_os = "macos")]

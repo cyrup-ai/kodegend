@@ -1,24 +1,6 @@
-//! Interactive installation wizard for `kodegen_install`
+//! Installation wizard display components for CLI progress
 
-use anyhow::Result;
-use inquire::Confirm;
 use std::path::PathBuf;
-
-/// Installation options gathered from interactive wizard
-#[derive(Debug, Clone)]
-pub struct InstallOptions {
-    pub dry_run: bool,
-    pub auto_start: bool,
-}
-
-impl Default for InstallOptions {
-    fn default() -> Self {
-        Self {
-            dry_run: false,
-            auto_start: true,
-        }
-    }
-}
 
 /// Results from actual installation (what was really installed)
 #[derive(Debug, Clone)]
@@ -32,8 +14,8 @@ pub struct InstallationResult {
     pub certificate_content: Option<String>,
 }
 
-/// Display welcome banner
-fn show_welcome() {
+/// Display welcome banner for CLI installation
+pub fn show_welcome_banner() {
     use std::io::Write;
     use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 
@@ -79,7 +61,7 @@ fn show_welcome() {
 }
 
 /// Display installation completion summary
-pub fn show_completion(_options: &InstallOptions, result: &InstallationResult) {
+pub fn show_completion(result: &InstallationResult) {
     use std::io::Write;
     use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 
@@ -182,82 +164,4 @@ pub fn show_completion(_options: &InstallOptions, result: &InstallationResult) {
         "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
     );
     let _ = stdout.reset();
-}
-
-/// Run interactive installation wizard
-pub fn run_wizard() -> Result<InstallOptions> {
-    show_welcome();
-
-    // Prompt 1: Dry-run mode
-    let dry_run = Confirm::new("Perform dry-run (preview changes without installing)?")
-        .with_default(false)
-        .with_help_message("Dry-run shows what would be installed without making changes")
-        .prompt()
-        .map_err(|e| anyhow::anyhow!("Prompt cancelled: {}", e))?;
-
-    // Prompt 2: Auto-start service
-    let auto_start = Confirm::new("Start service automatically after installation?")
-        .with_default(true)
-        .with_help_message("The daemon will start on system boot (systemd/launchd)")
-        .prompt()
-        .map_err(|e| anyhow::anyhow!("Prompt cancelled: {}", e))?;
-
-    // Show summary of selections
-    println!("\n📋 Installation Summary:");
-    println!(
-        "  • Dry-run mode: {}",
-        if dry_run {
-            "Yes (preview only)"
-        } else {
-            "No (will install)"
-        }
-    );
-    println!(
-        "  • Auto-start: {}",
-        if auto_start {
-            "Yes (on boot)"
-        } else {
-            "No (manual start)"
-        }
-    );
-    println!();
-
-    // Final confirmation before proceeding
-    let proceed = Confirm::new("Proceed with these settings?")
-        .with_default(true)
-        .prompt()
-        .map_err(|e| anyhow::anyhow!("Prompt cancelled: {}", e))?;
-
-    if !proceed {
-        return Err(anyhow::anyhow!("Installation cancelled by user"));
-    }
-
-    Ok(InstallOptions {
-        dry_run,
-        auto_start,
-    })
-}
-
-/// Check if running in non-interactive mode (CLI flags provided)
-///
-/// Returns true if the installer should skip the interactive wizard and run
-/// in automated CLI mode.
-///
-/// Non-interactive mode is triggered by:
-/// 1. Explicit `--no-interaction` flag (highest priority)
-/// 2. Automation-specific flags (`--dry-run` or `--uninstall`)
-///
-/// Priority reasoning:
-/// - `--no-interaction` always wins (explicit non-interactive command)
-/// - `--dry-run` and `--uninstall` are automation-focused operations
-pub fn is_non_interactive(cli: &super::cli::Cli) -> bool {
-    // Priority 1: Explicit non-interactive flag always takes precedence
-    if cli.no_interaction {
-        return true;
-    }
-
-    // Priority 2: Automation-specific flags only
-    // REMOVED: cli.no_start (affects WHAT, not HOW)
-    // REMOVED: cli.binary check (affects WHAT to install, not HOW to install)
-    cli.dry_run || cli.uninstall
 }

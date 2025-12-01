@@ -1,6 +1,6 @@
 [package]
 name = "kodegend"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 description = "KODEGEN.ᴀɪ: Memory-efficient, Blazing-Fast, MCP tools for code generation agents."
 authors = ["KODEGEN.ᴀɪ"]
@@ -92,10 +92,6 @@ zstd = "0.13"           # Zstd decompression (RPM)
 inquire = "0.9"
 indicatif = "0.18"
 
-# Plugin system support
-extism = "1"
-oci-client = "0.15"
-
 # async support (always enabled)
 async-process = { version = "2" }
 tokio = { version = "1", features = [
@@ -149,17 +145,16 @@ jwalk = "0.8"
 rayon = "1"
 walkdir = "2"
 
-# GUI installer dependencies (optional, feature-gated)
-eframe = { version = "0.33", optional = true }
-egui = { version = "0.33", optional = true }
-image = { version = "0.25", optional = true }
-opener = { version = "0.8", optional = true }
+# GUI installer dependencies (always enabled - runtime detection)
+eframe = { version = "0.33" }
+egui = { version = "0.33" }
+image = { version = "0.25" }
+opener = { version = "0.8" }
 
 [features]
 default = ["systemd-notify"]
 systemd-notify = ["systemd"]
 systemd = ["dep:systemd"]
-gui = ["eframe", "egui", "image", "opener"]
 
 # platform-specific deps
 [target.'cfg(target_os = "linux")'.dependencies]

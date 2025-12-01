@@ -87,8 +87,8 @@ impl PlatformExecutor {
             env_vars: &env_vec,
             auto_restart: b.auto_restart,
             wants_network: b.wants_network,
-            user: None, // Run as root for system service, or current user for user service
-            group: None,
+            user: Some(&b.run_as_user),
+            group: Some(&b.run_as_group),
         };
 
         // Generate and install systemd unit file

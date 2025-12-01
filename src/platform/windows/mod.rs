@@ -288,6 +288,19 @@ pub(super) fn platform_status_socket_path(_is_elevated: bool) -> PathBuf {
     PathBuf::from(r"\\.\pipe\kodegend\status")
 }
 
+/// Get the system's maximum PID value for Windows
+///
+/// Windows doesn't have a documented hard limit for PIDs, but uses DWORD (u32).
+/// We use a conservative maximum based on Linux's absolute limit.
+///
+/// # Returns
+/// Reasonable maximum PID value for Windows (4,194,304)
+pub(super) fn platform_get_system_pid_max() -> u32 {
+    // Windows doesn't have a documented hard limit, but use Linux max as conservative bound
+    // This prevents obviously corrupted PID files while allowing legitimate Windows PIDs
+    4_194_304
+}
+
 /// Platform-specific PID validation for Windows
 ///
 /// Validates that a PID is within the safe range for Windows.
@@ -302,7 +315,7 @@ pub(super) fn platform_status_socket_path(_is_elevated: bool) -> PathBuf {
 /// - Ok(()) if PID is valid and safe to use
 /// - Err with detailed error message if invalid
 pub(super) fn platform_validate_pid_range(pid: u32) -> Result<(), anyhow::Error> {
-    // Check for zero (while technically possible, practically invalid in PID file)
+    // Check 1: PID must not be zero (System Idle Process)
     if pid == 0 {
         bail!(
             "Invalid PID: 0 (System Idle Process)\n\
@@ -312,18 +325,17 @@ pub(super) fn platform_validate_pid_range(pid: u32) -> Result<(), anyhow::Error>
         );
     }
     
-    // Check against reasonable maximum
-    // Windows doesn't have a documented hard limit, but use Linux max as conservative bound
-    const WINDOWS_REASONABLE_MAX: u32 = 4_194_304;
+    // Check 2: Platform-specific maximum (detects corrupted PID files)
+    let max_pid = platform_get_system_pid_max();
     
-    if pid > WINDOWS_REASONABLE_MAX {
+    if pid > max_pid {
         bail!(
             "Invalid PID: {} exceeds reasonable maximum {}\n\
              \n\
              While Windows technically supports larger PIDs, this value\n\
              is suspiciously high and likely indicates corruption.",
             pid,
-            WINDOWS_REASONABLE_MAX
+            max_pid
         );
     }
     

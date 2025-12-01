@@ -8,7 +8,7 @@ use super::types::BinaryStatus;
 use super::window::InstallWindow;
 
 /// Show progress panel during installation
-pub fn show_progress_panel(window: &InstallWindow, ui: &mut egui::Ui) {
+pub(super) fn show_progress_panel(window: &InstallWindow, ui: &mut egui::Ui) {
     // Current step title (e.g., "Creating Directories", "Downloading Chromium")
     ui.label(
         egui::RichText::new(&window.current_step)
@@ -113,7 +113,7 @@ pub fn show_progress_panel(window: &InstallWindow, ui: &mut egui::Ui) {
 }
 
 /// Show completion panel when installation succeeds
-pub fn show_completion_panel(
+pub(super) fn show_completion_panel(
     window: &mut InstallWindow,
     ui: &mut egui::Ui,
     _frame: &mut eframe::Frame,
@@ -214,7 +214,7 @@ pub fn show_completion_panel(
 }
 
 /// Show error panel when installation fails
-pub fn show_error_panel(window: &InstallWindow, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+pub(super) fn show_error_panel(window: &InstallWindow, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
     // Error icon (large, prominent)
     ui.label(
         egui::RichText::new("❌")

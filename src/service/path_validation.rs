@@ -128,11 +128,11 @@ fn expand_tilde(path: &str) -> Result<String> {
         let home = dirs::home_dir()
             .ok_or_else(|| anyhow!("HOME directory not found"))?;
         Ok(home.to_string_lossy().to_string())
-    } else if path.starts_with("~/") {
+    } else if let Some(suffix) = path.strip_prefix("~/") {
         // Prefix match: ~/path → home/path
         let home = dirs::home_dir()
             .ok_or_else(|| anyhow!("HOME directory not found"))?;
-        Ok(home.join(&path[2..]).to_string_lossy().to_string())
+        Ok(home.join(suffix).to_string_lossy().to_string())
     } else {
         // No tilde - return as-is
         Ok(path.to_string())

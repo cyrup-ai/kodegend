@@ -184,6 +184,7 @@ pub const FORCE_KILL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Maximum attempts to verify force kill succeeded
 ///
 /// Poll 10 times at 100ms intervals = 1 second total verification period
+#[allow(dead_code)] // Reserved for future retry logic in force_kill_process
 pub const FORCE_KILL_MAX_ATTEMPTS: u32 = 10;
 
 // ============================================================================
@@ -263,9 +264,14 @@ pub const TIME_WAIT_TOLERANCE_DELAY: Duration = Duration::from_millis(500);
 // HELPER FUNCTIONS
 // ============================================================================
 
-/// Get the range of standard file descriptors (stdin, stdout, stderr)
-pub const fn standard_fds() -> std::ops::RangeInclusive<i32> {
-    STDIN_FD..=STDERR_FD
+/// Get the array of standard file descriptors (stdin, stdout, stderr)
+///
+/// Returns file descriptors in canonical order: stdin (0), stdout (1), stderr (2).
+/// Used during daemonization to redirect standard streams to /dev/null.
+///
+/// Reference: Stevens APUE §13.3 - Daemon Conventions
+pub const fn standard_fds() -> [i32; 3] {
+    [STDIN_FD, STDOUT_FD, STDERR_FD]
 }
 
 /// Calculate total maximum time for port cleanup with retries

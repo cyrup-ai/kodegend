@@ -12,51 +12,67 @@ const PLIST_PATH: &str = "/Library/LaunchDaemons/kodegend.plist";
 
 /// Check if daemon is running via launchctl list
 ///
-/// Returns: Ok(true) if service is loaded and running, Ok(false) otherwise
-pub async fn check_status() -> Result<bool> {
+/// Returns: Ok(ServiceStatus) with PID information when running
+///
+/// Uses defense-in-depth strategy:
+/// 1. Try launchd/launchctl first (authoritative service manager)
+/// 2. Fall back to PID file validation if launchctl unavailable or fails
+pub async fn check_status() -> Result<crate::daemon::ServiceStatus> {
+    use crate::daemon::ServiceStatus;
+    
     let cmd_display = format!("launchctl list {}", SERVICE_LABEL);
+    debug!("Checking daemon status: {}", cmd_display);
     
-    // Log at DEBUG level - only visible with RUST_LOG=debug
-    debug!("Executing: {}", cmd_display);
-    
-    let output = Command::new("launchctl")
+    let result = Command::new("launchctl")
         .args(["list", SERVICE_LABEL])
         .output()
-        .await
-        .with_context(|| format!("Failed to execute: {}", cmd_display))?;
-
-    // launchctl list returns:
-    // - Exit 0 if service is loaded (may be running or stopped)
-    // - Exit 1 if service not found
-
-    if !output.status.success() {
-        info!("Daemon is not loaded");
-        return Ok(false); // Service not loaded
-    }
-
-    // Parse output to check if PID exists
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    // Output format: "PID\tStatus\tLabel"
-    // If PID is "-", service is loaded but not running
-    // If PID is a number, service is running
-    for line in stdout.lines() {
-        if line.contains(SERVICE_LABEL) {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if let Some(pid) = parts.first() {
-                let is_running = *pid != "-";
-                if is_running {
-                    info!("Daemon is running");
-                } else {
-                    info!("Daemon is loaded but not running");
+        .await;
+    
+    match result {
+        Ok(output) if output.status.success() => {
+            // Service is loaded in launchd - parse PID from output
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            
+            for line in stdout.lines() {
+                if line.contains(SERVICE_LABEL) {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if let Some(pid_str) = parts.first() {
+                        if *pid_str == "-" {
+                            // launchctl shows loaded but not running
+                            info!("Daemon is loaded but not running (verified by launchd)");
+                            return Ok(ServiceStatus::Stopped);
+                        } else if let Ok(pid) = pid_str.parse::<crate::platform::ProcessId>() {
+                            // PIDs match - daemon is genuinely running
+                            info!("Daemon running with PID {} (verified by launchd)", pid);
+                            return Ok(ServiceStatus::Running { pid });
+                        } else {
+                            // Failed to parse PID - fall back to PID file
+                            warn!("Failed to parse PID '{}' from launchctl, using PID file fallback", pid_str);
+                            let pid_file = crate::control::generic_control::pid_file_path();
+                            return crate::daemon::get_service_status(&pid_file);
+                        }
+                    }
                 }
-                return Ok(is_running);
             }
+            
+            // No matching line found - service might not be loaded properly
+            info!("Service loaded but status unclear, checking PID file");
+            let pid_file = crate::control::generic_control::pid_file_path();
+            crate::daemon::get_service_status(&pid_file)
+        }
+        Ok(_output) => {
+            // launchctl returned non-zero (service not loaded)
+            info!("Service not loaded, checking PID file for stale entries");
+            let pid_file = crate::control::generic_control::pid_file_path();
+            crate::daemon::get_service_status(&pid_file)
+        }
+        Err(e) => {
+            // launchctl command failed - use PID file fallback
+            warn!("launchctl failed ({}), using PID file fallback", e);
+            let pid_file = crate::control::generic_control::pid_file_path();
+            crate::daemon::get_service_status(&pid_file)
         }
     }
-
-    info!("Daemon is stopped");
-    Ok(false)
 }
 
 /// Start daemon via launchctl
@@ -66,9 +82,34 @@ pub async fn check_status() -> Result<bool> {
 /// Uses modern bootstrap + kickstart with legacy load fallback
 pub async fn start_daemon() -> Result<()> {
     // Layer 1: Check if already running (fast path)
-    if check_status().await? {
+    let status = check_status().await?;
+    
+    if status.is_running() {
         debug!("Service already running - idempotent success");
         return Ok(());
+    }
+    
+    // Handle cleanup cases before starting
+    if status.needs_cleanup() {
+        match status {
+            crate::daemon::ServiceStatus::StaleFile { pid } => {
+                warn!("Found stale PID file (PID: {}), will clean up and start", pid);
+                // PID file will be overwritten when we start
+            }
+            crate::daemon::ServiceStatus::InvalidFile { error } => {
+                warn!("Found invalid PID file ({}), will clean up and start", error);
+                // PID file will be overwritten when we start
+            }
+            crate::daemon::ServiceStatus::Zombie { pid } => {
+                warn!("Found zombie process (PID: {}), force killing before start", pid);
+                // Use existing port_cleanup infrastructure to force kill zombie
+                crate::service::port_cleanup::force_kill_process(pid as u32).await
+                    .context("Failed to force kill zombie process")?;
+                info!("Zombie process {} killed, proceeding with start", pid);
+                // PID file will be overwritten when we start
+            }
+            _ => {} // Unreachable due to needs_cleanup() check
+        }
     }
     
     // Layer 2: Start the service
@@ -153,10 +194,35 @@ pub async fn start_daemon() -> Result<()> {
 /// Uses modern kill + bootout with legacy unload fallback
 pub async fn stop_daemon() -> Result<()> {
     // Layer 1: Check if already stopped (fast path)
-    if !check_status().await? {
-        debug!("Service already stopped - idempotent success");
-        return Ok(());
+    let status = check_status().await?;
+    
+    // If not running, handle based on the specific status
+    if !status.is_running() {
+        match status {
+            crate::daemon::ServiceStatus::Stopped => {
+                debug!("Service already stopped - idempotent success");
+                return Ok(());
+            }
+            crate::daemon::ServiceStatus::StaleFile { pid } => {
+                debug!("Service already stopped (stale PID file: {})", pid);
+                return Ok(());
+            }
+            crate::daemon::ServiceStatus::InvalidFile { error } => {
+                debug!("Service already stopped (invalid PID file: {})", error);
+                return Ok(());
+            }
+            crate::daemon::ServiceStatus::Zombie { pid } => {
+                warn!("Found zombie process (PID: {}), force killing to clean up", pid);
+                crate::service::port_cleanup::force_kill_process(pid as u32).await
+                    .context("Failed to force kill zombie process")?;
+                info!("Zombie process {} cleaned up", pid);
+                return Ok(());
+            }
+            _ => {} // Unreachable - all non-running states handled above
+        }
     }
+    
+    // Service is running, continue to stop the service
     
     // Layer 2: Stop the service
     // Try to kill the service first (graceful shutdown with SIGTERM)
@@ -168,14 +234,14 @@ pub async fn stop_daemon() -> Result<()> {
         .output()
         .await;
     
-    if let Ok(output) = kill_result {
-        if output.status.success() {
-            debug!("Sent SIGTERM to service");
-        }
+    if let Ok(output) = kill_result
+        && output.status.success()
+    {
+        debug!("Sent SIGTERM to service");
     }
 
     // Give it a moment to shutdown gracefully
-    sleep(Duration::from_millis(500)).await;
+    sleep(POST_SIGTERM_DELAY).await;
 
     // Then bootout to unload it
     let bootout_cmd = format!("launchctl bootout system {}", PLIST_PATH);
@@ -250,8 +316,18 @@ async fn wait_for_stopped(timeout: Duration) -> Result<()> {
     loop {
         // Check if already stopped
         match check_status().await {
-            Ok(false) => return Ok(()), // Stopped successfully
-            Ok(true) => {
+            Ok(status) => {
+                // If not running, we're done (either stopped cleanly or needs cleanup)
+                if !status.is_running() {
+                    // Handle zombie case specially - force kill it
+                    if let crate::daemon::ServiceStatus::Zombie { pid } = status {
+                        log::warn!("Daemon is zombie (PID: {}), force killing", pid);
+                        crate::service::port_cleanup::force_kill_process(pid as u32).await
+                            .context("Failed to force kill zombie during wait_for_stopped")?;
+                    }
+                    return Ok(()); // Stopped successfully (or cleaned up)
+                }
+                
                 // Still running, continue waiting
                 if start_time.elapsed() > timeout {
                     anyhow::bail!(
@@ -301,8 +377,19 @@ async fn wait_for_active(timeout: Duration) -> Result<()> {
     loop {
         // Check if active
         match check_status().await {
-            Ok(true) => return Ok(()), // Active successfully
-            Ok(false) => {
+            Ok(status) => {
+                // If running, we're done
+                if status.is_running() {
+                    return Ok(()); // Active successfully
+                }
+                
+                // Handle zombie case specially - force kill it before continuing
+                if let crate::daemon::ServiceStatus::Zombie { pid } = status {
+                    log::warn!("Found zombie process (PID: {}) while waiting for active, force killing", pid);
+                    crate::service::port_cleanup::force_kill_process(pid as u32).await
+                        .context("Failed to force kill zombie during wait_for_active")?;
+                }
+                
                 // Not running yet, continue waiting
                 if start_time.elapsed() > timeout {
                     anyhow::bail!(

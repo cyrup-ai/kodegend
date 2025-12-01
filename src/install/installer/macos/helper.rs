@@ -16,13 +16,16 @@ use zip::ZipArchive;
 use super::InstallerError;
 
 // Global helper path - initialized once, used everywhere
+#[allow(dead_code)]
 pub(super) static HELPER_PATH: OnceCell<PathBuf> = OnceCell::new();
 
 // Embedded ZIP data for the signed helper app
 // This is generated at build time by build.rs which creates a proper signed macOS helper
+#[allow(dead_code)] // Used on macOS but appears unused during cross-platform checks
 const APP_ZIP_DATA: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/KodegenHelper.app.zip"));
 
 /// Ensure the helper path is initialized for secure privileged operations
+#[allow(dead_code)] // Used on macOS but appears unused during cross-platform checks
 pub(super) fn ensure_helper_path() -> Result<(), InstallerError> {
     if HELPER_PATH.get().is_none() {
         let helper_path = extract_helper_app()?;
@@ -34,6 +37,7 @@ pub(super) fn ensure_helper_path() -> Result<(), InstallerError> {
 }
 
 /// Extract the signed helper app from embedded data
+#[allow(dead_code)] // Called from ensure_helper_path(), appears unused in cross-platform checks
 fn extract_helper_app() -> Result<PathBuf, InstallerError> {
     // Create lock file (stable location)
     let lock_path = std::env::temp_dir()
@@ -104,6 +108,7 @@ fn extract_helper_app() -> Result<PathBuf, InstallerError> {
 }
 
 /// Extract helper from embedded `APP_ZIP_DATA` with zero-allocation validation
+#[allow(dead_code)] // Called from extract_helper_app() at line 100, appears unused in cross-platform checks
 fn extract_from_embedded_data(helper_path: &PathBuf) -> Result<bool, InstallerError> {
     // Atomic validation state tracking (0=pending, 1=size_valid, 2=header_valid, 3=extraction_complete)
     static VALIDATION_STATE: AtomicU8 = AtomicU8::new(0);
@@ -211,6 +216,7 @@ fn extract_from_embedded_data(helper_path: &PathBuf) -> Result<bool, InstallerEr
 }
 
 /// Zero-allocation ZIP central directory validation using pointer arithmetic
+#[allow(dead_code)] // Called from extract_from_embedded_data() at line 143, appears unused in cross-platform checks
 fn validate_zip_central_directory() -> Result<(), &'static str> {
     const EOCD_SIGNATURE: u32 = 0x06054b50; // End of Central Directory signature
     const EOCD_MIN_SIZE: usize = 22;
@@ -299,6 +305,7 @@ fn validate_zip_central_directory() -> Result<(), &'static str> {
 }
 
 /// Extract ZIP data to the specified path
+#[allow(dead_code)] // Called from extract_from_embedded_data() at line 160, appears unused in cross-platform checks
 fn extract_zip_data(zip_data: &[u8], target_path: &Path) -> Result<(), InstallerError> {
     // Create a cursor for the ZIP data
     let cursor = Cursor::new(zip_data);
@@ -400,6 +407,7 @@ fn extract_zip_data(zip_data: &[u8], target_path: &Path) -> Result<(), Installer
 }
 
 /// Validate that the helper app is properly signed and functional
+#[allow(dead_code)] // Called at lines 81 and 165, appears unused in cross-platform checks
 pub(super) fn validate_helper(helper_path: &Path) -> Result<bool, InstallerError> {
     // Check if the helper exists and has the expected structure
     let contents = helper_path.join("Contents");
@@ -432,6 +440,7 @@ pub(super) fn validate_helper(helper_path: &Path) -> Result<bool, InstallerError
 }
 
 /// Verify the code signature of the helper app using Tauri-compatible validation
+#[allow(dead_code)] // Called at lines 82 and 184, appears unused in cross-platform checks
 pub(super) fn verify_code_signature(helper_path: &Path) -> Result<bool, InstallerError> {
     // Use Tauri's signing verification approach - check for valid bundle structure
     // and signature presence without manual codesign calls

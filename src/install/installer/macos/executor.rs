@@ -4,11 +4,12 @@ use std::{io::Write, process::Command};
 
 use anyhow::Context;
 
-use super::{CommandBuilder, InstallerError};
+use super::{InstallerError, command_builder::CommandBuilder};
 
 use super::helper::{HELPER_PATH, verify_code_signature};
 
 /// Execute script using the signed helper app with elevated privileges
+#[allow(dead_code)]
 pub(super) fn run_helper(script: &str) -> Result<(), InstallerError> {
     // Get the helper path
     let helper_path = HELPER_PATH
@@ -119,6 +120,7 @@ pub(super) fn run_osascript(script: &str) -> Result<(), InstallerError> {
 }
 
 /// Convert a CommandBuilder into a shell script fragment
+#[allow(dead_code)]
 pub(super) fn command_to_script(cmd: &CommandBuilder) -> String {
     let mut parts = vec![cmd.program.to_string_lossy().to_string()];
     parts.extend(cmd.args.iter().cloned());

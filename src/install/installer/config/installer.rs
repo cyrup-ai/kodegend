@@ -19,6 +19,7 @@ use super::toolchain::{ensure_rust_toolchain, verify_rust_toolchain_file};
 use crate::install::wizard::InstallationResult;
 
 /// Configure and install the Kodegen daemon with optimized installation flow
+#[allow(dead_code)]
 pub async fn install_kodegen_daemon(
     exe_path: PathBuf,
     config_path: PathBuf,
@@ -77,7 +78,8 @@ pub async fn install_kodegen_daemon(
                 ctx
             })
             .map_err(|e: anyhow::Error| anyhow::anyhow!("Installation pipeline failed: {e}"))
-            .await?
+            .await
+            .map_err(|_| anyhow::anyhow!("Installation channel closed unexpectedly"))??
     };
 
     let mut context = result_context;
@@ -121,7 +123,7 @@ pub async fn install_kodegen_daemon(
     }
 
     // Determine actual service path
-    let service_path = get_service_path(&context);
+    let service_path = get_service_path();
 
     context.send_critical_progress(InstallProgress::complete(
         "installation".to_string(),
@@ -143,7 +145,7 @@ pub async fn install_kodegen_daemon(
 }
 
 /// Determine the platform-specific service file path (always system-wide for system daemons)
-fn get_service_path(_context: &InstallContext) -> PathBuf {
+fn get_service_path() -> PathBuf {
     #[cfg(target_os = "macos")]
     {
         PathBuf::from("/Library/LaunchDaemons/com.kodegen.daemon.plist")

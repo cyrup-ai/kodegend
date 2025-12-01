@@ -3,6 +3,7 @@
 //! This module creates a Linux helper executable that can be embedded
 //! into the main binary for cross-platform deployment.
 
+use crate::cli_output;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -17,7 +18,7 @@ pub fn build_and_sign_helper() -> Result<(), Box<dyn std::error::Error>> {
 
     // Sign executable (optional but recommended)
     if let Err(e) = sign_executable(&exe_path) {
-        eprintln!("Warning: Failed to sign Linux helper executable: {}", e);
+        cli_output::warning(&format!("Failed to sign Linux helper executable: {}", e));
     }
 
     // Generate integrity hash for embedding

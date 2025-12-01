@@ -8,6 +8,7 @@ use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
+use super::super::cleanup::InstallationCleanupContext;
 use super::super::wizard::InstallationResult;
 use crate::install::core::InstallProgress;
 
@@ -15,9 +16,7 @@ use super::types::INSTALL_TIMEOUT;
 use super::window::InstallWindow;
 
 /// Run GUI installation with progress window
-pub async fn run_gui_installation(
-    cli: &super::super::cli::Cli,
-) -> anyhow::Result<InstallationResult> {
+pub async fn run_gui_installation() -> anyhow::Result<InstallationResult> {
     let mut stdout = StandardStream::stdout(ColorChoice::Always);
     let _ = stdout.set_color(ColorSpec::new().set_fg(Some(Color::Cyan)));
     let _ = writeln!(stdout, "🎨 Launching GUI installer...");
@@ -30,17 +29,23 @@ pub async fn run_gui_installation(
     let (result_tx, mut result_rx) = oneshot::channel();
 
     // Spawn installation in background tokio task
-    let cli_clone = cli.clone();
     tokio::spawn(async move {
+        // Create cleanup context for RAII cleanup on failure
+        let mut cleanup_ctx = InstallationCleanupContext::new();
+        
         // Download all binaries from GitHub with progress reporting
-        let binary_paths = match crate::install::download::download_all_binaries(tx.clone()).await {
-            Ok(paths) => paths,
+        let (binary_paths, _download_dir) = match crate::install::download::download_all_binaries(tx.clone()).await {
+            Ok(paths) => {
+                cleanup_ctx.downloaded_binaries_dir = Some(paths.1.clone());
+                paths
+            }
             Err(e) => {
                 let _ = tx.try_send(InstallProgress::error(
                     "binary_download".to_string(),
                     format!("Failed to download binaries: {}", e),
                 ));
                 let _ = result_tx.send(Err(e));
+                // Drop will automatically clean up
                 return;
             }
         };
@@ -60,6 +65,7 @@ pub async fn run_gui_installation(
                 format!("Failed to install binaries: {}", e),
             ));
             let _ = result_tx.send(Err(e));
+            // Drop will automatically clean up
             return;
         }
 
@@ -93,12 +99,11 @@ pub async fn run_gui_installation(
         // Get config path (platform-specific)
         let config_path = crate::platform::user_config_dir().join("config.toml");
 
-        // Run daemon installation (function already accepts progress channel!)
-        let auto_start = !cli_clone.no_start;
+        // Run daemon installation (always auto_start)
         let install_result = crate::install::config::install_kodegen_daemon(
             kodegend_path,
             config_path,
-            auto_start,
+            true, // Always auto_start
             Some(tx.clone()), // Progress updates flow through this channel
         )
         .await;
@@ -109,6 +114,9 @@ pub async fn run_gui_installation(
                 "complete".to_string(),
                 "Installation finished successfully".to_string(),
             ));
+            
+            // Defuse cleanup context - installation succeeded
+            cleanup_ctx.defuse();
         }
 
         // Send final result to main thread

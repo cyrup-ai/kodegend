@@ -6,6 +6,7 @@
 use anyhow::Result;
 use std::path::PathBuf;
 
+use super::cleanup::InstallationCleanupContext;
 use super::detection::{ComponentFixResult, ComponentStatus};
 #[cfg(unix)]
 use super::privilege::PrivilegedExecutor;
@@ -219,6 +220,9 @@ pub async fn fix_kodegen_version(executor: &mut PrivilegedExecutor) -> Component
         }
     }
 
+    // Create cleanup context for RAII cleanup on failure
+    let mut cleanup_ctx = InstallationCleanupContext::new();
+
     // Step 1: Download binary (unprivileged)
     let (tx, mut rx) = mpsc::channel(100);
 
@@ -229,8 +233,12 @@ pub async fn fix_kodegen_version(executor: &mut PrivilegedExecutor) -> Component
     });
 
     let binary_paths = match download::download_all_binaries(tx).await {
-        Ok((paths, _download_dir)) => paths,
+        Ok((paths, download_dir)) => {
+            cleanup_ctx.downloaded_binaries_dir = Some(download_dir);
+            paths
+        }
         Err(e) => {
+            // Drop will automatically clean up any registered resources
             return ComponentFixResult {
                 component: "kodegen_version",
                 success: false,
@@ -253,8 +261,12 @@ pub async fn fix_kodegen_version(executor: &mut PrivilegedExecutor) -> Component
 
     // Step 2: Stage binaries (unprivileged)
     let staging_dir = match binary_staging::stage_binaries_for_install(&binary_paths).await {
-        Ok(dir) => dir,
+        Ok(dir) => {
+            cleanup_ctx.staging_dir = Some(dir.clone());
+            dir
+        }
         Err(e) => {
+            // Drop will automatically clean up download_dir
             return ComponentFixResult {
                 component: "kodegen_version",
                 success: false,
@@ -311,11 +323,67 @@ pub async fn fix_kodegen_version(executor: &mut PrivilegedExecutor) -> Component
     let _ = std::fs::remove_dir_all(&staging_dir);
 
     log::info!("Kodegen binary installed to /usr/local/bin");
+    
+    // Defuse cleanup context - installation succeeded
+    cleanup_ctx.defuse();
+
     ComponentFixResult {
         component: "kodegen_version",
         success: true,
         error: None,
         required_sudo: true,
+    }
+}
+
+/// Fix Rust toolchain using shared privileged executor
+///
+/// Ensures Rust nightly toolchain is installed without changing user's default.
+/// This is required for building kodegen from source.
+#[cfg(unix)]
+pub async fn fix_toolchain(_executor: &mut PrivilegedExecutor) -> ComponentFixResult {
+    use super::installer::config::toolchain::{ensure_rust_toolchain, verify_rust_toolchain_file};
+
+    log::info!("Checking Rust toolchain...");
+
+    // First verify rust-toolchain.toml exists
+    if let Err(e) = verify_rust_toolchain_file() {
+        log::warn!("rust-toolchain.toml verification failed: {}", e);
+        // This is non-fatal - the file should exist in the repo
+        // but we can still install the toolchain
+    }
+
+    // Ensure nightly toolchain is available
+    match ensure_rust_toolchain().await {
+        Ok(()) => {
+            log::info!("Rust toolchain: verified");
+            ComponentFixResult {
+                component: "toolchain",
+                success: true,
+                error: None,
+                required_sudo: false, // rustup doesn't require sudo
+            }
+        }
+        Err(e) => {
+            log::error!("Failed to ensure Rust toolchain: {}", e);
+            ComponentFixResult {
+                component: "toolchain",
+                success: false,
+                error: Some(e.to_string()),
+                required_sudo: false,
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub async fn fix_toolchain(_executor: &mut PrivilegedExecutor) -> ComponentFixResult {
+    // TODO: Implement Windows toolchain installation
+    log::warn!("Toolchain verification not yet implemented for Windows");
+    ComponentFixResult {
+        component: "toolchain",
+        success: true,
+        error: None,
+        required_sudo: false,
     }
 }
 
@@ -331,6 +399,7 @@ pub async fn fix_all_components() -> Result<super::detection::InstallationFixRep
     if status.all_ok() {
         log::info!("All installation components verified OK");
         return Ok(super::detection::InstallationFixReport {
+            toolchain: None,
             hosts: None,
             certificates: None,
             kodegen_version: None,
@@ -344,6 +413,7 @@ pub async fn fix_all_components() -> Result<super::detection::InstallationFixRep
     );
 
     let mut report = super::detection::InstallationFixReport {
+        toolchain: None,
         hosts: None,
         certificates: None,
         kodegen_version: None,
@@ -357,6 +427,25 @@ pub async fn fix_all_components() -> Result<super::detection::InstallationFixRep
     } else {
         None
     };
+
+    // Fix toolchain FIRST if needed (FAIL-FAST) - required for building
+    // Note: toolchain fix doesn't require sudo (rustup runs as user)
+    if status.toolchain != ComponentStatus::Ok {
+        log::info!("Fixing toolchain (status: {:?})...", status.toolchain);
+        let result = if let Some(ref mut exec) = executor {
+            fix_toolchain(exec).await
+        } else {
+            // Create a temporary executor for toolchain (spawns without sudo prompts if not needed)
+            let mut temp_exec = PrivilegedExecutor::spawn().await?;
+            fix_toolchain(&mut temp_exec).await
+        };
+        let success = result.success;
+        report.toolchain = Some(result);
+        if !success {
+            report.overall_success = false;
+            return Ok(report);
+        }
+    }
 
     // Fix hosts if needed (FAIL-FAST)
     if status.hosts != ComponentStatus::Ok {
@@ -433,6 +522,7 @@ pub async fn fix_all_components() -> Result<super::detection::InstallationFixRep
 pub async fn fix_all_components() -> Result<super::detection::InstallationFixReport> {
     // Windows implementation would go here
     Ok(super::detection::InstallationFixReport {
+        toolchain: None,
         hosts: None,
         certificates: None,
         kodegen_version: None,

@@ -52,6 +52,10 @@ pub struct ServiceManager {
     workers: HashMap<String, Sender<Cmd>>,
     pending_restarts: HashMap<String, RestartState>,
 
+    /// Vulnerability scanner for periodic security audits
+    /// Enabled via config.security.enable_vulnerability_scanning
+    vulnerability_scanner: Option<Arc<crate::security::audit::VulnerabilityScanner>>,
+
     /// Restart policies per service (loaded from config)
     /// Allows per-service policy customization
     restart_policies: HashMap<String, crate::config::RestartPolicy>,
@@ -78,6 +82,13 @@ pub struct ServiceManager {
     /// Uses crossbeam channel (bounded, size 1) for compatibility with existing
     /// select! macro infrastructure. Sender is exposed via shutdown() method.
     shutdown_rx: Receiver<()>,
+    /// Sender half of shutdown channel - used by shutdown() method on Windows
+    /// 
+    /// On Unix platforms, shutdown is triggered via OS signals (SIGTERM/SIGINT)
+    /// which are handled directly in the run() loop. The shutdown_tx is only
+    /// used on Windows where the Service Control Manager needs a programmatic
+    /// way to trigger graceful shutdown.
+    #[cfg_attr(not(windows), allow(dead_code))]
     shutdown_tx: Sender<()>,
 }
 
@@ -155,6 +166,26 @@ impl ServiceManager {
             }
         }
 
+        // Initialize vulnerability scanner if enabled in config
+        let vulnerability_scanner = if cfg_read.security.enable_vulnerability_scanning.unwrap_or(false) {
+            let thresholds = crate::security::audit::AuditThresholds::new(
+                cfg_read.security.vulnerability_thresholds.critical_max.unwrap_or(0),
+                cfg_read.security.vulnerability_thresholds.high_max.unwrap_or(2),
+                cfg_read.security.vulnerability_thresholds.medium_max.unwrap_or(10),
+                cfg_read.security.vulnerability_thresholds.low_max.unwrap_or(50),
+            );
+            info!("Vulnerability scanning enabled with thresholds: critical={}, high={}, medium={}, low={}",
+                cfg_read.security.vulnerability_thresholds.critical_max.unwrap_or(0),
+                cfg_read.security.vulnerability_thresholds.high_max.unwrap_or(2),
+                cfg_read.security.vulnerability_thresholds.medium_max.unwrap_or(10),
+                cfg_read.security.vulnerability_thresholds.low_max.unwrap_or(50),
+            );
+            Some(Arc::new(crate::security::audit::VulnerabilityScanner::new(thresholds)))
+        } else {
+            info!("Vulnerability scanning disabled (enable via config.security.enable_vulnerability_scanning)");
+            None
+        };
+
         drop(cfg_read); // Release read lock
 
         // Initialize shutdown coordination channel
@@ -166,6 +197,7 @@ impl ServiceManager {
             bus_rx,
             workers,
             pending_restarts: HashMap::new(),
+            vulnerability_scanner,
             restart_policies,
             last_state: HashMap::new(),
             lifecycle: Lifecycle::default(),
@@ -566,6 +598,10 @@ impl ServiceManager {
         let watchdog_tick = tick(Duration::from_secs(15)); // WatchdogSec/2
         let log_rotate_tick = tick(Duration::from_secs(3600));
         let restart_tick = tick(Duration::from_millis(100));
+        
+        // Vulnerability scan ticker - default 1 hour, configurable via security.vulnerability_scan_interval_secs
+        let vuln_scan_interval = self.config.read().security.vulnerability_scan_interval_secs.unwrap_or(3600);
+        let vuln_scan_tick = tick(Duration::from_secs(vuln_scan_interval));
 
         loop {
             select! {
@@ -672,6 +708,12 @@ impl ServiceManager {
                     // Process pending restarts
                     self.process_pending_restarts();
                 }
+                recv(vuln_scan_tick) -> _ => {
+                    // Run vulnerability scan if scanner is enabled
+                    if let Some(scanner) = &self.vulnerability_scanner {
+                        self.run_vulnerability_scan(scanner.clone()).await;
+                    }
+                }
             }
             
             // Handle status queries (Unix only)
@@ -679,10 +721,10 @@ impl ServiceManager {
             if let Some(ref rx) = socket_rx {
                 select! {
                     recv(rx) -> stream => {
-                        if let Ok(stream) = stream {
-                            if let Err(e) = self.handle_status_query(stream) {
-                                error!("Error handling status query: {}", e);
-                            }
+                        if let Ok(stream) = stream
+                            && let Err(e) = self.handle_status_query(stream)
+                        {
+                            error!("Error handling status query: {}", e);
                         }
                     }
                 }
@@ -783,6 +825,18 @@ impl ServiceManager {
                     );
                 }
             }
+            Evt::VulnerabilitiesReport {
+                vulnerabilities,
+                metrics,
+                ts,
+                correlation_id,
+            } => {
+                info!(
+                    "Vulnerability report received at {ts} (correlation_id={correlation_id}): {} vulnerabilities, {} critical",
+                    vulnerabilities.len(),
+                    metrics.critical_count
+                );
+            }
         }
         Ok(())
     }
@@ -822,7 +876,7 @@ impl ServiceManager {
         let mut services = Vec::new();
         
         // Collect status for all registered services
-        for (service_name, _worker_tx) in &self.workers {
+        for service_name in self.workers.keys() {
             let restart_state = self.pending_restarts.get(service_name);
             let policy = self.restart_policies.get(service_name);
             let last_state = self.last_state.get(service_name);
@@ -836,7 +890,7 @@ impl ServiceManager {
                     ServiceState::Stopped => ServiceStateKind::Stopped,
                     ServiceState::StoppedClean => ServiceStateKind::Stopped,
                     ServiceState::StoppedCrash => ServiceStateKind::Failed,
-                    ServiceState::Restarting => ServiceStateKind::Restarting,
+                    ServiceState::RestartedService => ServiceStateKind::Restarting,
                 }
             } else {
                 ServiceStateKind::Stopped
@@ -1220,6 +1274,78 @@ impl ServiceManager {
         }
     }
 
+    /// Run vulnerability scan and log results
+    ///
+    /// Executes a cargo-audit based vulnerability scan and logs metrics.
+    /// If thresholds are exceeded, logs an error with details.
+    /// Uses VulnerabilityMetrics helper methods for health monitoring and alerting.
+    async fn run_vulnerability_scan(&self, scanner: Arc<crate::security::audit::VulnerabilityScanner>) {
+        use crate::security::audit::ci_cd;
+        
+        info!("Starting periodic vulnerability scan");
+        
+        match scanner.scan_dependencies().await {
+            Ok(result) => {
+                let metrics = scanner.get_metrics();
+                
+                // Log scan summary using total_vulnerabilities() helper
+                info!(
+                    "Vulnerability scan completed: {} total vulnerabilities (critical={}, high={}, medium={}, low={})",
+                    metrics.total_vulnerabilities(),
+                    metrics.critical_count,
+                    metrics.high_count,
+                    metrics.medium_count,
+                    metrics.low_count
+                );
+                
+                // Check for critical vulnerabilities using has_critical() helper
+                // This provides immediate alerting for the most severe security issues
+                if metrics.has_critical() {
+                    error!(
+                        "CRITICAL VULNERABILITIES DETECTED: {} critical vulnerabilities require immediate attention!",
+                        metrics.critical_count
+                    );
+                    // Log detailed scan results for investigation
+                    info!("{}", ci_cd::format_scan_results(&result));
+                }
+                
+                // Check if thresholds are exceeded (includes all severity levels)
+                if ci_cd::should_fail_build(&scanner, &result) {
+                    error!(
+                        "SECURITY ALERT: {}",
+                        ci_cd::generate_failure_message(&result, &scanner.thresholds)
+                    );
+                    // Only log detailed results if not already logged for critical
+                    if !metrics.has_critical() {
+                        info!("{}", ci_cd::format_scan_results(&result));
+                    }
+                }
+                
+                // Health monitoring using success_rate() helper
+                // Warn if scan success rate drops below 80%
+                let rate = metrics.success_rate();
+                if rate < 80.0 && metrics.total_scans > 0 {
+                    log::warn!(
+                        "Vulnerability scanner health degraded: success rate {:.1}% (below 80% threshold)",
+                        rate
+                    );
+                }
+                
+                // Log success rate for monitoring
+                info!(
+                    "Vulnerability scanner stats: {}/{} scans successful ({:.1}%), cache size: {}",
+                    metrics.successful_scans,
+                    metrics.total_scans,
+                    rate,
+                    metrics.cache_size
+                );
+            }
+            Err(e) => {
+                error!("Vulnerability scan failed: {}", e);
+            }
+        }
+    }
+
     /// Process pending restarts that are ready
     ///
     /// Executes restarts for services whose backoff delay has elapsed.
@@ -1311,6 +1437,7 @@ impl ServiceManager {
     ///     Err(_) => error!("Shutdown timeout"),
     /// }
     /// ```
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn shutdown(&self, _timeout: Duration) -> Result<()> {
         info!("Sending shutdown signal to ServiceManager");
         

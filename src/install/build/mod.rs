@@ -4,6 +4,8 @@
 //! helper app creation, code signing, and packaging with zero allocation
 //! patterns and blazing-fast performance.
 
+use crate::cli_output;
+
 pub mod macos_helper;
 pub mod packaging;
 pub mod signing;
@@ -31,16 +33,16 @@ pub fn main() {
         let out_dir = match std::env::var("OUT_DIR").map(std::path::PathBuf::from) {
             Ok(dir) => dir,
             Err(e) => {
-                eprintln!("Error: OUT_DIR environment variable must be set in build scripts: {e}");
-                eprintln!("This indicates a problem with the cargo build environment.");
+                cli_output::error(&format!("OUT_DIR environment variable must be set in build scripts: {e}"));
+                cli_output::error("This indicates a problem with the cargo build environment.");
                 std::process::exit(1);
             }
         };
         let zip_path = out_dir.join("KodegenHelper.app.zip");
 
         if let Err(e) = packaging::create_functional_zip(&zip_path) {
-            eprintln!("Error: Failed to build macOS helper app: {e}");
-            eprintln!("Build failed - macOS helper is required for proper installation");
+            cli_output::error(&format!("Failed to build macOS helper app: {e}"));
+            cli_output::error("Build failed - macOS helper is required for proper installation");
             std::process::exit(1);
         }
     }
@@ -49,8 +51,8 @@ pub fn main() {
     #[cfg(target_os = "windows")]
     {
         if let Err(e) = windows_helper::build_and_sign_helper() {
-            eprintln!("Error: Failed to build Windows helper: {e}");
-            eprintln!("Build failed - Windows helper is required for proper installation");
+            cli_output::error(&format!("Failed to build Windows helper: {e}"));
+            cli_output::error("Build failed - Windows helper is required for proper installation");
             std::process::exit(1);
         }
     }
@@ -59,8 +61,8 @@ pub fn main() {
     #[cfg(target_os = "linux")]
     {
         if let Err(e) = linux_helper::build_and_sign_helper() {
-            eprintln!("Error: Failed to build Linux helper: {e}");
-            eprintln!("Build failed - Linux helper is required for proper installation");
+            cli_output::error(&format!("Failed to build Linux helper: {e}"));
+            cli_output::error("Build failed - Linux helper is required for proper installation");
             std::process::exit(1);
         }
     }

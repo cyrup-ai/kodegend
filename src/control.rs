@@ -255,6 +255,10 @@
 
 use anyhow::{Context, Result};
 
+// Generic control module (provides shared utilities like pid_file_path)
+// Available on all platforms for use by platform-specific implementations
+pub(crate) mod generic_control;
+
 // Platform-specific implementations
 cfg_if::cfg_if! {
     if #[cfg(target_os = "macos")] {
@@ -277,7 +281,6 @@ cfg_if::cfg_if! {
         // - ✅ stop_daemon() - via SIGTERM signal
         // - ❌ start_daemon() - returns helpful error
         // - ❌ restart_daemon() - returns helpful error
-        mod generic_control;
         use generic_control as platform;
     } else {
         // Non-Unix, non-Windows platform (extremely rare)

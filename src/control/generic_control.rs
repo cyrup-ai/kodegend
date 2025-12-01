@@ -23,8 +23,8 @@
 //! - Linux: [`linux_control`] (systemd via systemctl)
 //! - Windows: [`windows_control`] (Service Control Manager)
 
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 use anyhow::{Context, Result, bail};
-use std::fs;
 use std::path::PathBuf;
 
 // Import existing platform utilities
@@ -37,22 +37,35 @@ use crate::platform;
 /// - User: $XDG_RUNTIME_DIR/kodegend/kodegend.pid or ~/.local/state/kodegend/kodegend.pid
 ///
 /// Reuses: config.rs::default_pid_file() logic
-fn pid_file_path() -> PathBuf {
+pub(crate) fn pid_file_path() -> PathBuf {
     let is_elevated = platform::is_elevated();
     platform::runtime_dir(is_elevated).join("kodegend.pid")
 }
 
-/// Read PID from PID file with comprehensive validation
+/// Read PID from the default PID file location
 ///
-/// Returns: Validated PID as i32
-/// Errors: 
-/// - File doesn't exist
-/// - Cannot read file
-/// - Invalid format (empty, multiple lines, non-numeric)
-/// - Invalid PID value (negative, zero, out of range)
+/// Convenience wrapper around [`daemon::read_pid_file()`] that automatically
+/// uses the platform-appropriate PID file path.
+///
+/// This function:
+/// 1. Gets the default PID file path via `pid_file_path()`
+/// 2. Delegates to `daemon::read_pid_file()` for comprehensive validation
+/// 3. Provides a helpful error message if the file doesn't exist
+///
+/// # Returns
+/// * `Ok(i32)` - Successfully read and validated PID
+/// * `Err` - PID file doesn't exist, is corrupted, or daemon not running
+///
+/// # Error Messages
+///
+/// If the PID file doesn't exist, provides actionable startup instructions:
+/// - How to run kodegend manually in foreground
+/// - How to use nohup for background execution
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn read_pid() -> Result<i32> {
     let path = pid_file_path();
 
+    // Check if PID file exists first to provide helpful error message
     if !path.exists() {
         bail!(
             "Daemon not running (PID file does not exist: {})\n\
@@ -68,82 +81,9 @@ fn read_pid() -> Result<i32> {
         );
     }
 
-    let pid_str = fs::read_to_string(&path)
-        .with_context(|| format!("Reading PID file: {}", path.display()))?;
-
-    // Validation 1: File must not be empty
-    if pid_str.trim().is_empty() {
-        bail!(
-            "Invalid PID file: {} (file is empty)\n\
-             \n\
-             The PID file should contain exactly one process ID number.\n\
-             This indicates the file was corrupted or not properly written.",
-            path.display()
-        );
-    }
-
-    // Validation 2: File must contain exactly one line with content
-    let lines: Vec<&str> = pid_str
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .collect();
-
-    if lines.len() != 1 {
-        bail!(
-            "Invalid PID file: {} (expected 1 line, found {})\n\
-             \n\
-             The PID file should contain exactly one process ID.\n\
-             Found {} non-empty lines - file appears corrupted.",
-            path.display(),
-            lines.len(),
-            lines.len()
-        );
-    }
-
-    let trimmed = pid_str.trim();
-
-    // Validation 3: Content must be pure numeric (with optional +/- prefix)
-    // This catches cases like "12 34" or "1234 # comment"
-    if !trimmed
-        .chars()
-        .all(|c| c.is_ascii_digit() || c == '-' || c == '+')
-    {
-        bail!(
-            "Invalid PID file: {} (contains non-numeric characters)\n\
-             \n\
-             File content: {:?}\n\
-             \n\
-             The PID file should contain only a numeric process ID.\n\
-             Found invalid characters - file appears corrupted.",
-            path.display(),
-            trimmed
-        );
-    }
-
-    // Validation 4: Parse as integer
-    let pid = trimmed.parse::<i32>().with_context(|| {
-        format!(
-            "Invalid PID in file {}: {:?} cannot be parsed as integer\n\
-             \n\
-             This may indicate:\n\
-             - Integer overflow (value too large for i32)\n\
-             - Corrupted file content\n\
-             - Manual tampering",
-            path.display(),
-            trimmed
-        )
-    })?;
-
-    // Validation 5: Platform-specific range check
-    platform::validate_pid_range(pid).with_context(|| {
-        format!(
-            "PID file {} contains out-of-range PID: {}",
-            path.display(),
-            pid
-        )
-    })?;
-
-    Ok(pid)
+    // Delegate to the canonical implementation in daemon module
+    // This provides comprehensive validation and rich error messages
+    crate::daemon::read_pid_file(&path)
 }
 
 /// Check if daemon is running using PID file and process validation
@@ -153,6 +93,7 @@ fn read_pid() -> Result<i32> {
 /// Returns:
 /// - Ok(ServiceStatus) with detailed state information
 /// - Err: System error (should be rare)
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 pub async fn check_status() -> Result<crate::daemon::ServiceStatus> {
     let path = pid_file_path();
     crate::daemon::get_service_status(&path)
@@ -164,6 +105,7 @@ pub async fn check_status() -> Result<crate::daemon::ServiceStatus> {
 /// service manager to spawn and supervise the process.
 ///
 /// Returns: Error with instructions for manual startup
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 pub async fn start_daemon() -> Result<()> {
     bail!(
         "Starting the daemon is not supported on this platform.\n\
@@ -207,6 +149,7 @@ pub async fn start_daemon() -> Result<()> {
 /// Returns:
 /// - Ok(()): SIGTERM sent successfully
 /// - Err: Cannot read PID file, or failed to send signal
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 pub async fn stop_daemon() -> Result<()> {
     let pid = read_pid().context("Cannot stop daemon: failed to read PID file")?;
 
@@ -241,6 +184,7 @@ pub async fn stop_daemon() -> Result<()> {
 /// Generic implementation cannot restart because start is not supported.
 ///
 /// Returns: Error with instructions for manual restart
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 pub async fn restart_daemon() -> Result<()> {
     bail!(
         "Restarting the daemon is not supported on this platform.\n\

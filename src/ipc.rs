@@ -4,6 +4,8 @@ use std::fmt;
 
 use chrono::{DateTime, Utc};
 
+use crate::security::audit::{Vulnerability, VulnerabilityMetrics, VulnerabilitySeverity};
+
 /// Service state for IPC event reporting
 ///
 /// Represents the runtime state of a managed service or the manager itself.
@@ -66,6 +68,15 @@ pub enum Cmd {
     /// Periodic log rotation
     /// correlation_id: Used to match Evt::LogRotate responses
     TickLogRotate { correlation_id: u64 },
+
+    /// Query current vulnerability status
+    /// min_severity: Filter by minimum severity (optional)
+    /// correlation_id: Used to match Evt::VulnerabilitiesReport responses
+    #[allow(dead_code)] // Reserved for IPC vulnerability query feature
+    QueryVulnerabilities {
+        min_severity: Option<VulnerabilitySeverity>,
+        correlation_id: u64,
+    },
 }
 
 /// Events emitted *from* workers back to the manager.
@@ -98,5 +109,14 @@ pub enum Evt {
         msg: Cow<'static, str>,
         ts: DateTime<Utc>,
         // No correlation_id: Fatal events are always spontaneous
+    },
+    /// Response with vulnerability data
+    #[allow(dead_code)] // Reserved for IPC vulnerability query feature
+    VulnerabilitiesReport {
+        vulnerabilities: Vec<Vulnerability>,
+        metrics: VulnerabilityMetrics,
+        ts: DateTime<Utc>,
+        /// Correlation ID from the QueryVulnerabilities command that triggered this
+        correlation_id: u64,
     },
 }

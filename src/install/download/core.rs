@@ -35,6 +35,18 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const VERY_SLOW_CONNECTION: f64 = 10_000.0;   // <10 KB/s
 const SLOW_CONNECTION: f64 = 100_000.0;        // <100 KB/s
 
+/// Configuration for download operations with resume support
+struct DownloadConfig<'a, F> {
+    client: &'a reqwest::Client,
+    url: &'a str,
+    package_path: &'a Path,
+    binary_name: &'a str,
+    total_bytes: u64,
+    version: Option<String>,
+    binary_index: usize,
+    send_best_effort: F,
+}
+
 /// Verify package integrity using SHA256 checksums
 ///
 /// Downloads checksums.txt from the GitHub release and verifies the package
@@ -140,16 +152,20 @@ async fn verify_package_checksum(
 }
 
 /// Attempt to download binary with resume support
-async fn download_with_resume(
-    client: &reqwest::Client,
-    url: &str,
-    package_path: &Path,
-    binary_name: &str,
-    total_bytes: u64,
-    version: Option<String>,
-    binary_index: usize,
-    send_best_effort: impl Fn(InstallProgress) + Clone,
-) -> Result<()> {
+async fn download_with_resume<F>(config: DownloadConfig<'_, F>) -> Result<()>
+where
+    F: Fn(InstallProgress) + Clone,
+{
+    let DownloadConfig {
+        client,
+        url,
+        package_path,
+        binary_name,
+        total_bytes,
+        version,
+        binary_index,
+        send_best_effort,
+    } = config;
     // Check for existing partial download
     let resume_from = if package_path.exists() {
         tokio::fs::metadata(package_path).await?.len()
@@ -272,7 +288,7 @@ async fn download_with_resume(
                             total_bytes,
                             (downloaded as f64 / total_bytes as f64) * 100.0,
                             downloaded
-                        ).into());
+                        ));
                     }
                     Ok(None) => {
                         // Stream ended normally
@@ -412,16 +428,16 @@ async fn download_binary(
     let mut last_error = None;
 
     for attempt in 1..=MAX_DOWNLOAD_RETRIES {
-        match download_with_resume(
-            &client,
-            &asset.browser_download_url,
-            &package_path,
+        match download_with_resume(DownloadConfig {
+            client: &client,
+            url: &asset.browser_download_url,
+            package_path: &package_path,
             binary_name,
             total_bytes,
-            version.clone(),
+            version: version.clone(),
             binary_index,
-            send_best_effort.clone(),
-        ).await {
+            send_best_effort,
+        }).await {
             Ok(()) => {
                 last_error = None;
                 break; // Success!
@@ -530,8 +546,7 @@ pub async fn download_all_binaries(
     }
 
     // All downloads succeeded - persist directory and return path for cleanup tracking
-    // Use into_path() instead of keep() so caller can track for cleanup
-    let download_dir = output_dir_guard.into_path();
+    let download_dir = output_dir_guard.keep();
 
     Ok((binaries, download_dir))
 }

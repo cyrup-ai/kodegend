@@ -1,53 +1,105 @@
 //! Linux daemon control using systemd (systemctl)
 
 use anyhow::{bail, Context, Result};
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use tokio::process::Command;
 
 const SERVICE_NAME: &str = "kodegend";
 
-/// Check if daemon is running via systemctl is-active
+/// Check if daemon is running via systemctl
 ///
-/// Returns: Ok(true) if service is active, Ok(false) if inactive
-pub async fn check_status() -> Result<bool> {
+/// Returns: Ok(ServiceStatus) with PID information when running
+///
+/// Uses defense-in-depth strategy:
+/// 1. Try systemd/systemctl first (authoritative service manager)
+/// 2. Fall back to PID file validation if systemd unavailable or fails
+pub async fn check_status() -> Result<crate::daemon::ServiceStatus> {
+    use crate::daemon::ServiceStatus;
     use crate::platform;
     
+    // Attempt systemd check first
     if !platform::is_systemd_available() {
-        bail!("systemd not available - cannot use systemctl commands");
+        warn!("systemd not available, using PID file fallback");
+        let pid_file = crate::control::generic_control::pid_file_path();
+        return crate::daemon::get_service_status(&pid_file);
     }
     
     let service_name = format!("{}.service", SERVICE_NAME);
-    let args = if is_root() {
+    let args_active = if is_root() {
         vec!["is-active", &service_name]
     } else {
         vec!["--user", "is-active", &service_name]
     };
-
-    // Format command for display
-    let cmd_display = format!("systemctl {}", args.join(" "));
     
-    // Log at DEBUG level - only visible with RUST_LOG=debug
-    debug!("Executing: {}", cmd_display);
-
-    let output = Command::new("systemctl")
-        .args(&args)
+    let cmd_display = format!("systemctl {}", args_active.join(" "));
+    debug!("Checking daemon status: {}", cmd_display);
+    
+    // Try systemctl is-active
+    let result_active = Command::new("systemctl")
+        .args(&args_active)
         .output()
-        .await
-        .with_context(|| format!("Failed to execute: {}", cmd_display))?;
+        .await;
+    
+    match result_active {
+        Ok(output) if output.status.success() => {
+            // Service is active according to systemd - get detailed status with PID
+            let args_status = if is_root() {
+                vec!["status", &service_name]
+            } else {
+                vec!["--user", "status", &service_name]
+            };
 
-    // systemctl is-active returns:
-    // - Exit 0 if active
-    // - Exit 3 if inactive
-    // - Other codes for other states
-    let is_active = output.status.success();
-    
-    if is_active {
-        info!("Daemon is running");
-    } else {
-        info!("Daemon is stopped");
+            let result_status = Command::new("systemctl")
+                .args(&args_status)
+                .output()
+                .await;
+
+            match result_status {
+                Ok(status_output) => {
+                    let stdout = String::from_utf8_lossy(&status_output.stdout);
+                    
+                    // Parse "Main PID: 12345 (kodegend)"
+                    for line in stdout.lines() {
+                        let trimmed = line.trim();
+                        if trimmed.starts_with("Main PID:") {
+                            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                            if parts.len() >= 3 {
+                                let pid_str = parts[2];
+                                let pid_num = pid_str.split('(').next().unwrap_or(pid_str).trim();
+                                
+                                if let Ok(pid) = pid_num.parse::<crate::platform::ProcessId>() {
+                                    info!("Daemon running with PID {} (verified by systemd)", pid);
+                                    return Ok(ServiceStatus::Running { pid });
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Could not parse PID from systemctl output - fall back to PID file
+                    warn!("Failed to parse PID from systemctl output, using PID file fallback");
+                    let pid_file = crate::control::generic_control::pid_file_path();
+                    crate::daemon::get_service_status(&pid_file)
+                }
+                Err(e) => {
+                    // systemctl status command failed - fall back to PID file
+                    warn!("systemctl status failed ({}), using PID file fallback", e);
+                    let pid_file = crate::control::generic_control::pid_file_path();
+                    crate::daemon::get_service_status(&pid_file)
+                }
+            }
+        }
+        Ok(_output) => {
+            // Service is not active according to systemd
+            info!("Daemon is stopped (verified by systemd)");
+            Ok(ServiceStatus::Stopped)
+        }
+        Err(e) => {
+            // systemctl command failed completely - use PID file fallback
+            warn!("systemctl failed ({}), using PID file fallback", e);
+            let pid_file = crate::control::generic_control::pid_file_path();
+            crate::daemon::get_service_status(&pid_file)
+        }
     }
-    
-    Ok(is_active)
 }
 
 /// Start daemon via systemctl start

@@ -14,14 +14,13 @@ use super::binaries::BINARY_COUNT;
 use super::binary_staging;
 use super::chromium;
 use super::cleanup::InstallationCleanupContext;
-use super::cli::Cli;
 use super::download;
 use super::privilege;
 use super::wizard;
 use crate::install;
 
-/// Run installation with wizard-collected options
-pub async fn run_install_with_options(options: &wizard::InstallOptions, _cli: &Cli) -> Result<()> {
+/// Run CLI installation with progress bars (no prompts, auto_start=true)
+pub async fn run_install() -> Result<wizard::InstallationResult> {
     use crate::install::core::DownloadPhase;
 
     // Create cleanup context - will automatically clean up on any failure
@@ -127,20 +126,15 @@ pub async fn run_install_with_options(options: &wizard::InstallOptions, _cli: &C
     pb_overall.set_message("Downloading binaries from GitHub...");
     pb_overall.set_position(0);
 
-    let binary_paths = if options.dry_run {
-        Vec::new()
-    } else {
-        // Unpack tuple and register download dir in cleanup context
-        let (binaries, download_dir) = download::download_all_binaries(tx.clone()).await?;
-        cleanup_ctx.downloaded_binaries_dir = Some(download_dir);
-        binaries
-    };
+    // Unpack tuple and register download dir in cleanup context
+    let (binary_paths, download_dir) = download::download_all_binaries(tx.clone()).await?;
+    cleanup_ctx.downloaded_binaries_dir = Some(download_dir);
 
     pb_overall.set_message("All binaries downloaded");
     pb_overall.set_position(50);
 
     // Stage binaries for installation (runs as unprivileged user)
-    let staging_dir = if !options.dry_run && !binary_paths.is_empty() {
+    let staging_dir = if !binary_paths.is_empty() {
         pb_overall.set_message("Staging binaries...");
         pb_overall.set_position(55);
 
@@ -158,19 +152,13 @@ pub async fn run_install_with_options(options: &wizard::InstallOptions, _cli: &C
     };
 
     // Determine kodegend path for daemon installation
-    let binary_path = if options.dry_run {
-        PathBuf::from("./target/release/kodegend")
-    } else {
-        #[cfg(unix)]
-        let path = PathBuf::from("/usr/local/bin/kodegend");
+    #[cfg(unix)]
+    let binary_path = PathBuf::from("/usr/local/bin/kodegend");
 
-        #[cfg(windows)]
-        let path = {
-            use crate::install::installer::windows::paths::{InstallScope, kodegend_exe};
-            kodegend_exe(InstallScope::System)
-        };
-
-        path
+    #[cfg(windows)]
+    let binary_path = {
+        use crate::install::installer::windows::paths::{InstallScope, kodegend_exe};
+        kodegend_exe(InstallScope::System)
     };
 
     // Determine config path
@@ -179,11 +167,11 @@ pub async fn run_install_with_options(options: &wizard::InstallOptions, _cli: &C
     pb_overall.set_message("Configuring daemon service...");
     pb_overall.set_position(65);
 
-    // Call installation with real progress channel
+    // Call installation with real progress channel (always auto_start)
     let result = install::config::install_kodegen_daemon(
         binary_path.clone(),
         config_path,
-        options.auto_start,
+        true, // Always auto_start
         Some(tx),
     )
     .await;
@@ -264,10 +252,8 @@ pub async fn run_install_with_options(options: &wizard::InstallOptions, _cli: &C
     pb_overall.finish_and_clear();
     pb_download.finish_and_clear();
 
-    wizard::show_completion(options, &install_result);
-
     // SUCCESS: Defuse cleanup context to prevent cleanup of successfully installed files
     cleanup_ctx.defuse();
 
-    Ok(())
+    Ok(install_result)
 }

@@ -23,6 +23,8 @@ mod runner;
 mod types;
 mod window;
 
-// Re-export public API
+// Re-export public API (used by GUI runner internally)
+#[allow(unused_imports)]
+pub use types::{BinaryDownloadStatus, BinaryStatus};
 #[allow(unused_imports)]
 pub use runner::run_gui_installation;

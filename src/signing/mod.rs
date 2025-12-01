@@ -39,6 +39,7 @@ mod linux;
 /// - Certificate is expired, revoked, or untrusted
 /// - Publisher doesn't match expected identity
 /// - Signature verification API fails
+#[allow(dead_code)] // Used on Windows and Linux platforms, appears unused on macOS due to conditional compilation
 pub fn verify_signature(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "windows")]
     {

@@ -65,13 +65,6 @@ impl InstallerBuilder {
         }
     }
 
-    /// Add a command line argument.
-    #[allow(dead_code)] // Part of public builder API
-    pub fn arg(mut self, arg: impl Into<String>) -> Self {
-        self.args.push(arg.into());
-        self
-    }
-
     /// Add multiple command line arguments.
     pub fn args<I, S>(mut self, args: I) -> Self
     where
@@ -128,49 +121,6 @@ impl InstallerBuilder {
     /// Set whether to start service automatically after installation.
     pub fn auto_start(mut self, auto_start: bool) -> Self {
         self.auto_start = auto_start;
-        self
-    }
-}
-
-/// Builder for privileged command execution.
-///
-/// This is used internally for constructing platform-specific installation commands.
-#[derive(Debug)]
-pub struct CommandBuilder {
-    /// Program to execute
-    pub program: PathBuf,
-
-    /// Arguments for the program
-    pub args: Vec<String>,
-}
-
-impl CommandBuilder {
-    /// Create a new command builder.
-    pub fn new(program: impl Into<PathBuf>) -> Self {
-        Self {
-            program: program.into(),
-            args: Vec::new(),
-        }
-    }
-
-    /// Add multiple command line arguments.
-    pub fn args<I, S>(mut self, args: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.args.extend(args.into_iter().map(Into::into));
-        self
-    }
-
-    /// Add multiple command line arguments from `InstallerBuilder` (integration method).
-    #[allow(dead_code)]
-    pub fn args_from_installer<I, S>(mut self, args: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.args.extend(args.into_iter().map(Into::into));
         self
     }
 }

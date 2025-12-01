@@ -38,6 +38,7 @@ use windows::{
 /// //                    ^^^^
 /// //              Single quote escaped as '\''
 /// ```
+#[allow(dead_code)] // Used at lines 206, 373, 391 in Unix builds, but compiler doesn't track platform-specific usage
 fn shell_escape(path: &std::path::Path) -> Result<String> {
     // Convert path to string (reject non-UTF8 paths)
     let path_str = path.to_str().ok_or_else(|| {
@@ -91,6 +92,7 @@ fn shell_escape(path: &std::path::Path) -> Result<String> {
 /// Binary filenames should NEVER contain shell metacharacters. If they do,
 /// it's either a mistake or an attack. Rejecting them early prevents exploitation
 /// even if shell escaping has bugs.
+#[allow(dead_code)] // Used at lines 203, 373, 391 in Unix builds (LAYER 1 security), but compiler doesn't track platform-specific usage
 fn validate_binary_filename(path: &std::path::Path) -> Result<()> {
     let filename = path
         .file_name()
@@ -152,6 +154,7 @@ fn validate_binary_filename(path: &std::path::Path) -> Result<()> {
 /// Security: By deferring privilege escalation until this point, we ensure that network
 /// operations, downloads, and extraction all run as an unprivileged user, dramatically
 /// reducing the attack surface.
+#[allow(dead_code)] // Used at 7 call sites across 6 modules (orchestration, runners, installer, etc.), but compiler doesn't track cross-module public API usage
 pub async fn install_with_elevated_privileges(
     staging_dir: &std::path::Path,
     cert_content: Option<&str>,
@@ -588,6 +591,8 @@ pub async fn install_with_elevated_privileges(
 async fn register_windows_service(binary_path: &std::path::Path) -> Result<()> {
     use crate::install::installer::InstallerBuilder;
     use crate::install::installer::windows::PlatformExecutor;
+    use crate::install::installer::core::InstallContext;
+    use crate::install::config::{configure_services, build_installer_config};
 
     eprintln!("🔧 Registering Windows service...");
 
@@ -599,15 +604,31 @@ async fn register_windows_service(binary_path: &std::path::Path) -> Result<()> {
         ));
     }
 
-    // Build service installer configuration
-    // Note: InstallerBuilder is defined in ../installer/builder.rs
-    let installer = InstallerBuilder::new("kodegend", binary_path)
-        .description("KODEGEN MCP Tool Server Daemon")
-        .args(["run", "--foreground"]) // --service flag added automatically by service_creation.rs
-        .env("RUST_LOG", "info")
-        .auto_restart(true) // Configure automatic restart on failure
-        .network(true) // Service requires network (depends on Tcpip/Afd)
-        .auto_start(true); // Start service automatically on boot (delayed start)
+    // Create installation context with binary path
+    let mut context = InstallContext::new(binary_path.to_path_buf());
+    
+    // Set config path (platform-specific)
+    let config_path = crate::platform::user_config_dir().join("config.toml");
+    context.config_path = config_path;
+
+    // Configure services (adds autoconfig service and any future services)
+    // This ensures Windows gets the same services as Unix installations
+    let auto_start = true; // Windows service should auto-start
+    configure_services(&mut context, auto_start)
+        .context("Failed to configure services for Windows installation")?;
+
+    // Build installer configuration with all services and platform settings
+    // This creates the InstallerBuilder with:
+    // - All configured services from context.services
+    // - Platform-specific user/group settings
+    // - Proper service dependencies
+    let installer = build_installer_config(&context, auto_start)
+        .context("Failed to build installer configuration for Windows")?;
+
+    eprintln!("  ✓ Configured {} service(s)", context.services.len());
+    for service in &context.services {
+        eprintln!("    - {}: {}", service.name, service.description);
+    }
 
     // Call Windows service creation API
     // This is a blocking operation, so wrap in spawn_blocking
@@ -617,6 +638,7 @@ async fn register_windows_service(binary_path: &std::path::Path) -> Result<()> {
     //   3. Registry operations - Create service metadata entries
     //   4. Event log registration - Register as event source
     //   5. StartServiceW() - Start the service if auto_start=true
+    //   6. Install all configured sub-services (autoconfig, etc.)
     //
     // See: packages/kodegend/src/install/installer/windows/mod.rs:60-94
     tokio::task::spawn_blocking(move || PlatformExecutor::install(installer))

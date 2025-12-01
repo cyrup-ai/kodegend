@@ -85,22 +85,29 @@ fn open_service(sc_manager: &ScManagerHandle, access: u32) -> Result<ServiceHand
 
 /// Check if daemon is running via QueryServiceStatusEx
 ///
-/// Returns: Ok(true) if service is running, Ok(false) if stopped
-pub async fn check_status() -> Result<bool> {
-    tokio::task::spawn_blocking(|| {
-        debug!("Opening Service Control Manager for status check");
+/// Returns: Ok(ServiceStatus) with PID information when running
+///
+/// Uses defense-in-depth strategy:
+/// 1. Try Windows Service Control Manager (SCM) first (authoritative service manager)
+/// 2. Fall back to PID file validation if SCM unavailable or fails
+pub async fn check_status() -> Result<crate::daemon::ServiceStatus> {
+    use crate::daemon::ServiceStatus;
+    
+    let result = tokio::task::spawn_blocking(|| {
+        debug!("Checking daemon status via Windows SCM");
+        
         let sc_manager = ScManagerHandle::new()
-            .context("Failed to open Service Control Manager for status check")?;
+            .context("Failed to open Service Control Manager")?;
 
         debug!("Opening service '{}' for status query", SERVICE_NAME);
         let service = open_service(&sc_manager, SERVICE_QUERY_STATUS.0)
-            .context("Failed to open service for status check")?;
+            .context("Failed to open service")?;
 
         let mut status: SERVICE_STATUS_PROCESS = unsafe { mem::zeroed() };
         let mut bytes_needed: u32 = 0;
 
         debug!("Querying service status via QueryServiceStatusEx");
-        let result = unsafe {
+        let query_result = unsafe {
             QueryServiceStatusEx(
                 service.handle(),
                 SC_STATUS_PROCESS_INFO,
@@ -110,26 +117,44 @@ pub async fn check_status() -> Result<bool> {
             )
         };
 
-        if result.is_err() {
+        if let Err(e) = query_result {
             let error_code = unsafe { windows::Win32::Foundation::GetLastError() };
             error!("QueryServiceStatusEx failed for service '{}'", SERVICE_NAME);
             error!("Error code: {:?}", error_code);
-            bail!("Failed to query service status");
+            bail!("QueryServiceStatusEx failed: {}", e);
         }
 
-        // SERVICE_RUNNING = 4, SERVICE_STOPPED = 1
-        let is_running = status.dwCurrentState == SERVICE_RUNNING.0;
-        
-        if is_running {
-            info!("Daemon is running");
-        } else {
-            info!("Daemon is stopped");
-        }
-        
-        Ok(is_running)
+        // Extract status from SERVICE_STATUS_PROCESS structure
+        let service_status = match status.dwCurrentState {
+            state if state == SERVICE_RUNNING.0 => {
+                let pid = status.dwProcessId as crate::platform::ProcessId;
+                info!("Daemon running with PID {} (verified by Windows SCM)", pid);
+                ServiceStatus::Running { pid }
+            }
+            state if state == SERVICE_STOPPED.0 => {
+                info!("Daemon is stopped (verified by Windows SCM)");
+                ServiceStatus::Stopped
+            }
+            _ => {
+                info!("Daemon is in non-running state: {} (verified by Windows SCM)", status.dwCurrentState);
+                ServiceStatus::Stopped
+            }
+        };
+
+        Ok(service_status)
     })
     .await
-    .context("Failed to spawn blocking task for check_status")?
+    .context("Failed to spawn blocking task for check_status")?;
+
+    match result {
+        Ok(status) => Ok(status),
+        Err(e) => {
+            // SCM query failed - use PID file fallback
+            warn!("Windows SCM query failed ({}), using PID file fallback", e);
+            let pid_file = crate::control::generic_control::pid_file_path();
+            crate::daemon::get_service_status(&pid_file)
+        }
+    }
 }
 
 /// Start daemon via StartServiceW

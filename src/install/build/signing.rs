@@ -3,6 +3,7 @@
 //! This module provides macOS code signing functionality for the helper app
 //! with secure signing operations and certificate validation.
 
+use crate::cli_output;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -51,7 +52,7 @@ fn ensure_signing_certificate() -> Result<(), Box<dyn std::error::Error>> {
 
     // CRITICAL: No certificate = BUILD FAILURE
     // Ad-hoc signing must NEVER be allowed for releases
-    eprintln!("\n❌ FATAL: No Developer ID certificate found!");
+    cli_output::error("FATAL: No Developer ID certificate found!");
     eprintln!("\nRELEASE BUILD REQUIRES VALID CERTIFICATE");
     eprintln!("\nOptions:");
     eprintln!("  1. Set APPLE_CERTIFICATE + APPLE_CERTIFICATE_PASSWORD env vars (CI/CD)");

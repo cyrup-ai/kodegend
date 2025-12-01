@@ -101,6 +101,9 @@ impl ServiceWorker {
                     },
                     Cmd::TickHealth { correlation_id }   => self.health_check(&mut child, correlation_id)?,
                     Cmd::TickLogRotate { correlation_id }=> self.rotate_logs(correlation_id)?,
+                    // QueryVulnerabilities is a manager-level command, not sent to service workers
+                    // It's handled by ServiceManager::run_vulnerability_scan() in manager.rs
+                    Cmd::QueryVulnerabilities { .. } => {},
                 },
                 recv(health_tick) -> _ => {
                     // Spontaneous health check (not triggered by command)
@@ -753,18 +756,18 @@ fn rotate_single_log(
             // Remove both compressed and uncompressed versions
             // Cleanup failures are non-fatal (old files remain, no data loss)
             // But we warn so administrators can detect disk space issues
-            if let Err(e) = fs::remove_file(&old_file) {
-                // Ignore NotFound (race condition: file deleted by external process)
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    warn!("Failed to delete old log file {} (beyond max_files={}): {}", 
-                          old_file, max_files, e);
-                }
+            // Ignore NotFound (race condition: file deleted by external process)
+            if let Err(e) = fs::remove_file(&old_file)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                warn!("Failed to delete old log file {} (beyond max_files={}): {}", 
+                      old_file, max_files, e);
             }
-            if let Err(e) = fs::remove_file(&old_gz) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    warn!("Failed to delete compressed log {} (beyond max_files={}): {}", 
-                          old_gz, max_files, e);
-                }
+            if let Err(e) = fs::remove_file(&old_gz)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                warn!("Failed to delete compressed log {} (beyond max_files={}): {}", 
+                      old_gz, max_files, e);
             }
         }
     } else {

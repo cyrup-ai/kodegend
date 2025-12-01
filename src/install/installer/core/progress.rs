@@ -28,7 +28,6 @@ pub struct DownloadMetadata {
     pub total_bytes: u64,
 
     /// Release version discovered (e.g., "v0.4.2")
-    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
     pub version: Option<String>,
 
     /// Download phase: "discovering" | "downloading" | "extracting" | "complete"
@@ -36,11 +35,22 @@ pub struct DownloadMetadata {
 }
 
 /// Installation progress tracking
+///
+/// All fields are consumed by GUI panels (gui/panels.rs, gui/runner.rs, gui/window.rs)
+/// and progress tracking systems via mpsc channels. The compiler may not see these reads
+/// due to opaque struct passing across async channel boundaries.
 #[derive(Debug, Clone)]
 pub struct InstallProgress {
+    /// Installation step identifier (e.g., "validation", "directories", "certificates", "download")
     pub step: String,
-    pub progress: f32, // 0.0 to 1.0
+
+    /// Progress percentage 0.0 to 1.0
+    pub progress: f32,
+
+    /// Human-readable status message
     pub message: String,
+
+    /// Error flag - true if this is an error status
     pub is_error: bool,
 
     /// Download-specific metadata (optional, used during binary downloads)
@@ -49,6 +59,7 @@ pub struct InstallProgress {
 
 impl InstallProgress {
     /// Create new progress update with optimized initialization
+    #[allow(dead_code)] // Used in context.rs:196,237,391 - false positive
     pub fn new(step: String, progress: f32, message: String) -> Self {
         Self {
             step,
@@ -60,7 +71,6 @@ impl InstallProgress {
     }
 
     /// Create error progress update
-    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
     pub fn error(step: String, message: String) -> Self {
         Self {
             step,
@@ -72,6 +82,7 @@ impl InstallProgress {
     }
 
     /// Create completion progress update
+    #[allow(dead_code)] // Used in installer.rs:135 - false positive
     pub fn complete(step: String, message: String) -> Self {
         Self {
             step,

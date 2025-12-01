@@ -129,22 +129,21 @@ pub async fn extract_from_deb(
             let mut entry = entry_result
                 .context("Failed to read tar entry")?;
             
-            let entry_path = entry.path()
-                .context("Failed to get tar entry path")?;
-            
-            let entry_path_str = entry_path
+            let entry_path_string = entry.path()
+                .context("Failed to get tar entry path")?
                 .to_str()
-                .ok_or_else(|| anyhow!("Tar entry contains non-UTF8 path"))?;
+                .ok_or_else(|| anyhow!("Tar entry contains non-UTF8 path"))?
+                .to_string();
 
             // Validate path safety
-            let validated_path = validate_archive_path(entry_path_str)
-                .context(format!("Invalid tar entry path: {}", entry_path_str))?;
+            let validated_path = validate_archive_path(&entry_path_string)
+                .context(format!("Invalid tar entry path: {}", entry_path_string))?;
             
             let output_path = extract_dir_clone.join(&validated_path);
 
             // Extract entry
             entry.unpack(&output_path)
-                .context(format!("Failed to extract tar entry: {}", entry_path_str))?;
+                .context(format!("Failed to extract tar entry: {}", entry_path_string))?;
         }
 
         Ok(())

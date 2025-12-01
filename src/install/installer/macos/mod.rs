@@ -2,14 +2,19 @@
 
 use std::{path::PathBuf, process::Command};
 
-use super::{InstallerBuilder, InstallerError, builder::CommandBuilder};
+use super::{InstallerBuilder, InstallerError};
 
+mod command_builder;
 mod executor;
 mod helper;
 mod plist;
 
+use command_builder::CommandBuilder;
+
+#[allow(dead_code)]
 pub(crate) struct PlatformExecutor;
 
+#[allow(dead_code)]
 impl PlatformExecutor {
     pub fn install(b: InstallerBuilder) -> Result<(), InstallerError> {
         // Initialize helper path if not already set

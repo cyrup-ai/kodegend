@@ -62,6 +62,44 @@ fn canonicalize_path_vec(paths: &[String], base_dir: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Vulnerability scanning thresholds configuration
+///
+/// Configures maximum allowed vulnerabilities by severity level.
+/// Used by the VulnerabilityScanner to determine if a scan passes CI/CD checks.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VulnerabilityThresholds {
+    /// Maximum critical vulnerabilities allowed (default: 0)
+    #[serde(default)]
+    pub critical_max: Option<u32>,
+    /// Maximum high vulnerabilities allowed (default: 2)
+    #[serde(default)]
+    pub high_max: Option<u32>,
+    /// Maximum medium vulnerabilities allowed (default: 10)
+    #[serde(default)]
+    pub medium_max: Option<u32>,
+    /// Maximum low vulnerabilities allowed (default: 50)
+    #[serde(default)]
+    pub low_max: Option<u32>,
+}
+
+/// Security configuration section
+///
+/// Controls daemon security features including vulnerability scanning.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SecurityConfig {
+    /// Enable periodic vulnerability scanning (default: false)
+    #[serde(default)]
+    pub enable_vulnerability_scanning: Option<bool>,
+    
+    /// Interval between vulnerability scans in seconds (default: 3600 = 1 hour)
+    #[serde(default)]
+    pub vulnerability_scan_interval_secs: Option<u64>,
+    
+    /// Vulnerability count thresholds for CI/CD integration
+    #[serde(default)]
+    pub vulnerability_thresholds: VulnerabilityThresholds,
+}
+
 /// Top‑level daemon configuration (mirrors original defaults).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceConfig {
@@ -148,6 +186,10 @@ pub struct ServiceConfig {
     /// - User home directories
     #[serde(default = "default_working_directory")]
     pub working_directory: PathBuf,
+
+    /// Security configuration including vulnerability scanning
+    #[serde(default)]
+    pub security: SecurityConfig,
 
     /// Path to config file (not serialized, used for reload)
     #[serde(skip)]
@@ -563,6 +605,7 @@ impl Default for ServiceConfig {
             daemon_shutdown_timeout_secs: default_daemon_shutdown_timeout(),
             pid_file: default_pid_file(),
             working_directory: default_working_directory(),
+            security: SecurityConfig::default(),
             config_file_path: None,
         }
     }

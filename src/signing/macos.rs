@@ -21,6 +21,7 @@ use std::process::Command;
 /// - Signature is invalid
 /// - Binary has been modified after signing
 /// - codesign command is not available
+#[allow(dead_code)] // Called via mod.rs cross-platform wrapper
 pub fn verify_signature(app_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let output = Command::new("codesign")
         .args(["--verify", "--deep", "--strict"])

@@ -13,20 +13,8 @@
 use once_cell::sync::Lazy;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-
-/// Installation state enum (legacy - for backward compatibility)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InstallationState {
-    /// No binaries or configuration found
-    NotInstalled,
-    /// Some components installed but incomplete (repair needed)
-    PartiallyInstalled,
-    /// All components installed and configured
-    FullyInstalled,
-}
 
 // ============================================================================
 // GRANULAR COMPONENT STATUS TYPES
@@ -46,15 +34,20 @@ pub enum ComponentStatus {
 }
 
 /// Result of fixing a single component
+///
+/// NOTE: The `component` and `required_sudo` fields are used via Debug trait
+/// and in component_fixers.rs. The compiler doesn't see cross-module usage.
 #[derive(Debug, Clone)]
 pub struct ComponentFixResult {
     /// Name of the component
+    #[allow(dead_code)]
     pub component: &'static str,
     /// Whether the fix succeeded
     pub success: bool,
     /// Error message if fix failed
     pub error: Option<String>,
     /// Whether privilege escalation was required
+    #[allow(dead_code)]
     pub required_sudo: bool,
 }
 
@@ -67,6 +60,8 @@ pub struct ComponentStatusReport {
     pub certificates: ComponentStatus,
     /// Kodegen binary version status (installed vs crates.io version)
     pub kodegen_version: ComponentStatus,
+    /// Rust toolchain status (nightly installed for building)
+    pub toolchain: ComponentStatus,
 }
 
 impl ComponentStatusReport {
@@ -75,11 +70,15 @@ impl ComponentStatusReport {
         self.hosts == ComponentStatus::Ok
             && self.certificates == ComponentStatus::Ok
             && self.kodegen_version == ComponentStatus::Ok
+            && self.toolchain == ComponentStatus::Ok
     }
 
     /// Get list of components needing action
     pub fn components_needing_action(&self) -> Vec<&'static str> {
         let mut needs_action = Vec::new();
+        if self.toolchain != ComponentStatus::Ok {
+            needs_action.push("toolchain");
+        }
         if self.hosts != ComponentStatus::Ok {
             needs_action.push("hosts");
         }
@@ -109,190 +108,12 @@ impl ComponentStatusReport {
 /// Result of fixing all components
 #[derive(Debug, Clone, Default)]
 pub struct InstallationFixReport {
+    pub toolchain: Option<ComponentFixResult>,
     pub hosts: Option<ComponentFixResult>,
     pub certificates: Option<ComponentFixResult>,
     pub kodegen_version: Option<ComponentFixResult>,
     /// Overall success (all attempted fixes succeeded)
     pub overall_success: bool,
-}
-
-/// Check current installation state by verifying all components
-///
-/// Returns:
-/// - `FullyInstalled` if kodegen binary, service, certs, and chromium present
-/// - `NotInstalled` if kodegen binary not found
-/// - `PartiallyInstalled` otherwise (needs repair)
-pub fn check_installation_state() -> InstallationState {
-    let binaries_ok = check_binaries_installed();
-    let service_ok = check_service_configured();
-    let certs_ok = check_certificates_present();
-    let chromium_ok = check_chromium_installed();
-
-    match (binaries_ok, service_ok, certs_ok, chromium_ok) {
-        (0, false, false, false) => InstallationState::NotInstalled,
-        (1, true, true, true) => InstallationState::FullyInstalled,
-        _ => InstallationState::PartiallyInstalled,
-    }
-}
-
-/// Count how many of the 1 required binaries are installed in /usr/local/bin
-///
-/// Uses the canonical BINARIES array from src/binaries.rs:
-/// ["kodegen"]
-///
-/// NOTE: We do NOT check for kodegend because it's already running!
-fn check_binaries_installed() -> usize {
-    use super::binaries::BINARIES;
-
-    #[cfg(unix)]
-    let bin_dir = Path::new("/usr/local/bin");
-
-    #[cfg(windows)]
-    let bin_dir = {
-        use crate::install::installer::windows::paths::{InstallScope, install_dir};
-        install_dir(InstallScope::System)
-    };
-
-    BINARIES
-        .iter()
-        .filter(|name| bin_dir.join(name).exists())
-        .count()
-}
-
-/// Check if system service is configured
-///
-/// Paths:
-/// - macOS: /Library/LaunchDaemons/com.kodegen.daemon.plist
-/// - Linux: /etc/systemd/system/kodegend.service
-/// - Windows: Registry key (HKLM\SYSTEM\CurrentControlSet\Services\kodegend)
-fn check_service_configured() -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        Path::new("/Library/LaunchDaemons/com.kodegen.daemon.plist").exists()
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        use crate::platform;
-        
-        // Only check for service file if systemd is the init system
-        if platform::is_systemd_available() {
-            Path::new("/etc/systemd/system/kodegend.service").exists()
-        } else {
-            // Non-systemd systems: check for running process via PID file
-            // (Traditional daemon detection method)
-            let pid_file = crate::platform::runtime_dir(true).join("kodegend.pid");
-            if let Ok(pid_str) = std::fs::read_to_string(&pid_file) {
-                if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                    return crate::platform::is_process_running(pid).unwrap_or(false);
-                }
-            }
-            false
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        // Check if kodegend service exists in Windows Service Manager
-        // Uses minimal permissions for read-only detection
-        use windows::Win32::System::Services::{
-            CloseServiceHandle, OpenSCManagerW, OpenServiceW, SC_MANAGER_CONNECT,
-            SERVICE_QUERY_STATUS,
-        };
-        use windows::core::PCWSTR;
-
-        // Service name to check
-        let service_name = "kodegend";
-
-        // Convert to UTF-16 (Windows native string format)
-        let wide_name: Vec<u16> = service_name
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-
-        unsafe {
-            // Open Service Control Manager with minimal permissions
-            let scm = OpenSCManagerW(
-                PCWSTR::null(),     // Local machine
-                PCWSTR::null(),     // Default database
-                SC_MANAGER_CONNECT, // Minimal read-only access
-            );
-
-            if scm.is_invalid() {
-                return false; // SCM not available or no permissions
-            }
-
-            // Try to open the kodegend service
-            let service = OpenServiceW(
-                scm,
-                PCWSTR::from_raw(wide_name.as_ptr()),
-                SERVICE_QUERY_STATUS, // Minimal read-only access
-            );
-
-            let exists = !service.is_invalid();
-
-            // Clean up handles (RAII pattern)
-            if !service.is_invalid() {
-                let _ = CloseServiceHandle(service);
-            }
-            let _ = CloseServiceHandle(scm);
-
-            exists // Return true if service was opened successfully
-        }
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    {
-        false
-    }
-}
-
-/// Check if certificates directory exists and has files
-///
-/// Path: /usr/local/var/kodegen/certs/ (Unix)
-/// Expected files: *.crt, *.key, *.pem
-fn check_certificates_present() -> bool {
-    #[cfg(unix)]
-    {
-        let cert_dir = Path::new("/usr/local/var/kodegen/certs");
-        cert_dir.exists()
-            && cert_dir
-                .read_dir()
-                .map(|mut d| d.next().is_some())
-                .unwrap_or(false)
-    }
-
-    #[cfg(windows)]
-    {
-        let cert_dir = crate::platform::user_config_dir().join("certs");
-        cert_dir.exists()
-            && cert_dir
-                .read_dir()
-                .map(|mut d| d.next().is_some())
-                .unwrap_or(false)
-    }
-}
-
-/// Check if Chromium is installed in cache directory
-///
-/// Chromium is downloaded by kodegen_tools_citescrape::download_managed_browser()
-///
-/// Paths:
-/// - macOS: ~/Library/Caches/kodegen/chromium/
-/// - Linux: ~/.cache/kodegen/chromium/
-/// - Windows: %LOCALAPPDATA%\kodegen\chromium\
-fn check_chromium_installed() -> bool {
-    if let Ok(data_dir) = kodegen_config::KodegenConfig::data_dir() {
-        let chromium_path = data_dir.join("chromium");
-        chromium_path.exists()
-    } else {
-        false
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    {
-        false
-    }
 }
 
 /// Get the version of an installed binary by running `binary --version`
@@ -524,6 +345,7 @@ pub async fn get_crates_io_version(crate_name: &str) -> Option<String> {
 /// - If crates.io is unreachable: assume installed version is OK (avoid forced reinstall)
 /// - If binary not found: needs installation (correct behavior)
 /// - If version parsing fails: depends on which side failed (see code comments)
+#[allow(dead_code)] // Used in runners.rs but compiler doesn't detect cross-module async usage
 pub async fn binary_needs_installation(binary_name: &str) -> bool {
     use semver::Version;
 
@@ -701,14 +523,68 @@ pub async fn check_kodegen_version_status() -> ComponentStatus {
     }
 }
 
+/// Check if Rust nightly toolchain is installed and available
+///
+/// Returns:
+/// - Ok: Nightly toolchain is installed
+/// - Missing: Rust or nightly toolchain not installed
+/// - CheckFailed: Could not determine toolchain status
+pub async fn check_toolchain_status() -> ComponentStatus {
+    use tokio::process::Command;
+
+    // Check if rustc is available
+    let rustc_check = Command::new("rustc").arg("--version").output().await;
+
+    match rustc_check {
+        Ok(output) if output.status.success() => {
+            // Check if nightly is installed
+            let list_output = Command::new("rustup")
+                .args(["toolchain", "list"])
+                .output()
+                .await;
+
+            match list_output {
+                Ok(output) if output.status.success() => {
+                    let toolchains = String::from_utf8_lossy(&output.stdout);
+                    if toolchains.lines().any(|line| line.contains("nightly")) {
+                        log::info!("Rust nightly toolchain: installed");
+                        ComponentStatus::Ok
+                    } else {
+                        log::info!("Rust nightly toolchain: not installed");
+                        ComponentStatus::Missing
+                    }
+                }
+                Ok(_) => {
+                    log::warn!("rustup toolchain list failed");
+                    ComponentStatus::CheckFailed
+                }
+                Err(e) => {
+                    log::warn!("Failed to run rustup: {}", e);
+                    ComponentStatus::Missing
+                }
+            }
+        }
+        Ok(_) => {
+            log::info!("rustc not available");
+            ComponentStatus::Missing
+        }
+        Err(e) => {
+            log::warn!("Failed to run rustc: {}", e);
+            ComponentStatus::Missing
+        }
+    }
+}
+
 /// Get comprehensive component status report
 ///
-/// Checks all three core components individually:
+/// Checks all four core components individually:
+/// - Toolchain (Rust nightly)
 /// - Hosts entry
 /// - Certificates
 /// - Kodegen version
 pub async fn check_all_components() -> ComponentStatusReport {
     ComponentStatusReport {
+        toolchain: check_toolchain_status().await,
         hosts: check_hosts_status(),
         certificates: check_certificates_status(),
         kodegen_version: check_kodegen_version_status().await,

@@ -20,7 +20,7 @@
 //! # Usage Pattern
 //!
 //! ```no_run
-//! use kodegend::daemon::{daemonise, systemd_ready, PidFile};
+//! use kodegend::daemon::{daemonise, systemd_notify_ready, PidFile};
 //! use kodegend::platform;
 //! use anyhow::Result;
 //!
@@ -39,7 +39,7 @@
 //!     let _pid_file = PidFile::create(pid_file_path)?;
 //!     
 //!     // Signal readiness to systemd (no-op if not running under systemd)
-//!     systemd_ready();
+//!     systemd_notify_ready();
 //!     
 //!     // Run daemon logic
 //!     run_daemon_services()?;
@@ -96,10 +96,10 @@ use nix::unistd::{Uid, geteuid};
 
 use crate::platform;
 
-//! systemd notification helpers
-//!
-//! Implements sd_notify protocol for Type=notify service integration.
-//! See: https://www.freedesktop.org/software/systemd/man/sd_notify.html
+// systemd notification helpers
+//
+// Implements sd_notify protocol for Type=notify service integration.
+// See: https://www.freedesktop.org/software/systemd/man/sd_notify.html
 
 /// Notify systemd that service is fully ready
 ///
@@ -216,11 +216,7 @@ pub fn systemd_notify_watchdog() {
     // No-op
 }
 
-// Keep the old function name for backward compatibility (deprecated)
-#[deprecated(since = "0.5.0", note = "Use systemd_notify_ready() instead")]
-pub fn systemd_ready() {
-    systemd_notify_ready();
-}
+
 
 /// Validate PID file path security (Unix only)
 ///
@@ -689,25 +685,23 @@ impl PidFile {
         validate_existing_pid_file(&path)?;
         
         // Create parent directory with restrictive permissions
-        if let Some(parent) = path.parent() {
-            if !parent.exists() {
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("Creating PID file directory: {}", parent.display()))?;
-                
-                // Set explicit permissions on directory (fixes umask dependency)
-                let mut perms = fs::metadata(parent)
-                    .with_context(|| format!("Reading PID directory metadata: {}", parent.display()))?
-                    .permissions();
-                perms.set_mode(PID_DIR_MODE);
-                fs::set_permissions(parent, perms)
-                    .with_context(|| format!("Setting PID directory permissions: {}", parent.display()))?;
-                
-                info!(
-                    "PID directory permissions set to {:o}: {}",
-                    PID_DIR_MODE,
-                    parent.display()
-                );
-            }
+        if let Some(parent) = path.parent().filter(|p| !p.exists()) {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Creating PID file directory: {}", parent.display()))?;
+            
+            // Set explicit permissions on directory (fixes umask dependency)
+            let mut perms = fs::metadata(parent)
+                .with_context(|| format!("Reading PID directory metadata: {}", parent.display()))?
+                .permissions();
+            perms.set_mode(PID_DIR_MODE);
+            fs::set_permissions(parent, perms)
+                .with_context(|| format!("Setting PID directory permissions: {}", parent.display()))?;
+            
+            info!(
+                "PID directory permissions set to {:o}: {}",
+                PID_DIR_MODE,
+                parent.display()
+            );
         }
 
         // Validate parent directory is writable and secure
@@ -1047,38 +1041,134 @@ impl std::fmt::Display for ServiceStatus {
     }
 }
 
-/// Read PID from existing PID file
+/// Read process ID from a PID file with comprehensive validation
 ///
-/// Does NOT create or lock the file - only reads existing content.
-/// Used for status checking, not daemon initialization.
+/// Reads a PID file and validates its contents to ensure it contains a valid
+/// process ID. This function performs extensive validation to detect corrupted
+/// or malformed PID files early with helpful error messages.
+///
+/// # Validation Steps
+///
+/// 1. **File Exists**: Returns error if file doesn't exist
+/// 2. **Not Empty**: Returns error if file is empty
+/// 3. **Single Line**: Returns error if file contains multiple non-empty lines
+/// 4. **Numeric Content**: Returns error if content contains non-numeric characters
+/// 5. **Valid Integer**: Returns error if content cannot be parsed as i32/u32
 ///
 /// # Arguments
-/// * `path` - Path to PID file
+/// * `path` - Path to the PID file to read
 ///
 /// # Returns
-/// * `Ok(pid)` - Successfully read and parsed PID
-/// * `Err` - File doesn't exist, can't read, or invalid format
+/// * `Ok(ProcessId)` - Successfully read and validated PID
+/// * `Err` - File doesn't exist, is corrupted, or contains invalid data
+///
+/// # Error Messages
+///
+/// This function provides **rich, actionable error messages** to help diagnose
+/// PID file corruption, making debugging easier in production:
+///
+/// - Empty file → Indicates improper PID file creation
+/// - Multiple lines → File corruption or manual editing
+/// - Non-numeric content → File corruption or wrong file type
+/// - Parse failure → Integer overflow or extreme corruption
 ///
 /// # Example
 /// ```rust
 /// let pid = read_pid_file(Path::new("/var/run/kodegend/kodegend.pid"))?;
 /// println!("Daemon PID: {}", pid);
 /// ```
+///
+/// # Platform Compatibility
+/// 
+/// Uses `platform::ProcessId` type which is:
+/// - `i32` on Unix-like systems (Linux, macOS, BSD)
+/// - `u32` on Windows
 pub fn read_pid_file(path: &Path) -> Result<platform::ProcessId> {
-    // Read file content
-    let content = fs::read_to_string(path)
+    // Step 1: Read file content (fails if file doesn't exist)
+    let pid_str = fs::read_to_string(path)
         .with_context(|| format!("Reading PID file: {}", path.display()))?;
-    
-    // Parse as integer (trim whitespace first)
-    content.trim()
+
+    // Step 2: Validation - File must not be empty
+    let trimmed = pid_str.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!(
+            "Invalid PID file: {} (file is empty)\n\
+             \n\
+             The PID file should contain exactly one process ID number.\n\
+             This indicates the file was corrupted or not properly written.",
+            path.display()
+        );
+    }
+
+    // Step 3: Validation - File must contain exactly one line with content
+    let lines: Vec<&str> = pid_str
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+
+    if lines.len() != 1 {
+        anyhow::bail!(
+            "Invalid PID file: {} (expected 1 line, found {})\n\
+             \n\
+             The PID file should contain exactly one process ID.\n\
+             Found {} non-empty lines - file appears corrupted.\n\
+             \n\
+             This may indicate:\n\
+             - File was manually edited\n\
+             - Disk corruption\n\
+             - Incomplete write operation",
+            path.display(),
+            lines.len(),
+            lines.len()
+        );
+    }
+
+    // Step 4: Validation - Content must be pure numeric (with optional +/- prefix)
+    // This catches cases like "12 34" or "1234 # comment" or "abc123"
+    if !trimmed.chars().all(|c| c.is_ascii_digit() || c == '-' || c == '+') {
+        anyhow::bail!(
+            "Invalid PID file: {} (contains non-numeric characters)\n\
+             \n\
+             File content: {:?}\n\
+             \n\
+             The PID file should contain only a numeric process ID.\n\
+             Found invalid characters - file appears corrupted.\n\
+             \n\
+             Common causes:\n\
+             - File was manually edited\n\
+             - Wrong file (not a PID file)\n\
+             - Disk corruption or incomplete write",
+            path.display(),
+            trimmed
+        );
+    }
+
+    // Step 5: Parse as platform-specific ProcessId type
+    let pid = trimmed
         .parse::<platform::ProcessId>()
         .with_context(|| {
             format!(
-                "Parsing PID from file {}: '{}' is not a valid process ID",
+                "Invalid PID in file {}: {:?} cannot be parsed as integer\n\
+                 \n\
+                 This may indicate:\n\
+                 - Integer overflow (value too large for platform ProcessId type)\n\
+                 - Corrupted file content\n\
+                 - Platform mismatch (PID file created on different OS)\n\
+                 \n\
+                 Platform ProcessId type: {} bits {}",
                 path.display(),
-                content.trim()
+                trimmed,
+                std::mem::size_of::<platform::ProcessId>() * 8,
+                if cfg!(windows) { "unsigned" } else { "signed" }
             )
-        })
+        })?;
+    
+    // SECURITY: Validate PID before use (CWE-20 mitigation)
+    // Prevents signaling kernel (PID 0), init (PID 1), and detects corrupted files
+    platform::validate_pid_range(pid)
+        .with_context(|| format!("PID file {} contains invalid PID", path.display()))?;
+    
+    Ok(pid)
 }
 
 /// Check if a process is a zombie (defunct)
@@ -1232,98 +1322,6 @@ pub fn get_service_status(pid_file: &Path) -> Result<ServiceStatus> {
     }
 }
 
-/// Validate a PID value before using it for process operations
-///
-/// Ensures PID is safe to use with kill() and other process APIs:
-/// - Rejects PID 0 (kernel scheduler / current process group signal)
-/// - Rejects PID 1 (init/systemd/launchd)
-/// - Rejects negative PIDs (process group signals)
-/// - Validates against system-specific maximum
-///
-/// This is a critical security control preventing:
-/// - System crashes from signaling init (PID 1)
-/// - Unintended process group signals (PID 0, negative PIDs)
-/// - Detection of corrupted PID files (out-of-range values)
-///
-/// # Arguments
-/// * `pid` - The PID value to validate
-///
-/// # Returns
-/// * `Ok(())` if PID is valid and safe to use
-/// * `Err(anyhow::Error)` with detailed error message if invalid
-///
-/// # Security
-/// This function implements CWE-20 (Improper Input Validation) mitigation
-/// for untrusted PID values read from filesystem.
-fn validate_pid(pid: platform::ProcessId) -> Result<()> {
-    // Reject reserved system PIDs and process group signals
-    if pid <= 1 {
-        anyhow::bail!(
-            "Invalid PID {}: Cannot signal kernel (PID 0) or init/systemd (PID 1)",
-            pid
-        );
-    }
-    
-    // Get platform-specific maximum PID value
-    let pid_max = get_system_pid_max();
-    
-    if pid > pid_max {
-        anyhow::bail!(
-            "Invalid PID {}: Exceeds system maximum {} (likely corrupted PID file)",
-            pid,
-            pid_max
-        );
-    }
-    
-    Ok(())
-}
-
-/// Get the system's maximum PID value
-///
-/// Platform-specific implementations:
-/// - **Linux**: Read /proc/sys/kernel/pid_max and subtract 1
-///   - File contains wrap-around value (one greater than max assignable PID)
-///   - Default: 32768 (max assignable: 32767)
-///   - 64-bit max: 4194304 (configurable)
-///   - 32-bit max: 32768 (hard limit)
-///
-/// - **macOS**: Use PID_MAX constant from kern_fork.c
-///   - PID_MAX = 99999, PIDs assigned < PID_MAX
-///   - Maximum assignable: 99998
-///
-/// - **Fallback**: Conservative default (32768) for other Unix systems
-///
-/// # Returns
-/// Maximum assignable PID value for current platform
-fn get_system_pid_max() -> platform::ProcessId {
-    #[cfg(target_os = "linux")]
-    {
-        // Linux: /proc/sys/kernel/pid_max contains wrap-around value
-        // Actual maximum assignable PID is (pid_max - 1)
-        // See: https://www.kernel.org/doc/html/latest/admin-guide/sysctl/kernel.html#pid-max
-        std::fs::read_to_string("/proc/sys/kernel/pid_max")
-            .ok()
-            .and_then(|s| s.trim().parse::<i32>().ok())
-            .map(|max| max - 1)  // Subtract 1: file contains wrap-around value
-            .unwrap_or(32767)     // Fallback: standard Unix default maximum
-    }
-    
-    #[cfg(target_os = "macos")]
-    {
-        // macOS: PID_MAX is 99999 in kern_fork.c
-        // PIDs are assigned < PID_MAX, so maximum assignable is 99998
-        // See: https://apple.stackexchange.com/questions/51119
-        99998
-    }
-    
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        // Conservative fallback for other Unix systems
-        // Uses historical Unix 16-bit PID limit
-        32767
-    }
-}
-
 /// Daemonize the current process using platform-specific mechanisms.
 ///
 /// This function performs the traditional Unix "double-fork" daemonization on Unix
@@ -1420,7 +1418,7 @@ fn get_system_pid_max() -> platform::ProcessId {
 /// # See Also
 ///
 /// - [`platform::running_under_service_manager()`] - Service manager detection
-/// - [`systemd_ready()`] - Signal readiness to systemd
+/// - [`systemd_notify_ready()`] - Signal readiness to systemd
 /// - [daemon(3)](https://man7.org/linux/man-pages/man3/daemon.3.html)
 #[allow(dead_code)]
 pub fn daemonise(config: &crate::config::ServiceConfig) -> Result<()> {
@@ -1444,7 +1442,7 @@ fn unix_daemonise(config: &crate::config::ServiceConfig) -> Result<()> {
     use nix::sys::resource::{Resource, getrlimit};
     use nix::sys::stat::{Mode, umask};
     use nix::unistd::{ForkResult, chdir, close, fork, pipe, read, setsid, write};
-    use std::os::unix::io::{AsRawFd, RawFd};
+    use std::os::unix::io::AsRawFd;
 
     // Use platform API to detect if we're under a service manager
     if platform::running_under_service_manager() {
@@ -1475,7 +1473,7 @@ fn unix_daemonise(config: &crate::config::ServiceConfig) -> Result<()> {
                 unsafe { std::os::fd::BorrowedFd::borrow_raw(read_fd) },
                 &mut buf,
             ) {
-                Ok(n) if n == READINESS_BUFFER_SIZE && &buf == READINESS_SIGNAL => {
+                Ok(n) if n == READINESS_BUFFER_SIZE && buf == READINESS_SIGNAL => {
                     // ✅ Grandchild is ready and initialized
                     close(read_fd).ok(); // Best effort cleanup
                     info!("Daemon initialization confirmed");
@@ -1576,7 +1574,7 @@ fn unix_daemonise(config: &crate::config::ServiceConfig) -> Result<()> {
 
     let devnull_fd = devnull.as_raw_fd();
 
-    for target in standard_fds() {
+    for &target in &standard_fds() {
         if unsafe { libc::dup2(devnull_fd, target) } == -1 {
             // If this fails, we can't signal parent (no stderr)
             // Close write_fd to signal failure

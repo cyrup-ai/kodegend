@@ -332,8 +332,8 @@ pub async fn shutdown_all_servers(servers: Vec<EmbeddedServer>) -> Result<()> {
     // Execute all shutdowns concurrently and collect results
     let results = join_all(shutdown_futures).await;
 
-    // Extract errors using filter_map (idiomatic Rust)
-    let errors: Vec<String> = results.into_iter().filter_map(|r| r).collect();
+    // Extract errors using flatten (idiomatic Rust for Option iteration)
+    let errors: Vec<String> = results.into_iter().flatten().collect();
 
     if !errors.is_empty() {
         return Err(anyhow::anyhow!(

@@ -3,27 +3,15 @@ use clap::{Parser, Subcommand};
 #[derive(Parser, Debug)]
 #[command(version, about = "kodegen service manager")]
 pub struct Args {
-    /// Sub‑commands (run, install, etc.)
+    /// Sub‑commands (uninstall, status, etc.)
     #[command(subcommand)]
     pub sub: Option<Cmd>,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum Cmd {
-    /// Normal daemon operation (default if no sub‑command)
-    Run {
-        /// Stay in foreground even on plain Unix
-        #[arg(long)]
-        foreground: bool,
-
-        /// Path to configuration file
-        #[arg(long, short = 'c')]
-        config: Option<String>,
-
-        /// Use system-wide config (/etc/kodegend/kodegend.toml)
-        #[arg(long, conflicts_with = "config")]
-        system: bool,
-    },
+    /// Uninstall kodegend daemon and clean up system configuration
+    Uninstall,
     /// Check daemon status (Exit 0 = running, 1 = stopped)
     Status,
     /// Start the daemon service (Exit 0 = success, 1 = failed)
@@ -32,4 +20,19 @@ pub enum Cmd {
     Stop,
     /// Restart the daemon service (Exit 0 = success, 1 = failed)
     Restart,
+    /// Query vulnerability scan results
+    #[command(name = "vulns")]
+    Vulnerabilities {
+        /// Filter by pattern (RUSTSEC ID, package name, or description)
+        #[arg(long)]
+        filter: Option<String>,
+
+        /// Filter by specific package name (exact match)
+        #[arg(long)]
+        package: Option<String>,
+
+        /// Show only critical/high severity
+        #[arg(long)]
+        critical_only: bool,
+    },
 }

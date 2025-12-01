@@ -27,14 +27,23 @@ use windows::{
 /// Installation context
 #[derive(Debug)]
 pub struct InstallContext {
+    /// Executable path (validated in validate_prerequisites:386)
     pub exe_path: PathBuf,
+    /// Configuration file path (set in installer.rs:26)
     pub config_path: PathBuf,
+    /// Data directory (created in create_directories:185, returned in installer.rs:143)
     pub data_dir: PathBuf,
+    /// Log directory (created in create_directories:188)
     pub log_dir: PathBuf,
+    /// Certificate directory (created in create_directories:191, used in generate_certificates:223-321)
     pub cert_dir: PathBuf,
+    /// Service configurations (populated via add_service:103, read in services.rs:14)
     pub services: Vec<ServiceConfig>,
+    /// Certificate configuration (set via set_certificate_config:108, read in generate_certificates:194)
     pub certificate_config: CertificateConfig,
+    /// Progress channel (set in set_progress_channel:113, used in send_*_progress:122-171)
     pub progress_tx: Option<mpsc::Sender<InstallProgress>>,
+    /// Progress disabled flag (checked at context.rs:149, set at 163)
     progress_disabled: Arc<AtomicBool>,
 }
 
@@ -404,6 +413,7 @@ impl InstallContext {
     ///
     /// Does NOT actually escalate - just validates that escalation would be possible.
     #[cfg(unix)]
+    #[allow(dead_code)] // Reserved for future privilege escalation
     fn can_escalate() -> bool {
         use std::process::Command;
 
@@ -418,6 +428,7 @@ impl InstallContext {
     }
 
     #[cfg(windows)]
+    #[allow(dead_code)] // Reserved for future privilege escalation
     fn can_escalate() -> bool {
         // Windows uses UAC elevation via ShellExecuteExW with "runas" verb
         // All users can trigger UAC elevation prompts
@@ -426,6 +437,7 @@ impl InstallContext {
     }
 
     #[cfg(not(any(unix, windows)))]
+    #[allow(dead_code)] // Reserved for future privilege escalation
     fn can_escalate() -> bool {
         // On other platforms, assume elevation is available
         true

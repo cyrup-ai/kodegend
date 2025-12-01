@@ -6,14 +6,17 @@ use log::info;
 use tokio::process::Command;
 use tokio::time::timeout;
 
+#[allow(dead_code)]
 const GIT_CLONE_TIMEOUT: Duration = Duration::from_secs(600); // 10 minutes
 
 /// Install fluent voice from git repository
+#[allow(dead_code)]
 pub async fn install_fluent_voice(fluent_voice_dir: &std::path::Path) -> Result<()> {
     clone_from_git(fluent_voice_dir).await
 }
 
 /// Uninstall fluent voice components by removing the installation directory
+#[allow(dead_code)]
 pub async fn uninstall_fluent_voice(fluent_voice_dir: &std::path::Path) -> Result<()> {
     if !fluent_voice_dir.exists() {
         info!("Fluent voice directory does not exist, nothing to uninstall");
@@ -31,6 +34,7 @@ pub async fn uninstall_fluent_voice(fluent_voice_dir: &std::path::Path) -> Resul
 }
 
 /// Clone from git repository with retries
+#[allow(dead_code)]
 async fn clone_from_git(fluent_voice_dir: &std::path::Path) -> Result<()> {
     const MAX_RETRIES: u32 = 3;
     let mut last_error = None;

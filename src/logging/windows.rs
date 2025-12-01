@@ -22,6 +22,7 @@
 //! - **Registration**: Requires HKLM write access (Administrator only)
 //! - **Runtime logging**: Works as any user (no elevation needed)
 
+use crate::cli_output;
 use anyhow::Result;
 use log::LevelFilter;
 
@@ -43,8 +44,8 @@ pub(super) fn platform_init_logging() -> Result<()> {
         }
         Err(e) => {
             // Log to stderr (goes to console before logger is initialized)
-            eprintln!("Warning: Failed to create Windows Event Log logger: {}", e);
-            eprintln!(
+            cli_output::warning(&format!("Failed to create Windows Event Log logger: {}", e));
+            cli_output::warning(
                 "Continuing with console-only logging. Run 'kodegend install' with Administrator privileges to enable Event Log."
             );
         }
@@ -63,8 +64,8 @@ pub(super) fn platform_init_logging() -> Result<()> {
         }
         Err(e) => {
             // MultiLogger failed - fall back to basic env_logger
-            eprintln!("Warning: MultiLogger initialization failed: {}", e);
-            eprintln!("Falling back to basic console logging");
+            cli_output::warning(&format!("MultiLogger initialization failed: {}", e));
+            cli_output::warning("Falling back to basic console logging");
             
             // Reinitialize with basic env_logger as fallback
             // Use try_init() because MultiLogger may have partially initialized the global logger

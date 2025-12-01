@@ -1,7 +1,7 @@
-//! Chromium browser installation for kodegen citescrape tools
+//! Chromium browser installation for kodegen browser tools
 //!
 //! This module handles downloading and installing the managed Chromium browser
-//! required for web automation and citescrape functionality.
+//! required for web automation and browser functionality.
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
@@ -12,7 +12,7 @@ use tokio::time::timeout;
 ///
 /// Reads KODEGEN_CHROMIUM_TIMEOUT environment variable (seconds).
 /// Falls back to 900 seconds (15 minutes) if not set or invalid.
-pub fn get_chromium_install_timeout() -> Duration {
+fn get_chromium_install_timeout() -> Duration {
     std::env::var("KODEGEN_CHROMIUM_TIMEOUT")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
@@ -20,12 +20,12 @@ pub fn get_chromium_install_timeout() -> Duration {
         .unwrap_or_else(|| Duration::from_secs(900))
 }
 
-/// Install Chromium using citescrape's `download_managed_browser`
+/// Install Chromium using browser package's `download_managed_browser`
 ///
 /// Chromium is REQUIRED - installation fails if this fails.
 /// Timeout can be configured via KODEGEN_CHROMIUM_TIMEOUT environment variable (seconds).
-pub async fn install_chromium() -> Result<PathBuf> {
-    use kodegen_tools_citescrape::download_managed_browser;
+pub(super) async fn install_chromium() -> Result<PathBuf> {
+    use kodegen_tools_browser::download_managed_browser;
     use std::io::Write;
     use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 
@@ -44,7 +44,7 @@ pub async fn install_chromium() -> Result<PathBuf> {
             .context("Failed to download Chromium - check network connection and disk space")?,
         Err(_) => anyhow::bail!(
             "Timeout installing Chromium after {} seconds ({} minutes). \
-             Chromium is ~100MB and required for citescrape functionality. \
+             Chromium is ~100MB and required for browser functionality. \
              Increase timeout with: KODEGEN_CHROMIUM_TIMEOUT={} {}",
             timeout_duration.as_secs(),
             timeout_duration.as_secs() / 60,

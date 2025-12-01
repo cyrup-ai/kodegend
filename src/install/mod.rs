@@ -6,93 +6,105 @@
 mod binaries;
 mod binary_staging;
 mod chromium;
-mod cleanup;
-mod cli;
+pub(crate) mod cleanup;
 mod component_fixers;
 mod download;
-#[cfg(feature = "gui")]
 mod gui;
 mod hosts;
 mod installer;
 mod orchestration;
 mod privilege;
-mod runners;
+pub mod runners;
 mod wizard;
 
 // NEW MODULES
 mod detection;
-mod environment;
 
-// Public exports - Legacy
-pub use detection::{InstallationState, check_installation_state};
-pub use environment::{is_cli_environment, is_desktop_environment};
+// Public exports for internal module use
+pub use component_fixers::fix_all_components;
+pub use detection::InstallationFixReport;
 
-// Public exports - Granular component system
-pub use component_fixers::{fix_all_components, fix_certificates, fix_hosts, fix_kodegen_version};
-pub use detection::{
-    ComponentFixResult, ComponentStatus, ComponentStatusReport, InstallationFixReport,
-    check_all_components, check_certificates_status, check_hosts_status,
-    check_kodegen_version_status,
-};
-
-// Re-export installer types and modules for internal use
-pub use installer::{InstallerBuilder, InstallerError};
 pub(crate) use installer::{config, core, uninstall};
 
 use anyhow::Result;
-use cli::Cli;
 
-/// Ensure Kodegen is fully installed with GRANULAR component checks
+/// Ensure Kodegen is fully installed - AUTOMAGICAL
 ///
-/// This is the main entry point for kodegend to call during startup.
-/// Checks each component individually and fixes only those that need action.
+/// This is called by run_daemon() before starting services.
+/// Auto-detects GUI availability and shows appropriate installer UI.
 ///
-/// # Behavior (NEW - Granular)
-/// - Checks each component independently: hosts, certificates, kodegen version
-/// - Fixes only components that need action
-/// - Uses fail-fast behavior: stops on first component failure
-/// - Uses SEPARATE sudo operations for each privileged component
-///
-/// # Components Checked
-/// 1. Hosts entry (127.0.0.1 mcp.kodegen.ai in /etc/hosts)
-/// 2. Certificates (valid TLS cert in config_dir/kodegen/certs/)
-/// 3. Kodegen version (binary in /usr/local/bin matches crates.io version)
-///
-/// # Returns
-/// - `Ok(())` if all components verified or fixed successfully
-/// - `Err(e)` if any component fix fails (fail-fast)
+/// # Behavior
+/// 1. Check all components (toolchain, hosts, certificates, kodegen, chrome)
+/// 2. If all installed → return immediately
+/// 3. If GUI available → show branded GUI wizard with progress
+/// 4. If no GUI → show CLI banner with progress bars
+/// 5. Install all missing components automatically (NO PROMPTS)
 pub async fn ensure_installed() -> Result<()> {
+    use crate::platform;
+
+    // Step 1: Check what components need installation
     let report = ensure_installed_granular().await?;
 
     if report.overall_success {
-        Ok(())
+        log::debug!("All components already installed");
+        return Ok(());
+    }
+
+    // Log any component fix failures for debugging
+    log_component_errors(&report);
+
+    // Step 2: Determine installation mode based on GUI availability
+    log::info!("Components missing, starting installation...");
+
+    let install_result = if platform::is_gui_available() {
+        // GUI mode: Show branded wizard window with progress
+        log::info!("GUI available, launching installation wizard");
+        gui::run_gui_installation().await?
     } else {
-        // Find first failure and return that error
-        if let Some(ref result) = report.hosts
-            && !result.success
-        {
-            return Err(anyhow::anyhow!(
-                "Hosts fix failed: {}",
-                result.error.as_deref().unwrap_or("unknown error")
-            ));
-        }
-        if let Some(ref result) = report.certificates
-            && !result.success
-        {
-            return Err(anyhow::anyhow!(
-                "Certificate fix failed: {}",
-                result.error.as_deref().unwrap_or("unknown error")
-            ));
-        }
-        if let Some(ref result) = report.kodegen_version
-            && !result.success
-        {
-            return Err(anyhow::anyhow!(
-                "Kodegen version fix failed: {}",
-                result.error.as_deref().unwrap_or("unknown error")
-            ));
-        }
-        Err(anyhow::anyhow!("Installation failed"))
+        // CLI mode: Show branding banner, then progress bars
+        log::info!("No GUI available, using CLI installation");
+        wizard::show_welcome_banner();
+        orchestration::run_install().await?
+    };
+
+    // Step 3: Show completion
+    wizard::show_completion(&install_result);
+
+    Ok(())
+}
+
+/// Log errors from failed component fixes
+///
+/// Iterates over each component in the report and logs any error messages
+/// from failed fixes. This provides visibility into what went wrong before
+/// falling back to GUI/CLI installation.
+fn log_component_errors(report: &InstallationFixReport) {
+    if let Some(ref result) = report.toolchain
+        && !result.success
+        && let Some(ref error) = result.error
+    {
+        log::error!("Toolchain fix failed: {}", error);
+    }
+
+    if let Some(ref result) = report.hosts
+        && !result.success
+        && let Some(ref error) = result.error
+    {
+        log::error!("Hosts fix failed: {}", error);
+    }
+
+    if let Some(ref result) = report.certificates
+        && !result.success
+        && let Some(ref error) = result.error
+    {
+        log::error!("Certificates fix failed: {}", error);
+    }
+
+    if let Some(ref result) = report.kodegen_version
+        && !result.success
+        && let Some(ref error) = result.error
+    {
+        log::error!("Kodegen version fix failed: {}", error);
     }
 }
 
@@ -110,24 +122,4 @@ pub async fn ensure_installed() -> Result<()> {
 /// If any component fix fails, the function returns immediately with the report.
 pub async fn ensure_installed_granular() -> Result<InstallationFixReport> {
     fix_all_components().await
-}
-
-/// Public API for manual installation (used by main.rs binary)
-///
-/// This preserves the existing standalone installer behavior.
-/// Called when user explicitly runs `kodegen_install` from command line.
-pub async fn install_interactive() -> Result<()> {
-    let cli = Cli::parse_args();
-
-    if cli.is_uninstall() {
-        return runners::run_uninstall(&cli).await;
-    }
-
-    // Wizard or non-interactive based on CLI args
-    if wizard::is_non_interactive(&cli) {
-        runners::run_install(&cli).await
-    } else {
-        let options = wizard::run_wizard()?;
-        orchestration::run_install_with_options(&options, &cli).await
-    }
 }

@@ -1,5 +1,6 @@
 //! Main GUI window implementation for installation progress
 
+use crate::cli_output;
 use eframe::egui;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -95,7 +96,7 @@ impl InstallWindow {
                 ))
             }
             Err(e) => {
-                eprintln!("Failed to load banner: {}", e);
+                cli_output::warning(&format!("Failed to load banner: {}", e));
                 None // Fallback to text title (handled in update())
             }
         }

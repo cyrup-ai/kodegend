@@ -6,6 +6,8 @@
 use std::time::Duration;
 use std::io::{Read, Write};
 
+use crate::security::audit::{AuditResult, Vulnerability, VulnerabilitySeverity};
+
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 
@@ -121,4 +123,55 @@ pub fn format_duration(d: Duration) -> String {
             format!("{}h{}m", hours, mins)
         }
     }
+}
+
+/// Query and filter vulnerabilities from an audit result
+/// 
+/// Uses SIMD-accelerated pattern matching via `Vulnerability::matches_pattern()`
+/// and exact package matching via `Vulnerability::affects_package()`.
+/// 
+/// # Arguments
+/// 
+/// * `result` - The audit result containing vulnerabilities to filter
+/// * `filter` - Optional pattern to search in ID, package name, or description
+/// * `package` - Optional exact package name match
+/// * `critical_only` - If true, only return Critical and High severity vulnerabilities
+/// 
+/// # Returns
+/// 
+/// A vector of cloned vulnerabilities matching all specified criteria
+pub fn query_vulnerabilities(
+    result: &AuditResult,
+    filter: Option<&str>,
+    package: Option<&str>,
+    critical_only: bool,
+) -> Vec<Vulnerability> {
+    result.vulnerabilities
+        .iter()
+        .filter(|v| {
+            // Filter by severity if requested
+            let severity_match = if critical_only {
+                matches!(v.severity, VulnerabilitySeverity::Critical | VulnerabilitySeverity::High)
+            } else {
+                true
+            };
+            
+            // Filter by SIMD-accelerated pattern search if provided
+            let pattern_match = if let Some(pattern) = filter {
+                v.matches_pattern(pattern.as_bytes())
+            } else {
+                true
+            };
+            
+            // Filter by exact package name if provided
+            let package_match = if let Some(pkg) = package {
+                v.affects_package(pkg)
+            } else {
+                true
+            };
+            
+            severity_match && pattern_match && package_match
+        })
+        .cloned()
+        .collect()
 }

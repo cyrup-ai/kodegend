@@ -22,7 +22,7 @@ impl Platform {
     /// Detect current platform (cached after first call)
     pub fn detect() -> Result<Self> {
         PLATFORM_CACHE
-            .get_or_try_init(|| Self::detect_uncached())
+            .get_or_try_init(Self::detect_uncached)
             .copied()
     }
 

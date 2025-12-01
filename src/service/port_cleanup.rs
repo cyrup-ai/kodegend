@@ -165,8 +165,8 @@ pub async fn kill_process_graceful(pid: u32) -> Result<()> {
 ///
 /// # Returns
 /// - Ok(()) if process was successfully killed and confirmed dead
-/// - Err() if kill failed or process still exists after 1 second
-async fn force_kill_process(pid: u32) -> Result<()> {
+/// - Err() if kill failed or process still exists after timeout
+pub(crate) async fn force_kill_process(pid: u32) -> Result<()> {
     #[cfg(unix)]
     {
         use nix::sys::signal::{Signal, kill};
@@ -178,47 +178,73 @@ async fn force_kill_process(pid: u32) -> Result<()> {
         kill(nix_pid, Signal::SIGKILL)
             .map_err(|e| anyhow::anyhow!("Failed to send SIGKILL to process {}: {}", pid, e))?;
 
-        log::debug!("Sent SIGKILL to process {}, waiting for termination", pid);
+        log::debug!(
+            "Sent SIGKILL to process {}, waiting for termination (timeout: {:?})",
+            pid,
+            FORCE_KILL_VERIFICATION_TIMEOUT
+        );
 
-        // Wait for process to actually die (up to 1 second with 10 checks)
-        for attempt in 1..=FORCE_KILL_MAX_ATTEMPTS {
-            tokio::time::sleep(FORCE_KILL_POLL_INTERVAL).await;
+        // Verify process dies within timeout using tokio::time::timeout
+        let verification_result = tokio::time::timeout(
+            FORCE_KILL_VERIFICATION_TIMEOUT,
+            async {
+                let start = std::time::Instant::now();
+                loop {
+                    tokio::time::sleep(FORCE_KILL_POLL_INTERVAL).await;
 
-            // Check if process is gone (kill with signal 0 = existence check, no actual signal)
-            match kill(nix_pid, None) {
-                Err(_) => {
-                    // ESRCH error means process is dead
-                    log::info!(
-                        "✓ Process {} successfully force-killed (confirmed dead after {}ms)",
-                        pid,
-                        attempt * 100
-                    );
-                    return Ok(());
-                }
-                Ok(_) => {
-                    // Process still exists, keep waiting
-                    log::trace!(
-                        "Process {} still exists after {}ms, continuing to wait",
-                        pid,
-                        attempt * 100
-                    );
-                    continue;
+                    // Check if process is gone (kill with signal 0 = existence check, no actual signal)
+                    match kill(nix_pid, None) {
+                        Err(_) => {
+                            // ESRCH error means process is dead
+                            let elapsed = start.elapsed();
+                            log::info!(
+                                "✓ Process {} successfully force-killed (confirmed dead after {:.1}ms)",
+                                pid,
+                                elapsed.as_secs_f64() * 1000.0
+                            );
+                            return Ok(());
+                        }
+                        Ok(_) => {
+                            // Process still exists, keep waiting
+                            let elapsed = start.elapsed();
+                            log::trace!(
+                                "Process {} still exists after {:.1}ms, continuing to wait",
+                                pid,
+                                elapsed.as_secs_f64() * 1000.0
+                            );
+                            continue;
+                        }
+                    }
                 }
             }
-        }
+        ).await;
 
-        // Process still exists after 1 second - this should never happen with SIGKILL
-        Err(anyhow::anyhow!(
-            "Process {} still exists 1 second after SIGKILL. \
-             This indicates a kernel-level issue (zombie process or unkillable kernel thread).",
-            pid
-        ))
+        // Handle timeout vs success
+        match verification_result {
+            Ok(Ok(())) => {
+                // Process successfully killed and verified dead
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                // Inner async block returned error (shouldn't happen in this logic)
+                Err(e)
+            }
+            Err(_elapsed) => {
+                // Timeout elapsed - process still exists
+                Err(anyhow::anyhow!(
+                    "Process {} still exists after {:?} SIGKILL timeout. \
+                     This indicates a kernel-level issue (zombie process or unkillable kernel thread).",
+                    pid,
+                    FORCE_KILL_VERIFICATION_TIMEOUT
+                ))
+            }
+        }
     }
 
     #[cfg(windows)]
     {
         use windows::Win32::System::Threading::TerminateProcess;
-        use crate::platform::windows::{ProcessHandle};
+        use crate::platform::windows::ProcessHandle;
 
         // Open process with terminate access - handle auto-closed on drop
         let handle = ProcessHandle::open_terminate(pid)?;
@@ -240,8 +266,6 @@ async fn force_kill_process(pid: u32) -> Result<()> {
             "✓ Process {} successfully terminated (Windows TerminateProcess)",
             pid
         );
-
-        // Windows TerminateProcess is synchronous - process is dead when it returns
         Ok(())
     }
 }
@@ -305,7 +329,7 @@ pub async fn cleanup_port_if_needed(port: u16) -> Result<()> {
                     "✗ Port {} cleanup failed after {} attempts ({}s total): {:#}",
                     port,
                     PORT_CLEANUP_MAX_RETRIES,
-                    (PORT_CLEANUP_INITIAL_DELAY_MS * ((1 << PORT_CLEANUP_MAX_RETRIES) - 1)) / 1000, // Geometric series sum
+                    port_cleanup_max_total_time_ms() / 1000, // Convert ms to seconds for logging
                     e
                 );
                 return Err(e);

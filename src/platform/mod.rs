@@ -27,8 +27,6 @@ use std::path::PathBuf;
 mod unix;
 #[cfg(unix)]
 pub use unix::*;
-#[cfg(target_os = "linux")]
-pub use unix::is_systemd_available as platform_is_systemd_available;
 
 #[cfg(windows)]
 mod windows;
@@ -75,40 +73,6 @@ pub fn running_under_service_manager() -> bool {
     platform_running_under_service_manager()
 }
 
-/// Detect if systemd is available as the init system
-///
-/// Returns true if systemd is PID 1, false on non-systemd Linux systems.
-/// Cached globally for performance.
-///
-/// # Platform Behavior
-///
-/// - **Linux**: Checks /run/systemd/system directory (official sd_booted method)
-/// - **macOS**: Always returns false (uses launchd)
-/// - **Windows**: Always returns false (uses Service Control Manager)
-///
-/// # Use Cases
-///
-/// - Installation: Decide whether to create .service files
-/// - Service control: Decide whether to use systemctl commands  
-/// - Detection: Show appropriate setup instructions to user
-#[cfg(unix)]
-pub fn is_systemd_available() -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        platform_is_systemd_available()
-    }
-    
-    #[cfg(not(target_os = "linux"))]
-    {
-        false // macOS, FreeBSD, etc. don't use systemd
-    }
-}
-
-#[cfg(windows)]
-pub fn is_systemd_available() -> bool {
-    false // Windows uses Service Control Manager
-}
-
 /// Current process identifier
 ///
 /// - Unix: getpid()
@@ -124,6 +88,7 @@ pub fn current_process_id() -> ProcessId {
 /// - Windows: OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) - succeeds if exists
 ///
 /// Returns Ok(true) if process exists, Ok(false) if not, Err on permission/system error
+#[allow(dead_code)] // FALSE POSITIVE: Used by daemon.rs and detection.rs
 pub fn is_process_running(pid: ProcessId) -> Result<bool, std::io::Error> {
     platform_is_process_running(pid)
 }
@@ -160,6 +125,40 @@ pub fn is_process_running(pid: ProcessId) -> Result<bool, std::io::Error> {
 /// ```
 pub fn validate_pid_range(pid: ProcessId) -> Result<(), anyhow::Error> {
     platform_validate_pid_range(pid)
+}
+
+/// Get the system's maximum PID value
+///
+/// Returns the platform-specific maximum PID that can be assigned to processes.
+/// This is used for validating PIDs read from files to detect corruption.
+///
+/// # Platform-Specific Values
+/// - **Linux**: Read from /proc/sys/kernel/pid_max (typically 32767, max 4194303)
+/// - **macOS**: 99998 (PIDs wrap at 99999)
+/// - **FreeBSD**: Read from kern.pid_max sysctl (typically 99999)
+/// - **Windows**: 4194304 (conservative limit)
+/// - **Other Unix**: 32767 (conservative default)
+///
+/// # Returns
+/// Maximum assignable PID value for current platform
+///
+/// # Example
+/// ```rust
+/// let max_pid = platform::get_system_pid_max();
+/// if pid > max_pid {
+///     bail!("PID {} exceeds system maximum {}", pid, max_pid);
+/// }
+/// ```
+#[cfg(unix)]
+#[allow(dead_code)] // Reserved for PID validation in daemon module
+pub fn get_system_pid_max() -> ProcessId {
+    platform_get_system_pid_max()
+}
+
+#[cfg(windows)]
+#[allow(dead_code)] // Reserved for PID validation in daemon module
+pub fn get_system_pid_max() -> ProcessId {
+    platform_get_system_pid_max()
 }
 
 /// Verify that a PID belongs to kodegend process
@@ -237,3 +236,7 @@ pub fn status_socket_path(is_elevated: bool) -> PathBuf {
 pub mod signal;
 #[allow(unused_imports)] // False positive - SignalWatcher is used in manager.rs
 pub use signal::{SignalKind, SignalWatcher, watch_signals};
+
+// GUI detection for installation wizard
+mod gui_detection;
+pub use gui_detection::is_gui_available;

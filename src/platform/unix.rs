@@ -146,6 +146,7 @@ pub fn platform_running_under_service_manager() -> bool {
 }
 
 /// Cache for systemd availability detection (checked once, used forever)
+#[allow(dead_code)] // FALSE POSITIVE: Used by is_systemd_available() via get_or_init()
 static SYSTEMD_AVAILABLE: OnceLock<bool> = OnceLock::new();
 
 /// Detect if systemd is the init system on this machine
@@ -180,6 +181,7 @@ static SYSTEMD_AVAILABLE: OnceLock<bool> = OnceLock::new();
 ///     eprintln!("systemd not detected - manual daemon management required");
 /// }
 /// ```
+#[allow(dead_code)] // FALSE POSITIVE: Exported and used via platform::is_systemd_available()
 pub fn is_systemd_available() -> bool {
     *SYSTEMD_AVAILABLE.get_or_init(|| {
         std::path::Path::new("/run/systemd/system").exists()
@@ -308,7 +310,10 @@ fn is_process_alive_ps(pid: i32) -> Result<bool, std::io::Error> {
     // Run: ps -p PID -o state=
     // This outputs only the state code without headers
     let output = Command::new("ps")
-        .args(&["-p", &pid.to_string(), "-o", "state="])
+        .arg("-p")
+        .arg(pid.to_string())
+        .arg("-o")
+        .arg("state=")
         .output()?;
     
     if !output.status.success() {
@@ -431,6 +436,63 @@ pub fn platform_status_socket_path(is_elevated: bool) -> PathBuf {
     platform_runtime_dir(is_elevated).join("status.sock")
 }
 
+/// Get the system's maximum PID value for Unix platforms
+///
+/// Platform-specific implementations:
+/// - **Linux**: Read /proc/sys/kernel/pid_max and subtract 1
+///   - File contains wrap-around value (one greater than max assignable PID)
+///   - Default: 32768 (max assignable: 32767)
+///   - 64-bit max: 4194304 (configurable)
+///   - Fallback: 4,194,303 (absolute max for 64-bit Linux)
+///
+/// - **macOS**: PID_MAX is 99999 in kern_fork.c
+///   - PIDs are assigned < PID_MAX, so maximum assignable is 99998
+///   - See: https://github.com/apple/darwin-xnu/blob/main/bsd/kern/kern_fork.c
+///
+/// - **FreeBSD**: Read kern.pid_max sysctl
+///   - Fallback to 99,999 if sysctl unavailable
+///
+/// - **Other Unix**: Conservative default (32767)
+///
+/// # Returns
+/// Maximum assignable PID value for current platform
+pub(super) fn platform_get_system_pid_max() -> i32 {
+    #[cfg(target_os = "linux")]
+    {
+        // Linux: /proc/sys/kernel/pid_max contains wrap-around value
+        // Actual maximum assignable PID is (pid_max - 1)
+        // See: https://www.kernel.org/doc/html/latest/admin-guide/sysctl/kernel.html#pid-max
+        std::fs::read_to_string("/proc/sys/kernel/pid_max")
+            .ok()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+            .map(|max| max - 1)  // Subtract 1: file contains wrap-around value
+            .unwrap_or(4_194_303)  // Fallback: absolute max for 64-bit Linux
+    }
+    
+    #[cfg(target_os = "macos")]
+    {
+        // macOS: PID_MAX is 99999 in kern_fork.c
+        // PIDs are assigned < PID_MAX, so maximum assignable is 99998
+        // See: https://apple.stackexchange.com/questions/51119
+        // XNU source: https://github.com/apple/darwin-xnu/blob/main/bsd/kern/kern_fork.c
+        99998
+    }
+    
+    #[cfg(target_os = "freebsd")]
+    {
+        // FreeBSD: Try to read kern.pid_max sysctl
+        // Fallback to typical maximum if unavailable
+        get_freebsd_pid_max().unwrap_or(99_999)
+    }
+    
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
+    {
+        // Conservative fallback for other Unix systems
+        // Uses historical Unix 16-bit PID limit
+        32767
+    }
+}
+
 /// Platform-specific PID validation for Unix systems
 ///
 /// Validates that a PID is within the safe range for this platform.
@@ -439,17 +501,14 @@ pub fn platform_status_socket_path(is_elevated: bool) -> PathBuf {
 ///
 /// # Validation Rules
 /// 1. PID must be positive (> 0)
-/// 2. PID must not exceed platform-specific maximum:
-///    - Linux: Reads /proc/sys/kernel/pid_max at runtime, fallback to 4,194,303
-///    - macOS: Hard limit of 99,999 (PID wrap point)
-///    - FreeBSD: Reads kern.pid_max sysctl, fallback to 99,999
-///    - Other Unix: Conservative limit of 99,999
+/// 2. PID must not be 1 (init/systemd/launchd - critical system process)
+/// 3. PID must not exceed platform-specific maximum (prevents corrupted PID files)
 ///
 /// # Returns
 /// - Ok(()) if PID is valid and safe to use
 /// - Err with detailed error message if invalid
 pub(super) fn platform_validate_pid_range(pid: i32) -> Result<(), anyhow::Error> {
-    // Check 1: PID must be positive
+    // Check 1: PID must be positive (rejects PID 0 and negative values)
     if pid <= 0 {
         bail!(
             "Invalid PID: {} (PIDs must be positive integers)\n\
@@ -463,86 +522,34 @@ pub(super) fn platform_validate_pid_range(pid: i32) -> Result<(), anyhow::Error>
         );
     }
     
-    // Check 2: Platform-specific maximum
-    #[cfg(target_os = "linux")]
-    {
-        // Try to read runtime limit from /proc/sys/kernel/pid_max
-        let max_pid = if let Ok(pid_max_str) = fs::read_to_string("/proc/sys/kernel/pid_max") {
-            if let Ok(max) = pid_max_str.trim().parse::<i32>() {
-                // Note: pid_max is one GREATER than actual max PID
-                max - 1
-            } else {
-                // Fallback to absolute maximum for 64-bit Linux
-                4_194_303
-            }
-        } else {
-            // Fallback to absolute maximum for 64-bit Linux
-            4_194_303
-        };
-        
-        if pid > max_pid {
-            bail!(
-                "Invalid PID: {} exceeds Linux maximum {}\n\
-                 \n\
-                 Linux PID limits:\n\
-                 - Default: 32,767 (2^15 - 1)\n\
-                 - Your system: {} (from /proc/sys/kernel/pid_max)\n\
-                 - Absolute max: 4,194,303 (2^22 - 1 on 64-bit)\n\
-                 \n\
-                 This PID is outside the valid range for this system.",
-                pid,
-                max_pid,
-                max_pid
-            );
-        }
+    // Check 2: PID must not be 1 (init/systemd/launchd)
+    if pid == 1 {
+        bail!(
+            "Invalid PID: 1 (init/systemd/launchd)\n\
+             \n\
+             PID 1 is the system init process and must never be signaled.\n\
+             This indicates a corrupted PID file.",
+        );
     }
     
-    #[cfg(target_os = "macos")]
-    {
-        const MACOS_PID_MAX: i32 = 99_999;
-        
-        if pid > MACOS_PID_MAX {
-            bail!(
-                "Invalid PID: {} exceeds macOS maximum {}\n\
-                 \n\
-                 macOS PIDs wrap at 99,999. This PID is invalid.",
-                pid,
-                MACOS_PID_MAX
-            );
-        }
-    }
+    // Check 3: Platform-specific maximum (detects corrupted PID files)
+    let max_pid = platform_get_system_pid_max();
     
-    #[cfg(target_os = "freebsd")]
-    {
-        // Try to read kern.pid_max via sysctl
-        // Fallback to typical maximum if unavailable
-        let max_pid = get_freebsd_pid_max().unwrap_or(99_999);
-        
-        if pid > max_pid {
-            bail!(
-                "Invalid PID: {} exceeds FreeBSD maximum {}\n\
-                 \n\
-                 FreeBSD PID limit: {} (from kern.pid_max sysctl)\n\
-                 Typical maximum: 99,999",
-                pid,
-                max_pid,
-                max_pid
-            );
-        }
-    }
-    
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
-    {
-        // Generic Unix: use conservative maximum
-        const GENERIC_UNIX_MAX: i32 = 99_999;
-        
-        if pid > GENERIC_UNIX_MAX {
-            bail!(
-                "Invalid PID: {} exceeds maximum {} for this platform",
-                pid,
-                GENERIC_UNIX_MAX
-            );
-        }
+    if pid > max_pid {
+        bail!(
+            "Invalid PID: {} exceeds system maximum {}\n\
+             \n\
+             Platform-specific PID limits:\n\
+             - Linux: Configurable via /proc/sys/kernel/pid_max (typically 32767, max 4194303)\n\
+             - macOS: Hard limit of 99998\n\
+             - FreeBSD: Configurable via kern.pid_max sysctl (typically 99999)\n\
+             - Other Unix: Conservative default of 32767\n\
+             \n\
+             This PID is outside the valid range for this system and likely indicates\n\
+             a corrupted PID file or malicious input.",
+            pid,
+            max_pid
+        );
     }
     
     Ok(())
