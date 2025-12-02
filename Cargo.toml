@@ -1,6 +1,6 @@
 [package]
 name = "kodegend"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2024"
 description = "KODEGEN.ᴀɪ: Memory-efficient, Blazing-Fast, MCP tools for code generation agents."
 authors = ["KODEGEN.ᴀɪ"]
@@ -114,7 +114,7 @@ regex = { version = "1" }
 semver = "1.0"
 url = { version = "2" }
 uuid = { version = "1", features = ["v4"] }
-rmcp = { version = "0.9", features = [
+rmcp = { version = "0.10", features = [
   "server",
   "transport-streamable-http-server",
 ] }
