@@ -18,6 +18,9 @@
 mod handles;
 pub(crate) use handles::{ProcessHandle, TokenHandle};
 
+pub mod named_pipe;
+pub use named_pipe::{NamedPipeStream, connect_named_pipe, create_named_pipe_server};
+
 use anyhow::{Result, bail};
 use kodegen_config::KodegenConfig;
 use std::mem;

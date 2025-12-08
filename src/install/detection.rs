@@ -112,6 +112,8 @@ pub struct InstallationFixReport {
     pub hosts: Option<ComponentFixResult>,
     pub certificates: Option<ComponentFixResult>,
     pub kodegen_version: Option<ComponentFixResult>,
+    /// Service registration result (launchd/systemd/SCM)
+    pub service: Option<ComponentFixResult>,
     /// Overall success (all attempted fixes succeeded)
     pub overall_success: bool,
 }

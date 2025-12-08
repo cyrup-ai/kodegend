@@ -2,6 +2,9 @@
 //!
 //! This module handles service definition creation, configuration, and platform-specific
 //! service setup for the Kodegen daemon.
+//!
+//! Note: Functions in this module are used by Windows installer (privilege.rs:617,625)
+//! but appear unused on macOS builds due to conditional compilation.
 
 use anyhow::Result;
 
@@ -9,6 +12,8 @@ use super::super::InstallerBuilder;
 use super::super::core::{InstallContext, InstallProgress, ServiceConfig};
 
 /// Configure services for the installer with optimized service configuration
+/// Used by privilege.rs:617 (Windows installer path)
+#[allow(dead_code)]
 pub fn configure_services(context: &mut InstallContext, _auto_start: bool) -> Result<()> {
     // Configure autoconfig service
     let autoconfig_service = ServiceConfig::new(
@@ -32,6 +37,8 @@ pub fn configure_services(context: &mut InstallContext, _auto_start: bool) -> Re
 }
 
 /// Build installer configuration with platform-specific settings
+/// Used by privilege.rs:625 (Windows installer path)
+#[allow(dead_code)]
 pub fn build_installer_config(
     context: &InstallContext,
     auto_start: bool,

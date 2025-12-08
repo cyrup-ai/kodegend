@@ -541,7 +541,7 @@ impl ServiceManager {
         #[cfg(unix)]
         let socket_rx = {
             use std::os::unix::net::UnixListener;
-            
+
             let is_elevated = crate::platform::is_elevated();
             let socket_path = crate::platform::status_socket_path(is_elevated);
             
@@ -590,8 +590,67 @@ impl ServiceManager {
                 }
             }
         };
-        
-        #[cfg(not(unix))]
+
+        #[cfg(windows)]
+        let socket_rx = {
+            use crate::platform::windows::named_pipe::{NamedPipeStream, create_named_pipe_server};
+
+            let is_elevated = crate::platform::is_elevated();
+            let socket_path = crate::platform::status_socket_path(is_elevated);
+            let path_str = socket_path.to_str().expect("Invalid pipe path");
+
+            match create_named_pipe_server(path_str, 254) {
+                Ok(initial_listener) => {
+                    // Spawn thread to accept connections (Windows Named Pipe model)
+                    let (socket_tx, socket_rx) = bounded(8);
+                    let path_string = path_str.to_string();
+
+                    std::thread::spawn(move || {
+                        use windows::Win32::System::Pipes::ConnectNamedPipe;
+
+                        let mut listener = initial_listener;
+                        loop {
+                            // Wait for client connection
+                            let connect_result = unsafe {
+                                ConnectNamedPipe(listener.as_raw_handle(), None)
+                            };
+
+                            match connect_result {
+                                Ok(_) => {
+                                    // Successfully connected - send stream through channel
+                                    if socket_tx.send(listener).is_err() {
+                                        break; // Receiver dropped, exit thread
+                                    }
+
+                                    // Create new named pipe instance for next connection
+                                    match create_named_pipe_server(&path_string, 254) {
+                                        Ok(new_listener) => listener = new_listener,
+                                        Err(e) => {
+                                            log::error!("Failed to recreate named pipe: {}", e);
+                                            break;
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    log::error!("Error accepting named pipe connection: {}", e);
+                                    std::thread::sleep(Duration::from_millis(100));
+                                }
+                            }
+                        }
+                    });
+
+                    info!("Status query named pipe listening at: {}", socket_path.display());
+                    Some(socket_rx)
+                }
+                Err(e) => {
+                    error!("Failed to create named pipe at {}: {}", socket_path.display(), e);
+                    error!("Status queries will not be available");
+                    None
+                }
+            }
+        };
+
+        #[cfg(not(any(unix, windows)))]
         let socket_rx: Option<Receiver<()>> = None;
 
         let health_tick = tick(Duration::from_secs(30));
@@ -715,9 +774,9 @@ impl ServiceManager {
                     }
                 }
             }
-            
-            // Handle status queries (Unix only)
-            #[cfg(unix)]
+
+            // Handle status queries (cross-platform: Unix socket or Windows Named Pipe)
+            #[cfg(any(unix, windows))]
             if let Some(ref rx) = socket_rx {
                 select! {
                     recv(rx) -> stream => {
@@ -843,27 +902,88 @@ impl ServiceManager {
 
     /// Handle status query from Unix socket
     #[cfg(unix)]
-    fn handle_status_query(&self, mut stream: std::os::unix::net::UnixStream) -> Result<()> {
+    fn handle_status_query(&mut self, mut stream: std::os::unix::net::UnixStream) -> Result<()> {
         use crate::status::{StatusQuery, recv_message, send_message};
-        
+
         // Set read timeout to prevent hanging on malicious clients
         stream.set_read_timeout(Some(Duration::from_secs(5)))
             .context("Failed to set socket read timeout")?;
-        
+
         // Receive query from CLI
         let query: StatusQuery = recv_message(&mut stream)
             .context("Failed to receive status query")?;
-        
-        // Build response
-        let response = match query {
-            StatusQuery::All => self.build_full_status(),
-            StatusQuery::Service(name) => self.build_service_status(&name),
-        }?;
-        
-        // Send response back to CLI
-        send_message(&mut stream, &response)
-            .context("Failed to send status response")?;
-        
+
+        // Handle query
+        match query {
+            StatusQuery::All => {
+                let response = self.build_full_status()?;
+                send_message(&mut stream, &response)
+                    .context("Failed to send status response")?;
+            }
+            StatusQuery::Service(name) => {
+                let response = self.build_service_status(&name)?;
+                send_message(&mut stream, &response)
+                    .context("Failed to send status response")?;
+            }
+            StatusQuery::UsageStats(connection_id) => {
+                // Block on async aggregation (we're in sync context)
+                let rt = tokio::runtime::Handle::current();
+                let response = rt.block_on(self.aggregate_usage_stats(&connection_id))?;
+                send_message(&mut stream, &response)
+                    .context("Failed to send usage stats response")?;
+            }
+            StatusQuery::ToolHistory(connection_id) => {
+                // Block on async aggregation (we're in sync context)
+                let rt = tokio::runtime::Handle::current();
+                let response = rt.block_on(self.aggregate_tool_history(&connection_id))?;
+                send_message(&mut stream, &response)
+                    .context("Failed to send tool history response")?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Handle status query from Windows Named Pipe
+    #[cfg(windows)]
+    fn handle_status_query(&mut self, mut stream: crate::platform::windows::named_pipe::NamedPipeStream) -> Result<()> {
+        use crate::status::{StatusQuery, recv_message, send_message};
+
+        // Note: Windows Named Pipes don't have set_read_timeout in our wrapper
+        // The timeout is handled at the pipe creation level
+
+        // Receive query from CLI
+        let query: StatusQuery = recv_message(&mut stream)
+            .context("Failed to receive status query")?;
+
+        // Handle query (same logic as Unix)
+        match query {
+            StatusQuery::All => {
+                let response = self.build_full_status()?;
+                send_message(&mut stream, &response)
+                    .context("Failed to send status response")?;
+            }
+            StatusQuery::Service(name) => {
+                let response = self.build_service_status(&name)?;
+                send_message(&mut stream, &response)
+                    .context("Failed to send status response")?;
+            }
+            StatusQuery::UsageStats(connection_id) => {
+                // Block on async aggregation (we're in sync context)
+                let rt = tokio::runtime::Handle::current();
+                let response = rt.block_on(self.aggregate_usage_stats(&connection_id))?;
+                send_message(&mut stream, &response)
+                    .context("Failed to send usage stats response")?;
+            }
+            StatusQuery::ToolHistory(connection_id) => {
+                // Block on async aggregation (we're in sync context)
+                let rt = tokio::runtime::Handle::current();
+                let response = rt.block_on(self.aggregate_tool_history(&connection_id))?;
+                send_message(&mut stream, &response)
+                    .context("Failed to send tool history response")?;
+            }
+        }
+
         Ok(())
     }
 
@@ -1344,6 +1464,350 @@ impl ServiceManager {
                 error!("Vulnerability scan failed: {}", e);
             }
         }
+    }
+
+    /// Aggregate usage statistics from all embedded HTTP servers
+    ///
+    /// Queries all backend servers in parallel via GET /mcp/stats, aggregates results,
+    /// and returns AggregatedUsageStats for Unix socket serialization.
+    ///
+    /// # Returns
+    /// - Returns AggregatedUsageStats even if some servers fail (partial failure tolerance)
+    /// - Failed servers are marked with available=false and error message
+    /// - Global aggregates only include stats from available servers
+    ///
+    /// # Performance
+    /// - Parallel HTTP queries (all servers queried simultaneously)
+    /// - 2-second timeout per server (prevents hanging on crashed servers)
+    /// - Total aggregation time: ~2 seconds for all servers
+    async fn aggregate_usage_stats(&self, connection_id: &str) -> anyhow::Result<crate::status::AggregatedUsageStats> {
+        use tokio::time::{timeout, Duration};
+        use anyhow::Context;
+        use crate::status::{AggregatedUsageStats, ServerStats, UsageStatsSnapshot, GlobalAggregates};
+
+        let aggregated_at = chrono::Utc::now().timestamp();
+
+        // Get embedded servers or return empty response if None
+        let embedded_servers = match &self.embedded_servers {
+            Some(servers) => servers,
+            None => {
+                return Ok(AggregatedUsageStats {
+                    aggregated_at,
+                    servers_queried: 0,
+                    servers_failed: 0,
+                    servers: Vec::new(),
+                    global: GlobalAggregates {
+                        total_tool_calls: 0,
+                        successful_calls: 0,
+                        failed_calls: 0,
+                        success_rate: 0.0,
+                        total_sessions: 0,
+                        categories_active: 0,
+                    },
+                });
+            }
+        };
+
+        // Create HTTP client (reuse TLS config, connection pooling)
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))  // Per-request timeout
+            .build()
+            .context("Failed to create HTTP client for stats aggregation")?;
+
+        // Query all servers in parallel
+        let futures: Vec<_> = embedded_servers
+            .iter()
+            .map(|server| {
+                let client = client.clone();
+                let category = server.name.clone();
+                let port = server.port;
+                let conn_id = connection_id.to_string();
+
+                async move {
+                    // Query with timeout (include connection_id parameter for per-connection isolation)
+                    let url = format!("http://127.0.0.1:{}/mcp/stats?connection_id={}", port, conn_id);
+
+                    match timeout(
+                        Duration::from_secs(2),
+                        client.get(&url).send()
+                    ).await {
+                        Ok(Ok(response)) => {
+                            // Successfully received response - parse UsageStats JSON
+                            match response.json::<serde_json::Value>().await {
+                                Ok(json) => {
+                                    // Parse UsageStats fields into UsageStatsSnapshot
+                                    let snapshot = UsageStatsSnapshot {
+                                        total_tool_calls: json["stats"]["total_tool_calls"].as_u64().unwrap_or(0),
+                                        successful_calls: json["stats"]["successful_calls"].as_u64().unwrap_or(0),
+                                        failed_calls: json["stats"]["failed_calls"].as_u64().unwrap_or(0),
+                                        tool_counts: json["stats"]["tool_counts"]
+                                            .as_object()
+                                            .map(|obj| {
+                                                obj.iter()
+                                                    .filter_map(|(k, v)| {
+                                                        v.as_u64().map(|count| (k.clone(), count))
+                                                    })
+                                                    .collect()
+                                            })
+                                            .unwrap_or_default(),
+                                        first_used: json["stats"]["first_used"].as_i64().unwrap_or(0),
+                                        last_used: json["stats"]["last_used"].as_i64().unwrap_or(0),
+                                        total_sessions: json["stats"]["total_sessions"].as_u64().unwrap_or(0),
+                                    };
+
+                                    ServerStats {
+                                        category,
+                                        port,
+                                        available: true,
+                                        error: None,
+                                        stats: snapshot,
+                                    }
+                                }
+                                Err(e) => {
+                                    // JSON parse error
+                                    ServerStats {
+                                        category,
+                                        port,
+                                        available: false,
+                                        error: Some(format!("JSON parse error: {}", e)),
+                                        stats: UsageStatsSnapshot {
+                                            total_tool_calls: 0,
+                                            successful_calls: 0,
+                                            failed_calls: 0,
+                                            tool_counts: std::collections::HashMap::new(),
+                                            first_used: 0,
+                                            last_used: 0,
+                                            total_sessions: 0,
+                                        },
+                                    }
+                                }
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            // HTTP request error
+                            ServerStats {
+                                category,
+                                port,
+                                available: false,
+                                error: Some(format!("HTTP error: {}", e)),
+                                stats: UsageStatsSnapshot {
+                                    total_tool_calls: 0,
+                                    successful_calls: 0,
+                                    failed_calls: 0,
+                                    tool_counts: std::collections::HashMap::new(),
+                                    first_used: 0,
+                                    last_used: 0,
+                                    total_sessions: 0,
+                                },
+                            }
+                        }
+                        Err(_) => {
+                            // Timeout
+                            ServerStats {
+                                category,
+                                port,
+                                available: false,
+                                error: Some("Timeout (2s)".to_string()),
+                                stats: UsageStatsSnapshot {
+                                    total_tool_calls: 0,
+                                    successful_calls: 0,
+                                    failed_calls: 0,
+                                    tool_counts: std::collections::HashMap::new(),
+                                    first_used: 0,
+                                    last_used: 0,
+                                    total_sessions: 0,
+                                },
+                            }
+                        }
+                    }
+                }
+            })
+            .collect();
+
+        // Wait for all queries to complete (no early exit on failure)
+        let server_results = futures::future::join_all(futures).await;
+
+        // Compute global aggregates and count failures
+        let mut global_total_calls = 0u64;
+        let mut global_successful = 0u64;
+        let mut global_failed = 0u64;
+        let mut global_sessions = 0u64;
+        let mut servers_failed = 0usize;
+        let mut categories_active = 0usize;
+
+        for server_stats in &server_results {
+            if !server_stats.available {
+                servers_failed += 1;
+            } else {
+                // Only aggregate from available servers
+                global_total_calls += server_stats.stats.total_tool_calls;
+                global_successful += server_stats.stats.successful_calls;
+                global_failed += server_stats.stats.failed_calls;
+                global_sessions += server_stats.stats.total_sessions;
+
+                if server_stats.stats.total_tool_calls > 0 {
+                    categories_active += 1;
+                }
+            }
+        }
+
+        let success_rate = if global_total_calls > 0 {
+            (global_successful as f64) / (global_total_calls as f64)
+        } else {
+            0.0
+        };
+
+        Ok(AggregatedUsageStats {
+            aggregated_at,
+            servers_queried: embedded_servers.len(),
+            servers_failed,
+            servers: server_results,
+            global: GlobalAggregates {
+                total_tool_calls: global_total_calls,
+                successful_calls: global_successful,
+                failed_calls: global_failed,
+                success_rate,
+                total_sessions: global_sessions,
+                categories_active,
+            },
+        })
+    }
+
+    /// Aggregate tool history from all embedded HTTP servers for a specific connection
+    ///
+    /// Similar to aggregate_usage_stats but queries /mcp/history endpoint instead.
+    /// Returns tool call records across all servers for the given connection_id.
+    ///
+    /// # Returns
+    /// - Returns AggregatedToolHistory even if some servers fail (partial failure tolerance)
+    /// - Failed servers are marked with available=false and error message
+    ///
+    /// # Performance
+    /// - Parallel HTTP queries (all servers queried simultaneously)
+    /// - 2-second timeout per server (prevents hanging on crashed servers)
+    async fn aggregate_tool_history(&self, connection_id: &str) -> anyhow::Result<crate::status::AggregatedToolHistory> {
+        use tokio::time::{timeout, Duration};
+        use anyhow::Context;
+        use crate::status::{AggregatedToolHistory, ServerToolHistory, ToolCallRecord};
+
+        let aggregated_at = chrono::Utc::now().timestamp();
+
+        // Get embedded servers or return empty response
+        let embedded_servers = match &self.embedded_servers {
+            Some(servers) => servers,
+            None => {
+                return Ok(AggregatedToolHistory {
+                    aggregated_at,
+                    connection_id: connection_id.to_string(),
+                    servers_queried: 0,
+                    servers_failed: 0,
+                    servers: Vec::new(),
+                    total_calls: 0,
+                });
+            }
+        };
+
+        // Create HTTP client (reuse TLS config, connection pooling)
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))  // Per-request timeout
+            .build()
+            .context("Failed to create HTTP client for tool history aggregation")?;
+
+        // Query all servers in parallel
+        let futures: Vec<_> = embedded_servers
+            .iter()
+            .map(|server| {
+                let client = client.clone();
+                let category = server.name.clone();
+                let port = server.port;
+                let conn_id = connection_id.to_string();
+
+                async move {
+                    // Query with timeout (include connection_id parameter for per-connection isolation)
+                    let url = format!("http://127.0.0.1:{}/mcp/history?connection_id={}", port, conn_id);
+
+                    match timeout(
+                        Duration::from_secs(2),
+                        client.get(&url).send()
+                    ).await {
+                        Ok(Ok(response)) => {
+                            // Successfully received response - parse history JSON
+                            match response.json::<serde_json::Value>().await {
+                                Ok(json) => {
+                                    // Parse tool call records from response
+                                    let calls: Vec<ToolCallRecord> = json["calls"]
+                                        .as_array()
+                                        .map(|arr| {
+                                            arr.iter()
+                                                .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                                                .collect()
+                                        })
+                                        .unwrap_or_default();
+
+                                    ServerToolHistory {
+                                        category,
+                                        port,
+                                        available: true,
+                                        error: None,
+                                        calls,
+                                    }
+                                }
+                                Err(e) => {
+                                    ServerToolHistory {
+                                        category,
+                                        port,
+                                        available: false,
+                                        error: Some(format!("JSON parse error: {}", e)),
+                                        calls: Vec::new(),
+                                    }
+                                }
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            ServerToolHistory {
+                                category,
+                                port,
+                                available: false,
+                                error: Some(format!("HTTP error: {}", e)),
+                                calls: Vec::new(),
+                            }
+                        }
+                        Err(_) => {
+                            ServerToolHistory {
+                                category,
+                                port,
+                                available: false,
+                                error: Some("Timeout (2s)".to_string()),
+                                calls: Vec::new(),
+                            }
+                        }
+                    }
+                }
+            })
+            .collect();
+
+        let server_results = futures::future::join_all(futures).await;
+
+        // Count failures and total calls across all servers
+        let mut servers_failed = 0usize;
+        let mut total_calls = 0usize;
+
+        for server in &server_results {
+            if !server.available {
+                servers_failed += 1;
+            } else {
+                total_calls += server.calls.len();
+            }
+        }
+
+        Ok(AggregatedToolHistory {
+            aggregated_at,
+            connection_id: connection_id.to_string(),
+            servers_queried: embedded_servers.len(),
+            servers_failed,
+            servers: server_results,
+            total_calls,
+        })
     }
 
     /// Process pending restarts that are ready

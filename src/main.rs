@@ -270,6 +270,92 @@ async fn handle_status() -> Result<()> {
                     }
                 }
             }
+
+            #[cfg(windows)]
+            {
+                use crate::status::{StatusQuery, send_message, recv_message, format_duration};
+                use crate::platform::windows::named_pipe::connect_named_pipe;
+
+                let is_elevated = crate::platform::is_elevated();
+                let socket_path = crate::platform::status_socket_path(is_elevated);
+                let path_str = socket_path.to_str().expect("Invalid pipe path");
+
+                match connect_named_pipe(path_str) {
+                    Ok(mut stream) => {
+                        // Note: Windows Named Pipes don't have set_read_timeout in our wrapper
+                        // Timeout is handled at pipe creation level
+
+                        // Send query
+                        if let Err(e) = send_message(&mut stream, &StatusQuery::All) {
+                            cli_output::error(&format!("kodegend is running (PID: {}) but status query failed: {}", pid, e));
+                            std::process::exit(0);
+                        }
+
+                        // Receive response
+                        let response: crate::status::StatusResponse = match recv_message(&mut stream) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                cli_output::error(&format!("kodegend is running (PID: {}) but failed to receive status: {}", pid, e));
+                                std::process::exit(0);
+                            }
+                        };
+
+                        // Display formatted output (same as Unix)
+                        cli_output::info("● kodegend.service - KODEGEN Daemon");
+                        cli_output::info("   Active: active (running)");
+                        cli_output::info(&format!("   Main PID: {}", response.daemon_pid));
+                        cli_output::info(&format!("   Uptime: {}", format_duration(response.daemon_uptime)));
+                        println!();
+
+                        if response.services.is_empty() {
+                            cli_output::info("   No services configured");
+                        } else {
+                            cli_output::info("   Services:");
+                            for svc in response.services {
+                                let state_str = format!("{:?}", svc.state).to_lowercase();
+                                print!("     {:24} {:10}", svc.name, state_str);
+
+                                if let Some(uptime) = svc.uptime {
+                                    print!("  uptime={}", format_duration(uptime));
+                                }
+
+                                let restarts_display = if let Some(max) = svc.max_restarts {
+                                    format!("{}/{}", svc.restart_count, max)
+                                } else {
+                                    format!("{}/∞", svc.restart_count)
+                                };
+                                print!("  restarts={}", restarts_display);
+
+                                if let Some(delay) = svc.next_restart_delay {
+                                    print!("  (restarting in {})", format_duration(delay));
+                                }
+
+                                if let Some(remaining) = svc.success_window_remaining
+                                    && remaining.as_secs() > 0
+                                {
+                                    print!("  (counter resets in {})", format_duration(remaining));
+                                }
+
+                                if let Some(reason) = svc.failure_reason {
+                                    print!("  reason=\"{}\"", reason);
+                                }
+
+                                println!();
+                            }
+                        }
+
+                        std::process::exit(0);
+                    }
+                    Err(_) => {
+                        // Named pipe not available, fall back to basic status
+                        cli_output::info("● kodegend.service - KODEGEN Daemon");
+                        cli_output::info("   Active: active (running)");
+                        cli_output::info(&format!("   Main PID: {}", pid));
+                        cli_output::info("   Note: Detailed status not available (named pipe unavailable)");
+                        std::process::exit(0);
+                    }
+                }
+            }
             
             #[cfg(not(unix))]
             {

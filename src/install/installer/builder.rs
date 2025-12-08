@@ -76,18 +76,24 @@ impl InstallerBuilder {
     }
 
     /// Set an environment variable.
+    /// Used by services.rs:47 (Windows installer path)
+    #[allow(dead_code)]
     pub fn env(mut self, k: impl Into<String>, v: impl Into<String>) -> Self {
         self.env.insert(k.into(), v.into());
         self
     }
 
     /// Set the user account to run as.
+    /// Used by services.rs:69 (macOS installer path)
+    #[allow(dead_code)]
     pub fn user(mut self, u: impl Into<String>) -> Self {
         self.run_as_user = u.into();
         self
     }
 
     /// Set the group to run as (Unix only).
+    /// Used by services.rs:61,69 (Linux/macOS installer paths)
+    #[allow(dead_code)]
     pub fn group(mut self, g: impl Into<String>) -> Self {
         self.run_as_group = g.into();
         self
@@ -106,12 +112,16 @@ impl InstallerBuilder {
     }
 
     /// Specify whether the daemon requires network availability.
+    /// Used by services.rs:49 (Windows installer path)
+    #[allow(dead_code)]
     pub fn network(mut self, v: bool) -> Self {
         self.wants_network = v;
         self
     }
 
     /// Add a service definition to install with the daemon.
+    /// Used by services.rs:54 (Windows installer path)
+    #[allow(dead_code)]
     pub fn service(self, service: ServiceDefinition) -> Self {
         let mut services = self.services;
         services.push(service);

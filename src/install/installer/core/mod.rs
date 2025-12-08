@@ -1,21 +1,23 @@
-//! Core installer structures and async task management
+//! Core installer structures for cross-platform daemon installation
 //!
-//! This module provides the core installer functionality with async task handling,
-//! certificate generation, and service configuration with zero allocation fast paths
-//! and blazing-fast performance.
+//! This module provides the core installer functionality with certificate generation
+//! and service configuration. Used by platform-specific installers (Windows, Linux, macOS).
 
 // Module declarations
-mod async_task;
 mod certificate;
 mod context;
 mod progress;
 mod service;
 
 // Re-export all public types
-pub use async_task::AsyncTask;
+// Note: CertificateConfig, InstallContext, ServiceConfig are used by Windows installer
+// (see privilege.rs:608, services.rs:12) but appear unused on macOS builds
+#[allow(unused_imports)]
 pub use certificate::CertificateConfig;
+#[allow(unused_imports)]
 pub use context::InstallContext;
 #[allow(unused_imports)]
 pub use progress::DownloadPhase;
 pub use progress::InstallProgress;
+#[allow(unused_imports)]
 pub use service::ServiceConfig;

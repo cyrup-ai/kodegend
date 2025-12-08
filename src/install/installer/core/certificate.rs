@@ -1,9 +1,13 @@
 //! Certificate generation configuration
+//!
+//! Used by InstallContext for Windows installer path.
 
 /// Certificate generation configuration
+/// Used by InstallContext (context.rs:43) which is used by Windows installer
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct CertificateConfig {
-    /// Common Name for certificate (used in context.rs:197, 282)
+    /// Common Name for certificate (used in context.rs:208)
     pub common_name: String,
     /// Organization name (used in context.rs:204, 284)
     pub organization: String,

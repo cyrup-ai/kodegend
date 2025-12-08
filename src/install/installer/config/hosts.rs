@@ -81,10 +81,8 @@ fn write_hosts_file_atomic(path: &Path, content: &str) -> Result<()> {
 
 /// Add Kodegen host entries with lock-protected atomic modification
 ///
-/// Used by uninstall.rs for structured hosts file management.
-/// Install phase uses shell script version in main.rs for simplicity.
+/// Used by both install and uninstall for structured hosts file management.
 /// This Rust version provides flock-based locking and atomic block management.
-#[allow(dead_code)]
 #[cfg(unix)]
 pub fn add_kodegen_host_entries() -> Result<()> {
     use nix::fcntl::{Flock, FlockArg};

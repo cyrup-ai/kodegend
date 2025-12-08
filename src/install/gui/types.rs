@@ -1,10 +1,5 @@
 //! Type definitions for GUI installation progress tracking
 
-use std::time::Duration;
-
-/// Timeout for installation completion (matches fluent_voice.rs git clone timeout)
-pub const INSTALL_TIMEOUT: Duration = Duration::from_secs(600); // 10 minutes
-
 /// Per-binary download status for GUI display
 #[derive(Debug, Clone)]
 pub struct BinaryDownloadStatus {

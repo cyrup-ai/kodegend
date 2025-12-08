@@ -2,44 +2,41 @@
 //!
 //! Each function fixes a single component independently.
 //! Privilege escalation is collected ONCE and shared across all operations.
+//!
+//! This is THE logic layer - GUI and CLI are presentation only.
 
 use anyhow::Result;
 use std::path::PathBuf;
+use tokio::sync::mpsc;
 
 use super::cleanup::InstallationCleanupContext;
+use super::core::InstallProgress;
 use super::detection::{ComponentFixResult, ComponentStatus};
 #[cfg(unix)]
 use super::privilege::PrivilegedExecutor;
 
-/// Fix hosts file entry using shared privileged executor
+/// Helper to send progress (best effort, ignores errors)
+fn send_progress(tx: &Option<mpsc::Sender<InstallProgress>>, progress: InstallProgress) {
+    if let Some(sender) = tx {
+        let _ = sender.try_send(progress);
+    }
+}
+
+/// Fix hosts file entry using atomic flock + write operations
+///
+/// Uses the proper `add_kodegen_host_entries()` function which provides:
+/// - flock-based locking (prevents concurrent modification)
+/// - Atomic temp file + rename pattern
+/// - Proper Kodegen block format
 #[cfg(unix)]
-pub async fn fix_hosts(executor: &mut PrivilegedExecutor) -> ComponentFixResult {
+pub async fn fix_hosts(_executor: &mut PrivilegedExecutor) -> ComponentFixResult {
     log::info!("Fixing hosts file entry...");
 
-    // Check if already configured
-    if super::hosts::hosts_entry_exists() {
-        log::info!("Hosts entry: already present");
-        return ComponentFixResult {
-            component: "hosts",
-            success: true,
-            error: None,
-            required_sudo: false,
-        };
-    }
-
-    // Add entry using direct file append (privileged)
-    let hosts_path = if cfg!(unix) {
-        std::path::Path::new("/etc/hosts")
-    } else {
-        std::path::Path::new(r"C:\Windows\System32\drivers\etc\hosts")
-    };
-
-    match executor
-        .append_to_file(hosts_path, "127.0.0.1 mcp.kodegen.ai\n")
-        .await
-    {
+    // Use the proper atomic function from installer::config::hosts
+    // This handles checking if entry exists, locking, and atomic write
+    match crate::install::installer::config::add_kodegen_host_entries() {
         Ok(()) => {
-            log::info!("Hosts entry: added");
+            log::info!("Hosts entry: OK");
             ComponentFixResult {
                 component: "hosts",
                 success: true,
@@ -186,11 +183,15 @@ fn generate_certificate_content_only() -> Result<String> {
 }
 
 /// Fix kodegen binary version using shared privileged executor
+///
+/// Accepts optional progress channel - if provided, download progress flows through it.
 #[cfg(unix)]
-pub async fn fix_kodegen_version(executor: &mut PrivilegedExecutor) -> ComponentFixResult {
+pub async fn fix_kodegen_version(
+    executor: &mut PrivilegedExecutor,
+    progress_tx: Option<mpsc::Sender<InstallProgress>>,
+) -> ComponentFixResult {
     use super::binary_staging;
     use super::download;
-    use tokio::sync::mpsc;
 
     log::info!("Fixing kodegen version...");
 
@@ -224,13 +225,18 @@ pub async fn fix_kodegen_version(executor: &mut PrivilegedExecutor) -> Component
     let mut cleanup_ctx = InstallationCleanupContext::new();
 
     // Step 1: Download binary (unprivileged)
-    let (tx, mut rx) = mpsc::channel(100);
-
-    let progress_task = tokio::spawn(async move {
-        while rx.recv().await.is_some() {
-            // Silently consume progress messages
-        }
-    });
+    // Use provided channel or create a dummy one that discards progress
+    let (tx, rx) = if let Some(ref sender) = progress_tx {
+        (sender.clone(), None)
+    } else {
+        let (tx, mut rx) = mpsc::channel(100);
+        // Spawn task to consume progress if no external channel
+        tokio::spawn(async move {
+            while rx.recv().await.is_some() {}
+        });
+        (tx, None::<mpsc::Receiver<InstallProgress>>)
+    };
+    let _ = rx; // Silence unused warning
 
     let binary_paths = match download::download_all_binaries(tx).await {
         Ok((paths, download_dir)) => {
@@ -247,8 +253,6 @@ pub async fn fix_kodegen_version(executor: &mut PrivilegedExecutor) -> Component
             };
         }
     };
-
-    let _ = progress_task.await;
 
     if binary_paths.is_empty() {
         return ComponentFixResult {
@@ -391,18 +395,79 @@ pub async fn fix_toolchain(_executor: &mut PrivilegedExecutor) -> ComponentFixRe
 ///
 /// Checks each component and fixes only those that need it.
 /// Spawns privileged executor ONCE if any operation needs sudo.
-/// Uses fail-fast behavior: stops on first failure.
+/// Emits progress events to the provided channel for GUI/CLI display.
+///
+/// This is THE logic layer - GUI and CLI are presentation only.
 #[cfg(unix)]
-pub async fn fix_all_components() -> Result<super::detection::InstallationFixReport> {
+pub async fn fix_all_components(
+    progress_tx: Option<mpsc::Sender<InstallProgress>>,
+) -> Result<super::detection::InstallationFixReport> {
+    // === TOOLCHAIN ===
+    send_progress(
+        &progress_tx,
+        InstallProgress::new("toolchain".into(), 0.0, "Checking toolchain...".into()),
+    );
     let status = super::detection::check_all_components().await;
 
+    if status.toolchain == ComponentStatus::Ok {
+        send_progress(
+            &progress_tx,
+            InstallProgress::new("toolchain".into(), 1.0, "✓ Toolchain OK".into()),
+        );
+    }
+
+    // === HOSTS ===
+    send_progress(
+        &progress_tx,
+        InstallProgress::new("hosts".into(), 0.0, "Checking hosts...".into()),
+    );
+    if status.hosts == ComponentStatus::Ok {
+        send_progress(
+            &progress_tx,
+            InstallProgress::new("hosts".into(), 1.0, "✓ Hosts OK".into()),
+        );
+    }
+
+    // === CERTIFICATES ===
+    send_progress(
+        &progress_tx,
+        InstallProgress::new("certificates".into(), 0.0, "Checking certificates...".into()),
+    );
+    if status.certificates == ComponentStatus::Ok {
+        send_progress(
+            &progress_tx,
+            InstallProgress::new("certificates".into(), 1.0, "✓ Certificates OK".into()),
+        );
+    }
+
+    // === KODEGEN VERSION ===
+    send_progress(
+        &progress_tx,
+        InstallProgress::new("kodegen".into(), 0.0, "Checking kodegen version...".into()),
+    );
+    if status.kodegen_version == ComponentStatus::Ok {
+        let version_str = super::detection::get_installed_binary_version("kodegen")
+            .await
+            .unwrap_or_else(|| "unknown".to_string());
+        send_progress(
+            &progress_tx,
+            InstallProgress::new("kodegen".into(), 1.0, format!("✓ Kodegen {} (up to date)", version_str)),
+        );
+    }
+
+    // If all OK, we're done
     if status.all_ok() {
         log::info!("All installation components verified OK");
+        send_progress(
+            &progress_tx,
+            InstallProgress::complete("complete".into(), "All components OK".into()),
+        );
         return Ok(super::detection::InstallationFixReport {
             toolchain: None,
             hosts: None,
             certificates: None,
             kodegen_version: None,
+            service: None,
             overall_success: true,
         });
     }
@@ -417,29 +482,47 @@ pub async fn fix_all_components() -> Result<super::detection::InstallationFixRep
         hosts: None,
         certificates: None,
         kodegen_version: None,
+        service: None,
         overall_success: true,
     };
 
     // Spawn privileged executor ONCE if any operation needs sudo
     let mut executor = if status.needs_sudo() {
         log::info!("Privileged operations required, collecting sudo credentials...");
+        send_progress(
+            &progress_tx,
+            InstallProgress::new("privilege".into(), 0.0, "Requesting elevated privileges...".into()),
+        );
         Some(PrivilegedExecutor::spawn().await?)
     } else {
         None
     };
 
     // Fix toolchain FIRST if needed (FAIL-FAST) - required for building
-    // Note: toolchain fix doesn't require sudo (rustup runs as user)
     if status.toolchain != ComponentStatus::Ok {
+        send_progress(
+            &progress_tx,
+            InstallProgress::new("toolchain".into(), 0.5, "Fixing toolchain...".into()),
+        );
         log::info!("Fixing toolchain (status: {:?})...", status.toolchain);
         let result = if let Some(ref mut exec) = executor {
             fix_toolchain(exec).await
         } else {
-            // Create a temporary executor for toolchain (spawns without sudo prompts if not needed)
             let mut temp_exec = PrivilegedExecutor::spawn().await?;
             fix_toolchain(&mut temp_exec).await
         };
         let success = result.success;
+        if success {
+            send_progress(
+                &progress_tx,
+                InstallProgress::new("toolchain".into(), 1.0, "✓ Toolchain fixed".into()),
+            );
+        } else {
+            send_progress(
+                &progress_tx,
+                InstallProgress::error("toolchain".into(), format!("✗ Toolchain failed: {}", result.error.as_deref().unwrap_or("unknown"))),
+            );
+        }
         report.toolchain = Some(result);
         if !success {
             report.overall_success = false;
@@ -449,6 +532,10 @@ pub async fn fix_all_components() -> Result<super::detection::InstallationFixRep
 
     // Fix hosts if needed (FAIL-FAST)
     if status.hosts != ComponentStatus::Ok {
+        send_progress(
+            &progress_tx,
+            InstallProgress::new("hosts".into(), 0.5, "Fixing hosts entry...".into()),
+        );
         log::info!("Fixing hosts entry (status: {:?})...", status.hosts);
         let result = if let Some(ref mut exec) = executor {
             fix_hosts(exec).await
@@ -461,6 +548,17 @@ pub async fn fix_all_components() -> Result<super::detection::InstallationFixRep
             }
         };
         let success = result.success;
+        if success {
+            send_progress(
+                &progress_tx,
+                InstallProgress::new("hosts".into(), 1.0, "✓ Hosts fixed".into()),
+            );
+        } else {
+            send_progress(
+                &progress_tx,
+                InstallProgress::error("hosts".into(), format!("✗ Hosts failed: {}", result.error.as_deref().unwrap_or("unknown"))),
+            );
+        }
         report.hosts = Some(result);
         if !success {
             report.overall_success = false;
@@ -470,6 +568,10 @@ pub async fn fix_all_components() -> Result<super::detection::InstallationFixRep
 
     // Fix certificates if needed (FAIL-FAST)
     if status.certificates != ComponentStatus::Ok {
+        send_progress(
+            &progress_tx,
+            InstallProgress::new("certificates".into(), 0.5, "Fixing certificates...".into()),
+        );
         log::info!("Fixing certificates (status: {:?})...", status.certificates);
         let result = if let Some(ref mut exec) = executor {
             fix_certificates(exec).await
@@ -482,6 +584,17 @@ pub async fn fix_all_components() -> Result<super::detection::InstallationFixRep
             }
         };
         let success = result.success;
+        if success {
+            send_progress(
+                &progress_tx,
+                InstallProgress::new("certificates".into(), 1.0, "✓ Certificates fixed".into()),
+            );
+        } else {
+            send_progress(
+                &progress_tx,
+                InstallProgress::error("certificates".into(), format!("✗ Certificates failed: {}", result.error.as_deref().unwrap_or("unknown"))),
+            );
+        }
         report.certificates = Some(result);
         if !success {
             report.overall_success = false;
@@ -490,13 +603,18 @@ pub async fn fix_all_components() -> Result<super::detection::InstallationFixRep
     }
 
     // Fix kodegen version if needed (FAIL-FAST)
+    // This passes the progress channel through for download progress
     if status.kodegen_version != ComponentStatus::Ok {
+        send_progress(
+            &progress_tx,
+            InstallProgress::new("kodegen".into(), 0.1, "Updating kodegen...".into()),
+        );
         log::info!(
             "Fixing kodegen version (status: {:?})...",
             status.kodegen_version
         );
         let result = if let Some(ref mut exec) = executor {
-            fix_kodegen_version(exec).await
+            fix_kodegen_version(exec, progress_tx.clone()).await
         } else {
             ComponentFixResult {
                 component: "kodegen_version",
@@ -506,6 +624,17 @@ pub async fn fix_all_components() -> Result<super::detection::InstallationFixRep
             }
         };
         let success = result.success;
+        if success {
+            send_progress(
+                &progress_tx,
+                InstallProgress::new("kodegen".into(), 1.0, "✓ Kodegen updated".into()),
+            );
+        } else {
+            send_progress(
+                &progress_tx,
+                InstallProgress::error("kodegen".into(), format!("✗ Kodegen failed: {}", result.error.as_deref().unwrap_or("unknown"))),
+            );
+        }
         report.kodegen_version = Some(result);
         if !success {
             report.overall_success = false;
@@ -513,19 +642,331 @@ pub async fn fix_all_components() -> Result<super::detection::InstallationFixRep
         }
     }
 
+    // === CHROMIUM ===
+    send_progress(
+        &progress_tx,
+        InstallProgress::new("chromium".into(), 0.0, "Checking Chromium...".into()),
+    );
+
+    // Check if chromium is installed
+    let chromium_installed = kodegen_tools_browser::find_browser_executable().await.is_ok();
+
+    if chromium_installed {
+        send_progress(
+            &progress_tx,
+            InstallProgress::new("chromium".into(), 1.0, "✓ Chromium OK".into()),
+        );
+    } else {
+        send_progress(
+            &progress_tx,
+            InstallProgress::new("chromium".into(), 0.1, "Installing Chromium (~100MB)...".into()),
+        );
+        match super::chromium::install_chromium().await {
+            Ok(_) => {
+                send_progress(
+                    &progress_tx,
+                    InstallProgress::new("chromium".into(), 1.0, "✓ Chromium installed".into()),
+                );
+            }
+            Err(e) => {
+                send_progress(
+                    &progress_tx,
+                    InstallProgress::error("chromium".into(), format!("✗ Chromium failed: {}", e)),
+                );
+                report.overall_success = false;
+                return Ok(report);
+            }
+        }
+    }
+
+    // === SERVICE REGISTRATION (ALL PLATFORMS) ===
+    send_progress(
+        &progress_tx,
+        InstallProgress::new("service".into(), 0.0, "Checking service registration...".into()),
+    );
+
+    let service_result = fix_service_registration(&progress_tx).await;
+    report.service = Some(service_result.clone());
+
+    if service_result.success {
+        send_progress(
+            &progress_tx,
+            InstallProgress::new("service".into(), 1.0, "✓ Service registered".into()),
+        );
+    } else {
+        send_progress(
+            &progress_tx,
+            InstallProgress::error(
+                "service".into(),
+                format!("✗ Service registration failed: {}", service_result.error.as_deref().unwrap_or("unknown")),
+            ),
+        );
+        // Service registration failure is not fatal - daemon can still run manually
+        log::warn!("Service registration failed, daemon will run but not as system service");
+    }
+
     log::info!("All component fixes completed successfully");
+    send_progress(
+        &progress_tx,
+        InstallProgress::complete("complete".into(), "Installation complete".into()),
+    );
     Ok(report)
+}
+
+// ============================================================================
+// SERVICE REGISTRATION - Cross-platform daemon service installation
+// ============================================================================
+
+/// Fix service registration - register daemon as system service if needed
+///
+/// ALL PLATFORMS: macOS (launchd), Linux (systemd), Windows (SCM), BSD (rc.d)
+/// Checks on EVERY startup - installs if missing, updates if outdated.
+pub async fn fix_service_registration(
+    progress_tx: &Option<mpsc::Sender<InstallProgress>>,
+) -> ComponentFixResult {
+    use crate::platform;
+
+    // Skip if already running under service manager
+    if platform::running_under_service_manager() {
+        log::info!("Running under service manager, skipping registration");
+        return ComponentFixResult {
+            component: "service",
+            success: true,
+            error: None,
+            required_sudo: false,
+        };
+    }
+
+    // Check if service is registered (platform-specific)
+    let service_registered = check_service_registered();
+
+    if service_registered {
+        // Check if service file needs update (version mismatch)
+        if !service_needs_update() {
+            log::info!("Service already registered and up-to-date");
+            return ComponentFixResult {
+                component: "service",
+                success: true,
+                error: None,
+                required_sudo: false,
+            };
+        }
+        log::info!("Service registered but outdated, updating...");
+    } else {
+        log::info!("Service not registered, installing...");
+    }
+
+    send_progress(
+        progress_tx,
+        InstallProgress::new("service".into(), 0.5, "Registering system service...".into()),
+    );
+
+    // Build installer config
+    let exe_path = std::env::current_exe().unwrap_or_default();
+
+    let builder = crate::install::installer::InstallerBuilder::new("kodegend", exe_path)
+        .description("Kodegen Service Manager")
+        .args(["run", "--foreground"])
+        .auto_restart(true)
+        .auto_start(true);
+
+    // Install service - dispatches to platform-specific implementation
+    match crate::install::installer::install_daemon_async(builder).await {
+        Ok(()) => {
+            log::info!("Service registered successfully");
+            ComponentFixResult {
+                component: "service",
+                success: true,
+                error: None,
+                required_sudo: true,
+            }
+        }
+        Err(e) => {
+            log::error!("Failed to register service: {}", e);
+            ComponentFixResult {
+                component: "service",
+                success: false,
+                error: Some(e.to_string()),
+                required_sudo: true,
+            }
+        }
+    }
+}
+
+/// Check if service is registered on the current platform
+/// Returns true if service file/registration exists
+fn check_service_registered() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        std::path::Path::new("/Library/LaunchDaemons/kodegend.plist").exists()
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        std::path::Path::new("/etc/systemd/system/kodegend.service").exists()
+            || dirs::config_dir()
+                .map(|d| d.join("systemd/user/kodegend.service").exists())
+                .unwrap_or(false)
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        check_windows_service_registered()
+    }
+
+    #[cfg(target_os = "freebsd")]
+    {
+        std::path::Path::new("/usr/local/etc/rc.d/kodegend").exists()
+    }
+
+    #[cfg(target_os = "openbsd")]
+    {
+        std::path::Path::new("/etc/rc.d/kodegend").exists()
+    }
+
+    #[cfg(target_os = "netbsd")]
+    {
+        std::path::Path::new("/etc/rc.d/kodegend").exists()
+    }
+
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "windows",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    )))]
+    {
+        // Generic Unix: Check common init script locations
+        std::path::Path::new("/etc/init.d/kodegend").exists()
+    }
+}
+
+/// Check if service needs update (version mismatch, binary changed, etc.)
+fn service_needs_update() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        check_macos_plist_needs_update()
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        check_linux_unit_needs_update()
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        check_windows_service_needs_update()
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        check_unix_init_needs_update()
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn check_windows_service_registered() -> bool {
+    use std::process::Command;
+    // Use sc.exe query to check if service exists
+    Command::new("sc.exe")
+        .args(["query", "kodegend"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn check_macos_plist_needs_update() -> bool {
+    use std::fs;
+    let plist_path = "/Library/LaunchDaemons/kodegend.plist";
+    let current_exe = std::env::current_exe().ok();
+
+    if let (Some(exe), Ok(content)) = (current_exe, fs::read_to_string(plist_path)) {
+        // Check if plist contains the current exe path
+        !content.contains(&exe.to_string_lossy().to_string())
+    } else {
+        true // If we can't check, assume update needed
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn check_linux_unit_needs_update() -> bool {
+    use std::fs;
+    let unit_paths = [
+        PathBuf::from("/etc/systemd/system/kodegend.service"),
+        dirs::config_dir()
+            .map(|d| d.join("systemd/user/kodegend.service"))
+            .unwrap_or_default(),
+    ];
+    let current_exe = std::env::current_exe().ok();
+
+    for path in unit_paths.iter().filter(|p| p.exists()) {
+        if let (Some(exe), Ok(content)) = (&current_exe, fs::read_to_string(path)) {
+            if content.contains(&exe.to_string_lossy().to_string()) {
+                return false; // Unit is up-to-date
+            }
+        }
+    }
+    true // Update needed
+}
+
+#[cfg(target_os = "windows")]
+fn check_windows_service_needs_update() -> bool {
+    use std::process::Command;
+    let current_exe = std::env::current_exe().ok();
+
+    if let Some(exe) = current_exe {
+        // Query service config and compare binary path
+        let output = Command::new("sc.exe")
+            .args(["qc", "kodegend"])
+            .output()
+            .ok();
+
+        if let Some(o) = output {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            return !stdout.contains(&exe.to_string_lossy().to_string());
+        }
+    }
+    true
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+fn check_unix_init_needs_update() -> bool {
+    // For BSD/generic Unix, check init script content
+    let init_paths = [
+        "/usr/local/etc/rc.d/kodegend",
+        "/etc/rc.d/kodegend",
+        "/etc/init.d/kodegend",
+    ];
+    let current_exe = std::env::current_exe().ok();
+
+    for path in init_paths {
+        if std::path::Path::new(path).exists() {
+            if let (Some(exe), Ok(content)) = (&current_exe, std::fs::read_to_string(path)) {
+                if content.contains(&exe.to_string_lossy().to_string()) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
 }
 
 // Non-Unix stub implementations
 #[cfg(not(unix))]
-pub async fn fix_all_components() -> Result<super::detection::InstallationFixReport> {
+pub async fn fix_all_components(
+    _progress_tx: Option<mpsc::Sender<InstallProgress>>,
+) -> Result<super::detection::InstallationFixReport> {
     // Windows implementation would go here
+    // TODO: Implement full Windows support using the same pattern as Unix
     Ok(super::detection::InstallationFixReport {
         toolchain: None,
         hosts: None,
         certificates: None,
         kodegen_version: None,
+        service: None,
         overall_success: true,
     })
 }

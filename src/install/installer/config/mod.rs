@@ -10,8 +10,7 @@ mod services;
 pub mod toolchain;
 
 // Re-export public API
-pub use hosts::remove_kodegen_host_entries;
-pub use installer::install_kodegen_daemon;
+pub use hosts::{add_kodegen_host_entries, remove_kodegen_host_entries};
 
 // Re-export toolchain verification for component fixers
 #[allow(unused_imports)]

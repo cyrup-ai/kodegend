@@ -25,7 +25,9 @@ use windows::{
 };
 
 /// Installation context
+/// Used by Windows installer (privilege.rs:608) but appears unused on macOS builds
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct InstallContext {
     /// Executable path (validated in validate_prerequisites:386)
     pub exe_path: PathBuf,
@@ -47,6 +49,7 @@ pub struct InstallContext {
     progress_disabled: Arc<AtomicBool>,
 }
 
+#[allow(dead_code)] // Methods used by Windows installer (privilege.rs, services.rs)
 impl InstallContext {
     /// Create new install context with optimized initialization
     pub fn new(exe_path: PathBuf) -> Self {

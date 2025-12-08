@@ -1,175 +1,28 @@
-//! GUI installation runner - orchestrates installation with progress window
+//! GUI presentation layer - displays progress from logic layer
+//!
+//! This is PRESENTATION ONLY:
+//! - Receives progress events from channel
+//! - Displays in eframe/egui window
+//! - NO logic, NO downloads, NO checks
 
 use eframe::egui;
-use std::io::Write;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
-use tokio::sync::{mpsc, oneshot};
-use tokio::time::timeout;
+use tokio::sync::mpsc;
 
-use super::super::cleanup::InstallationCleanupContext;
-use super::super::wizard::InstallationResult;
 use crate::install::core::InstallProgress;
-
-use super::types::INSTALL_TIMEOUT;
 use super::window::InstallWindow;
 
-/// Run GUI installation with progress window
-pub async fn run_gui_installation() -> anyhow::Result<InstallationResult> {
-    let mut stdout = StandardStream::stdout(ColorChoice::Always);
-    let _ = stdout.set_color(ColorSpec::new().set_fg(Some(Color::Cyan)));
-    let _ = writeln!(stdout, "🎨 Launching GUI installer...");
-    let _ = stdout.reset();
+/// Run GUI display - receives progress and shows in window
+///
+/// This is the GUI presentation layer. It:
+/// - Creates an eframe window
+/// - Receives InstallProgress events from the channel
+/// - Displays progress in the window
+///
+/// NO logic happens here - all checks/fixes/downloads happen in fix_all_components()
+pub async fn run_gui_display(rx: mpsc::Receiver<InstallProgress>) -> anyhow::Result<()> {
+    log::info!("Starting GUI display...");
 
-    // Create progress channel (large buffer = rarely blocks background thread)
-    let (tx, rx) = mpsc::channel::<InstallProgress>(100);
-
-    // Create result channel (oneshot = single result value)
-    let (result_tx, mut result_rx) = oneshot::channel();
-
-    // Spawn installation in background tokio task
-    tokio::spawn(async move {
-        // Create cleanup context for RAII cleanup on failure
-        let mut cleanup_ctx = InstallationCleanupContext::new();
-        
-        // Download all binaries from GitHub with progress reporting
-        let (binary_paths, _download_dir) = match crate::install::download::download_all_binaries(tx.clone()).await {
-            Ok(paths) => {
-                cleanup_ctx.downloaded_binaries_dir = Some(paths.1.clone());
-                paths
-            }
-            Err(e) => {
-                let _ = tx.try_send(InstallProgress::error(
-                    "binary_download".to_string(),
-                    format!("Failed to download binaries: {}", e),
-                ));
-                let _ = result_tx.send(Err(e));
-                // Drop will automatically clean up
-                return;
-            }
-        };
-
-        // Install binaries to system paths
-        let _ = tx.try_send(InstallProgress::new(
-            "binary_install".to_string(),
-            0.55,
-            format!("Installing {} binaries to system", binary_paths.len()),
-        ));
-
-        if let Err(e) =
-            crate::install::binary_staging::install_binaries_to_system(&binary_paths).await
-        {
-            let _ = tx.try_send(InstallProgress::error(
-                "binary_install".to_string(),
-                format!("Failed to install binaries: {}", e),
-            ));
-            let _ = result_tx.send(Err(e));
-            // Drop will automatically clean up
-            return;
-        }
-
-        let _ = tx.try_send(InstallProgress::new(
-            "binary_install".to_string(),
-            0.60,
-            "Binaries installed successfully".to_string(),
-        ));
-
-        // Determine kodegend path
-        #[cfg(unix)]
-        let kodegend_path = std::path::PathBuf::from("/usr/local/bin/kodegend");
-
-        #[cfg(windows)]
-        let kodegend_path = {
-            use crate::install::installer::windows::paths::{InstallScope, kodegend_exe};
-            kodegend_exe(InstallScope::System)
-        };
-
-        #[cfg(not(any(unix, windows)))]
-        {
-            let err = anyhow::anyhow!("Unsupported platform");
-            let _ = tx.try_send(InstallProgress::error(
-                "platform".to_string(),
-                format!("{}", err),
-            ));
-            let _ = result_tx.send(Err(err));
-            return;
-        }
-
-        // Get config path (platform-specific)
-        let config_path = crate::platform::user_config_dir().join("config.toml");
-
-        // Run daemon installation (always auto_start)
-        let install_result = crate::install::config::install_kodegen_daemon(
-            kodegend_path,
-            config_path,
-            true, // Always auto_start
-            Some(tx.clone()), // Progress updates flow through this channel
-        )
-        .await;
-
-        // Send completion progress (100%)
-        if install_result.is_ok() {
-            let _ = tx.try_send(InstallProgress::complete(
-                "complete".to_string(),
-                "Installation finished successfully".to_string(),
-            ));
-            
-            // Defuse cleanup context - installation succeeded
-            cleanup_ctx.defuse();
-        }
-
-        // Send final result to main thread
-        let _ = result_tx.send(install_result);
-    });
-
-    // Store result in Arc<Mutex<>> so GUI can access it
-    let result_container = Arc::new(Mutex::new(None));
-    let result_clone = result_container.clone();
-
-    // Spawn result polling task with timeout protection
-    tokio::spawn(async move {
-        // Wrap polling loop with timeout (matches fluent_voice.rs pattern)
-        let result = timeout(INSTALL_TIMEOUT, async {
-            loop {
-                match result_rx.try_recv() {
-                    Ok(res) => break res,
-                    Err(oneshot::error::TryRecvError::Empty) => {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                    }
-                    Err(oneshot::error::TryRecvError::Closed) => {
-                        break Err(anyhow::anyhow!("Installation channel closed unexpectedly"));
-                    }
-                }
-            }
-        })
-        .await;
-
-        // Handle timeout vs operation result (double-Result unwrap)
-        let final_result = match result {
-            Ok(res) => res, // Installation completed (success or failure)
-            Err(_) => {
-                // Timeout elapsed - installation hung
-                Err(anyhow::anyhow!(
-                    "Installation timed out after {} seconds. \
-                     This may indicate a network issue or system problem.\n\n\
-                     Please check:\n\
-                     • Network connection is active\n\
-                     • ~100MB free disk space for Chromium\n\
-                     • Firewall allows GitHub/Chrome downloads\n\
-                     • System disk is not full",
-                    INSTALL_TIMEOUT.as_secs()
-                ))
-            }
-        };
-
-        // Store result (including timeout error) for main thread to retrieve
-        if let Ok(mut container) = result_container.lock() {
-            *container = Some(final_result);
-        }
-    });
-
-    // Configure GUI window (runs on main thread)
+    // Configure GUI window
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([600.0, 450.0])
@@ -179,40 +32,23 @@ pub async fn run_gui_installation() -> anyhow::Result<InstallationResult> {
     };
 
     // Run GUI (blocking until window closes)
-    let _ = eframe::run_native(
+    // The closure is FnOnce so we can move rx directly
+    let result = eframe::run_native(
         "kodegen_install",
         native_options,
-        Box::new(move |cc| Ok(Box::new(InstallWindow::new(cc, rx)))),
+        Box::new(move |cc| {
+            Ok(Box::new(InstallWindow::new(cc, rx)))
+        }),
     );
 
-    // Wait up to 10 seconds for result after window closes
-    // Handles race condition if user somehow closed window early despite disabled button
-    let result = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if let Some(r) = result_clone.lock().ok().and_then(|mut g| g.take()) {
-                return r;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    })
-    .await;
-
     match result {
-        Ok(install_result) => install_result, // Got result within 10 seconds
-        Err(_timeout) => {
-            // Timeout - installation didn't complete even with 10 second grace period
-            Err(anyhow::anyhow!(
-                "Installation window closed before completion.\n\
-                 \n\
-                 The installation may have completed in the background.\n\
-                 To verify, check if the kodegend service is running:\n\
-                 \n\
-                 macOS/Linux: sudo launchctl list | grep kodegend\n\
-                 Windows:     sc query kodegend\n\
-                 \n\
-                 If the service is running, restart your MCP client (Claude Desktop/Cursor/Zed/Windsurf).\n\
-                 If not running, the installation failed - please run the installer again."
-            ))
+        Ok(()) => {
+            log::info!("GUI display completed");
+            Ok(())
+        }
+        Err(e) => {
+            log::error!("GUI display error: {}", e);
+            Err(anyhow::anyhow!("GUI error: {}", e))
         }
     }
 }

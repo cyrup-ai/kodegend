@@ -3,54 +3,19 @@
 //! Provides Unix socket-based IPC for querying service status from CLI.
 //! Uses length-prefixed JSON messages for simplicity and extensibility.
 
-use std::time::Duration;
 use std::io::{Read, Write};
+use std::time::Duration;
 
 use crate::security::audit::{AuditResult, Vulnerability, VulnerabilitySeverity};
+
+// Re-export all wire protocol types from kodegend-protocol-ipc
+pub use kodegend_protocol_ipc::*;
 
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 
-/// Status query request (sent by CLI)
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub enum StatusQuery {
-    /// Query all services
-    All,
-    /// Query specific service by name
-    Service(String),
-}
-
-/// Per-service status information
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct ServiceStatus {
-    pub name: String,
-    pub state: ServiceStateKind,
-    pub pid: Option<u32>,
-    pub uptime: Option<Duration>,
-    pub restart_count: u32,
-    pub max_restarts: Option<u32>,
-    pub next_restart_delay: Option<Duration>,
-    pub success_window_remaining: Option<Duration>,
-    pub failure_reason: Option<String>,
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize, Clone, Copy)]
-pub enum ServiceStateKind {
-    Running,
-    Stopped,
-    Failed,
-    Restarting,
-    Starting,
-}
-
-/// Status query response (sent by manager)
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct StatusResponse {
-    pub daemon_running: bool,
-    pub daemon_pid: u32,
-    pub daemon_uptime: Duration,
-    pub services: Vec<ServiceStatus>,
-}
+#[cfg(windows)]
+use crate::platform::windows::named_pipe::NamedPipeStream;
 
 /// Wire protocol: length-prefixed JSON
 /// Format: [4-byte little-endian length][JSON payload]
@@ -60,15 +25,25 @@ const MAX_MESSAGE_SIZE: usize = 1024 * 1024;
 
 #[cfg(unix)]
 pub fn send_message<T: serde::Serialize>(stream: &mut UnixStream, msg: &T) -> anyhow::Result<()> {
+    send_message_impl(stream, msg)
+}
+
+#[cfg(windows)]
+pub fn send_message<T: serde::Serialize>(stream: &mut NamedPipeStream, msg: &T) -> anyhow::Result<()> {
+    send_message_impl(stream, msg)
+}
+
+/// Internal implementation (platform-agnostic via Read+Write traits)
+fn send_message_impl<T: serde::Serialize, S: Write>(stream: &mut S, msg: &T) -> anyhow::Result<()> {
     use anyhow::Context;
-    
+
     let json = serde_json::to_vec(msg)
         .context("Failed to serialize message")?;
-    
+
     if json.len() > MAX_MESSAGE_SIZE {
         anyhow::bail!("Message too large: {} bytes (max: {})", json.len(), MAX_MESSAGE_SIZE);
     }
-    
+
     let len = (json.len() as u32).to_le_bytes();
     stream.write_all(&len)
         .context("Failed to write message length")?;
@@ -81,22 +56,32 @@ pub fn send_message<T: serde::Serialize>(stream: &mut UnixStream, msg: &T) -> an
 
 #[cfg(unix)]
 pub fn recv_message<T: serde::de::DeserializeOwned>(stream: &mut UnixStream) -> anyhow::Result<T> {
+    recv_message_impl(stream)
+}
+
+#[cfg(windows)]
+pub fn recv_message<T: serde::de::DeserializeOwned>(stream: &mut NamedPipeStream) -> anyhow::Result<T> {
+    recv_message_impl(stream)
+}
+
+/// Internal implementation (platform-agnostic via Read+Write traits)
+fn recv_message_impl<T: serde::de::DeserializeOwned, S: Read>(stream: &mut S) -> anyhow::Result<T> {
     use anyhow::Context;
-    
+
     let mut len_bytes = [0u8; 4];
     stream.read_exact(&mut len_bytes)
         .context("Failed to read message length")?;
-    
+
     let len = u32::from_le_bytes(len_bytes) as usize;
-    
+
     if len > MAX_MESSAGE_SIZE {
         anyhow::bail!("Message too large: {} bytes (max: {})", len, MAX_MESSAGE_SIZE);
     }
-    
+
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf)
         .context("Failed to read message payload")?;
-    
+
     serde_json::from_slice(&buf)
         .context("Failed to deserialize message")
 }

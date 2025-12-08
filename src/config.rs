@@ -351,98 +351,15 @@ pub fn discover_certificate_paths() -> (Option<std::path::PathBuf>, Option<std::
 
 impl ServiceConfig {
     fn default_category_servers() -> Vec<CategoryServerConfig> {
-        vec![
-            CategoryServerConfig {
-                name: "browser".to_string(),
-                binary: "kodegen-browser".to_string(),
-                port: 30438,
+        kodegen_config::CATEGORY_PORTS
+            .iter()
+            .map(|(category, port)| CategoryServerConfig {
+                name: category.to_string(),
+                binary: format!("kodegen-{}", category),
+                port: *port,
                 enabled: true,
-            },
-            CategoryServerConfig {
-                name: "citescrape".to_string(),
-                binary: "kodegen-citescrape".to_string(),
-                port: 30439,
-                enabled: true,
-            },
-            CategoryServerConfig {
-                name: "claude-agent".to_string(),
-                binary: "kodegen-claude-agent".to_string(),
-                port: 30440,
-                enabled: true,
-            },
-            CategoryServerConfig {
-                name: "config".to_string(),
-                binary: "kodegen-config".to_string(),
-                port: 30441,
-                enabled: true,
-            },
-            CategoryServerConfig {
-                name: "database".to_string(),
-                binary: "kodegen-database".to_string(),
-                port: 30442,
-                enabled: true,
-            },
-            CategoryServerConfig {
-                name: "filesystem".to_string(),
-                binary: "kodegen-filesystem".to_string(),
-                port: 30443,
-                enabled: true,
-            },
-            CategoryServerConfig {
-                name: "git".to_string(),
-                binary: "kodegen-git".to_string(),
-                port: 30444,
-                enabled: true,
-            },
-            CategoryServerConfig {
-                name: "github".to_string(),
-                binary: "kodegen-github".to_string(),
-                port: 30445,
-                enabled: true,
-            },
-            CategoryServerConfig {
-                name: "introspection".to_string(),
-                binary: "kodegen-introspection".to_string(),
-                port: 30446,
-                enabled: true,
-            },
-            CategoryServerConfig {
-                name: "process".to_string(),
-                binary: "kodegen-process".to_string(),
-                port: 30447,
-                enabled: true,
-            },
-            CategoryServerConfig {
-                name: "prompt".to_string(),
-                binary: "kodegen-prompt".to_string(),
-                port: 30448,
-                enabled: true,
-            },
-            CategoryServerConfig {
-                name: "reasoner".to_string(),
-                binary: "kodegen-reasoner".to_string(),
-                port: 30449,
-                enabled: true,
-            },
-            CategoryServerConfig {
-                name: "sequential-thinking".to_string(),
-                binary: "kodegen-sequential-thinking".to_string(),
-                port: 30450,
-                enabled: true,
-            },
-            CategoryServerConfig {
-                name: "terminal".to_string(),
-                binary: "kodegen-terminal".to_string(),
-                port: 30451,
-                enabled: true,
-            },
-            CategoryServerConfig {
-                name: "candle-agent".to_string(),
-                binary: "kodegen-candle-agent".to_string(),
-                port: 30452,
-                enabled: true,
-            },
-        ]
+            })
+            .collect()
     }
 
     /// Load config from file and canonicalize all path fields
