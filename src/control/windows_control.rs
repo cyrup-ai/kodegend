@@ -10,7 +10,7 @@ use windows::Win32::System::Services::{
     CloseServiceHandle, ControlService, OpenSCManagerW, OpenServiceW, QueryServiceStatusEx,
     SC_HANDLE, SC_MANAGER_CONNECT, SC_STATUS_PROCESS_INFO, SERVICE_CONTROL_STOP,
     SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START, SERVICE_STATUS, SERVICE_STATUS_PROCESS,
-    SERVICE_STOP, StartServiceW,
+    SERVICE_STOP, SERVICE_STOPPED, StartServiceW,
 };
 use windows::core::PCWSTR;
 
@@ -26,10 +26,11 @@ struct ScManagerHandle(SC_HANDLE);
 impl ScManagerHandle {
     fn new() -> Result<Self> {
         let handle =
-            unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT.0) };
+            unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) }
+                .context("Failed to open Service Control Manager")?;
 
         if handle.is_invalid() {
-            anyhow::bail!("Failed to open Service Control Manager");
+            anyhow::bail!("Service Control Manager handle is invalid");
         }
 
         Ok(ScManagerHandle(handle))
@@ -74,10 +75,11 @@ fn open_service(sc_manager: &ScManagerHandle, access: u32) -> Result<ServiceHand
     let service_name: Vec<u16> = SERVICE_NAME.encode_utf16().chain(Some(0)).collect();
 
     let handle =
-        unsafe { OpenServiceW(sc_manager.handle(), PCWSTR(service_name.as_ptr()), access) };
+        unsafe { OpenServiceW(sc_manager.handle(), PCWSTR(service_name.as_ptr()), access) }
+            .context(format!("Failed to open service: {}", SERVICE_NAME))?;
 
     if handle.is_invalid() {
-        anyhow::bail!("Failed to open service: {}", SERVICE_NAME);
+        anyhow::bail!("Service handle is invalid: {}", SERVICE_NAME);
     }
 
     Ok(ServiceHandle(handle))
@@ -93,50 +95,52 @@ fn open_service(sc_manager: &ScManagerHandle, access: u32) -> Result<ServiceHand
 pub async fn check_status() -> Result<crate::daemon::ServiceStatus> {
     use crate::daemon::ServiceStatus;
     
-    let result = tokio::task::spawn_blocking(|| {
+    let result: Result<crate::daemon::ServiceStatus, anyhow::Error> = tokio::task::spawn_blocking(|| {
         debug!("Checking daemon status via Windows SCM");
         
         let sc_manager = ScManagerHandle::new()
             .context("Failed to open Service Control Manager")?;
 
         debug!("Opening service '{}' for status query", SERVICE_NAME);
-        let service = open_service(&sc_manager, SERVICE_QUERY_STATUS.0)
+        let service = open_service(&sc_manager, SERVICE_QUERY_STATUS)
             .context("Failed to open service")?;
 
         let mut status: SERVICE_STATUS_PROCESS = unsafe { mem::zeroed() };
         let mut bytes_needed: u32 = 0;
 
         debug!("Querying service status via QueryServiceStatusEx");
-        let query_result = unsafe {
+        unsafe {
+            // Create a byte slice view over the status struct
+            let status_buffer = std::slice::from_raw_parts_mut(
+                &mut status as *mut _ as *mut u8,
+                mem::size_of::<SERVICE_STATUS_PROCESS>(),
+            );
             QueryServiceStatusEx(
                 service.handle(),
                 SC_STATUS_PROCESS_INFO,
-                Some(&mut status as *mut _ as *mut u8),
-                mem::size_of::<SERVICE_STATUS_PROCESS>() as u32,
+                Some(status_buffer),
                 &mut bytes_needed,
             )
+            .map_err(|e| {
+                let error_code = windows::Win32::Foundation::GetLastError();
+                error!("QueryServiceStatusEx failed for service '{}': {:?}", SERVICE_NAME, error_code);
+                anyhow::anyhow!("QueryServiceStatusEx failed: {}", e)
+            })?
         };
-
-        if let Err(e) = query_result {
-            let error_code = unsafe { windows::Win32::Foundation::GetLastError() };
-            error!("QueryServiceStatusEx failed for service '{}'", SERVICE_NAME);
-            error!("Error code: {:?}", error_code);
-            bail!("QueryServiceStatusEx failed: {}", e);
-        }
 
         // Extract status from SERVICE_STATUS_PROCESS structure
         let service_status = match status.dwCurrentState {
-            state if state == SERVICE_RUNNING.0 => {
+            state if state == SERVICE_RUNNING => {
                 let pid = status.dwProcessId as crate::platform::ProcessId;
                 info!("Daemon running with PID {} (verified by Windows SCM)", pid);
                 ServiceStatus::Running { pid }
             }
-            state if state == SERVICE_STOPPED.0 => {
+            state if state == SERVICE_STOPPED => {
                 info!("Daemon is stopped (verified by Windows SCM)");
                 ServiceStatus::Stopped
             }
             _ => {
-                info!("Daemon is in non-running state: {} (verified by Windows SCM)", status.dwCurrentState);
+                info!("Daemon is in non-running state: {:?} (verified by Windows SCM)", status.dwCurrentState);
                 ServiceStatus::Stopped
             }
         };
@@ -166,9 +170,17 @@ pub async fn check_status() -> Result<crate::daemon::ServiceStatus> {
 /// - Layer 2: Handle ERROR_SERVICE_ALREADY_RUNNING from race conditions
 pub async fn start_daemon() -> Result<()> {
     // Layer 1: Check if already running (fast path)
-    if check_status().await? {
-        debug!("Service already running - idempotent success");
-        return Ok(());
+    match check_status().await? {
+        crate::daemon::ServiceStatus::Running { .. } => {
+            debug!("Service already running - idempotent success");
+            return Ok(());
+        }
+        crate::daemon::ServiceStatus::Stopped
+        | crate::daemon::ServiceStatus::StaleFile { .. }
+        | crate::daemon::ServiceStatus::InvalidFile { .. }
+        | crate::daemon::ServiceStatus::Zombie { .. } => {
+            // Continue to start the service
+        }
     }
     
     // Layer 2: Attempt to start the service
@@ -179,7 +191,7 @@ pub async fn start_daemon() -> Result<()> {
 
         debug!("Opening service '{}' with SERVICE_START access", SERVICE_NAME);
         let service =
-            open_service(&sc_manager, SERVICE_START.0).context("Failed to open service for start")?;
+            open_service(&sc_manager, SERVICE_START).context("Failed to open service for start")?;
 
         debug!("Starting Windows service '{}' via StartServiceW", SERVICE_NAME);
         let result = unsafe { StartServiceW(service.handle(), None) };
@@ -242,9 +254,17 @@ pub async fn start_daemon() -> Result<()> {
 /// - Layer 2: Handle ERROR_SERVICE_NOT_ACTIVE from race conditions
 pub async fn stop_daemon() -> Result<()> {
     // Layer 1: Check if already stopped (fast path)
-    if !check_status().await? {
-        debug!("Service already stopped - idempotent success");
-        return Ok(());
+    match check_status().await? {
+        crate::daemon::ServiceStatus::Stopped
+        | crate::daemon::ServiceStatus::StaleFile { .. }
+        | crate::daemon::ServiceStatus::InvalidFile { .. } => {
+            debug!("Service already stopped/invalid - idempotent success");
+            return Ok(());
+        }
+        crate::daemon::ServiceStatus::Running { .. }
+        | crate::daemon::ServiceStatus::Zombie { .. } => {
+            // Continue to stop the service
+        }
     }
     
     // Layer 2: Attempt to stop the service
@@ -255,7 +275,7 @@ pub async fn stop_daemon() -> Result<()> {
 
         debug!("Opening service '{}' with SERVICE_STOP access", SERVICE_NAME);
         let service =
-            open_service(&sc_manager, SERVICE_STOP.0).context("Failed to open service for stop")?;
+            open_service(&sc_manager, SERVICE_STOP).context("Failed to open service for stop")?;
 
         let mut status: SERVICE_STATUS = unsafe { mem::zeroed() };
 
@@ -326,8 +346,11 @@ async fn wait_for_stopped(timeout: Duration) -> Result<()> {
     loop {
         // Check if already stopped
         match check_status().await {
-            Ok(false) => return Ok(()), // Stopped successfully
-            Ok(true) => {
+            Ok(crate::daemon::ServiceStatus::Stopped)
+            | Ok(crate::daemon::ServiceStatus::StaleFile { .. })
+            | Ok(crate::daemon::ServiceStatus::InvalidFile { .. }) => return Ok(()), // Stopped successfully
+            Ok(crate::daemon::ServiceStatus::Running { .. })
+            | Ok(crate::daemon::ServiceStatus::Zombie { .. }) => {
                 // Still running, continue waiting
                 if start_time.elapsed() > timeout {
                     anyhow::bail!(
@@ -377,8 +400,11 @@ async fn wait_for_active(timeout: Duration) -> Result<()> {
     loop {
         // Check if active
         match check_status().await {
-            Ok(true) => return Ok(()), // Active successfully
-            Ok(false) => {
+            Ok(crate::daemon::ServiceStatus::Running { .. }) => return Ok(()), // Active successfully
+            Ok(crate::daemon::ServiceStatus::Stopped)
+            | Ok(crate::daemon::ServiceStatus::StaleFile { .. })
+            | Ok(crate::daemon::ServiceStatus::InvalidFile { .. })
+            | Ok(crate::daemon::ServiceStatus::Zombie { .. }) => {
                 // Not running yet, continue waiting
                 if start_time.elapsed() > timeout {
                     anyhow::bail!(

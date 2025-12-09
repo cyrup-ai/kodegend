@@ -1,6 +1,6 @@
 [package]
 name = "kodegend"
-version = "0.10.0"
+version = "0.10.1"
 edition = "2024"
 description = "KODEGEN.ᴀɪ: Memory-efficient, Blazing-Fast, MCP tools for code generation agents."
 authors = ["KODEGEN.ᴀɪ"]
@@ -62,7 +62,6 @@ toml = "0.9"
 clap = { version = "4", features = ["derive"] } # for the new CLI
 which = "8" # locate system executables
 wait-timeout = "0.2"  # Cross-platform Child::wait_timeout() for graceful shutdown
-exec = "0.3"
 dirs = "6"
 thiserror = "2"
 cfg-if = "1"
@@ -183,11 +182,13 @@ winapi = { version = "0.3", features = [
 windows = { version = "0.62", features = [
   "Win32_Foundation",
   "Win32_Security",
+  "Win32_Security_Authorization",
   "Win32_Security_Cryptography",
   "Win32_Security_WinTrust",
   "Win32_Storage_FileSystem",
   "Win32_System_Pipes",
   "Win32_System_Registry",
+  "Win32_System_RemoteDesktop",
   "Win32_System_Services",
   "Win32_System_Console",
   "Win32_System_Threading",
@@ -201,6 +202,7 @@ plist = "1"
 core-graphics2 = { version = "0.4.1", default-features = false, features = ["display", "link"] }
 security-framework = "3.5"  # Native macOS certificate trust settings
 core-foundation = "0.10"    # Required by security-framework
+dispatch = "0.2"            # GCD main queue for Authorization Services (must run on main thread)
 zip = { version = "6", default-features = false, features = [
   "aes-crypto",
   "bzip2",

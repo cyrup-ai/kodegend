@@ -103,44 +103,68 @@ impl InstallWindow {
     }
 
     /// Poll for progress updates (non-blocking)
+    ///
+    /// FIXED: Now checks is_final flag instead of progress >= 1.0 to detect completion.
+    /// Also detects unexpected channel disconnection as an error.
     pub fn poll_progress(&mut self) {
         // try_lock() = non-blocking (won't stall GUI if contended)
         if let Ok(mut rx) = self.progress_rx.try_lock() {
-            // try_recv() = non-blocking (returns immediately if empty)
-            while let Ok(progress) = rx.try_recv() {
-                // Update per-binary status if download metadata present
-                if let Some(meta) = &progress.download_metadata {
-                    let idx = meta.binary_index.saturating_sub(1);
-                    if let Some(status) = self.binary_statuses.get_mut(idx) {
-                        status.progress = if meta.total_bytes > 0 {
-                            (meta.bytes_downloaded as f64 / meta.total_bytes as f64) as f32
-                        } else {
-                            0.0
-                        };
+            // Drain all available messages
+            loop {
+                match rx.try_recv() {
+                    Ok(progress) => {
+                        // Update per-binary status if download metadata present
+                        if let Some(meta) = &progress.download_metadata {
+                            let idx = meta.binary_index.saturating_sub(1);
+                            if let Some(status) = self.binary_statuses.get_mut(idx) {
+                                status.progress = if meta.total_bytes > 0 {
+                                    (meta.bytes_downloaded as f64 / meta.total_bytes as f64) as f32
+                                } else {
+                                    0.0
+                                };
 
-                        status.version = meta.version.clone();
+                                status.version = meta.version.clone();
 
-                        status.status = match meta.phase {
-                            DownloadPhase::Discovering => BinaryStatus::Discovering,
-                            DownloadPhase::Downloading => BinaryStatus::Downloading,
-                            DownloadPhase::Extracting => BinaryStatus::Extracting,
-                            DownloadPhase::Complete => BinaryStatus::Complete,
-                        };
+                                status.status = match meta.phase {
+                                    DownloadPhase::Discovering => BinaryStatus::Discovering,
+                                    DownloadPhase::Downloading => BinaryStatus::Downloading,
+                                    DownloadPhase::Extracting => BinaryStatus::Extracting,
+                                    DownloadPhase::Complete => BinaryStatus::Complete,
+                                };
+                            }
+                        }
+
+                        self.current_step = progress.step;
+                        self.current_message = progress.message;
+                        self.progress = progress.progress;
+                        self.is_error = progress.is_error;
+
+                        // FIXED: Only complete on explicit is_final message
+                        // This prevents false success when individual components send progress=1.0
+                        if progress.is_final {
+                            if progress.is_error {
+                                self.is_error = true;
+                            } else {
+                                self.is_complete = true;
+                                // Start auto-close timer when completion detected
+                                if self.auto_close_timer.is_none() {
+                                    self.auto_close_timer = Some(std::time::Instant::now());
+                                }
+                            }
+                        }
                     }
-                }
-
-                self.current_step = progress.step;
-                self.current_message = progress.message;
-                self.progress = progress.progress;
-                self.is_error = progress.is_error;
-
-                // Check for completion
-                if self.progress >= 1.0 && !self.is_error {
-                    self.is_complete = true;
-
-                    // Start auto-close timer when completion detected
-                    if self.auto_close_timer.is_none() {
-                        self.auto_close_timer = Some(std::time::Instant::now());
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                        // No more messages, exit loop
+                        break;
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        // Channel closed! If we haven't received is_final, this is an error
+                        if !self.is_complete && !self.is_error {
+                            log::error!("Progress channel disconnected without completion message");
+                            self.is_error = true;
+                            self.current_message = "Installation failed unexpectedly".to_string();
+                        }
+                        break;
                     }
                 }
             }

@@ -53,12 +53,17 @@ pub struct InstallProgress {
     /// Error flag - true if this is an error status
     pub is_error: bool,
 
+    /// Final message flag - true if this is the final message (completion or error)
+    /// Used by GUI to detect actual completion vs intermediate progress at 1.0
+    pub is_final: bool,
+
     /// Download-specific metadata (optional, used during binary downloads)
     pub download_metadata: Option<DownloadMetadata>,
 }
 
 impl InstallProgress {
     /// Create new progress update with optimized initialization
+    /// Note: This is NOT a final message - use complete() or error() for final messages
     #[allow(dead_code)] // Used in context.rs:196,237,391 - false positive
     pub fn new(step: String, progress: f32, message: String) -> Self {
         Self {
@@ -66,22 +71,26 @@ impl InstallProgress {
             progress: progress.clamp(0.0, 1.0),
             message,
             is_error: false,
+            is_final: false, // Regular progress, not completion
             download_metadata: None,
         }
     }
 
-    /// Create error progress update
+    /// Create error progress update - marks the installation as failed
+    /// This IS a final message (is_final: true)
     pub fn error(step: String, message: String) -> Self {
         Self {
             step,
-            progress: 0.0,
+            progress: 0.0, // Don't let errors look like success
             message,
             is_error: true,
+            is_final: true, // Error ends the flow
             download_metadata: None,
         }
     }
 
-    /// Create completion progress update
+    /// Create completion progress update - marks the installation as successful
+    /// This IS a final message (is_final: true)
     #[allow(dead_code)] // Used in installer.rs:135 - false positive
     pub fn complete(step: String, message: String) -> Self {
         Self {
@@ -89,6 +98,21 @@ impl InstallProgress {
             progress: 1.0,
             message,
             is_error: false,
+            is_final: true, // Explicit completion marker
+            download_metadata: None,
+        }
+    }
+
+    /// Create warning progress update - marks an error but NOT final
+    /// Use this for non-fatal errors where installation can continue
+    /// (e.g., service registration failure - daemon can still run manually)
+    pub fn warning(step: String, message: String) -> Self {
+        Self {
+            step,
+            progress: 0.0,
+            message,
+            is_error: true,
+            is_final: false, // NOT final - installation continues
             download_metadata: None,
         }
     }
@@ -142,6 +166,7 @@ impl InstallProgress {
             progress: overall_progress,
             message,
             is_error: false,
+            is_final: false, // Downloads are never final - use complete() for final success
             download_metadata: Some(DownloadMetadata {
                 binary_name,
                 binary_index,

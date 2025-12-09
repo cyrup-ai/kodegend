@@ -13,7 +13,6 @@ use nix::unistd::{Pid, Uid, geteuid, getpid};
 use std::fs::{self, DirBuilder};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::OnceLock;
 use sysinfo::{Pid as SysinfoPid, ProcessesToUpdate, System};
 
@@ -307,6 +306,8 @@ fn is_process_alive_linux(pid: i32) -> Result<bool, std::io::Error> {
 /// See: BSD ps(1) man page
 #[cfg(not(target_os = "linux"))]
 fn is_process_alive_ps(pid: i32) -> Result<bool, std::io::Error> {
+    use std::process::Command;
+
     // Run: ps -p PID -o state=
     // This outputs only the state code without headers
     let output = Command::new("ps")
@@ -563,6 +564,8 @@ pub(super) fn platform_validate_pid_range(pid: i32) -> Result<(), anyhow::Error>
 /// Returns Some(max_pid) if successful, None otherwise.
 #[cfg(target_os = "freebsd")]
 fn get_freebsd_pid_max() -> Option<i32> {
+    use std::process::Command;
+
     let output = Command::new("sysctl")
         .arg("-n")
         .arg("kern.pid_max")

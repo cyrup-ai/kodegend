@@ -4,7 +4,7 @@ mod config;
 mod constants;
 mod control;
 mod daemon;
-mod install;
+pub(crate) mod install;
 mod ipc;
 mod lifecycle;
 mod logging;

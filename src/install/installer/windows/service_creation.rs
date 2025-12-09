@@ -1,14 +1,13 @@
 //! Service creation, configuration, and control operations.
 
 use std::mem;
-use std::path::PathBuf;
 
 use windows::Win32::Foundation::ERROR_SERVICE_EXISTS;
 use windows::Win32::System::Services::{
     ChangeServiceConfig2W, CreateServiceW, OpenServiceW, SC_ACTION, SC_ACTION_RESTART,
     SERVICE_ALL_ACCESS, SERVICE_AUTO_START, SERVICE_CONFIG_DELAYED_AUTO_START_INFO,
-    SERVICE_CONFIG_DESCRIPTION, SERVICE_CONFIG_DESCRIPTION_W, SERVICE_CONFIG_FAILURE_ACTIONS,
-    SERVICE_CONFIG_FAILURE_ACTIONSW, SERVICE_CONFIG_SERVICE_SID_INFO,
+    SERVICE_CONFIG_DESCRIPTION, SERVICE_DESCRIPTIONW, SERVICE_CONFIG_FAILURE_ACTIONS,
+    SERVICE_CONFIG_SERVICE_SID_INFO,
     SERVICE_DELAYED_AUTO_START_INFO, SERVICE_DEMAND_START, SERVICE_ERROR_IGNORE,
     SERVICE_FAILURE_ACTIONSW, SERVICE_SID_TYPE_UNRESTRICTED, SERVICE_WIN32_OWN_PROCESS,
     StartServiceW,
@@ -80,21 +79,21 @@ pub(super) fn create_service(
             PCWSTR::null(),
             PCWSTR::null(),
         )
-    };
+    }
+    .map_err(|e| {
+        let error_code = e.code();
+        if error_code.0 as u32 == ERROR_SERVICE_EXISTS.0 {
+            InstallerError::System(format!("Service '{}' already exists", builder.label))
+        } else {
+            InstallerError::System(format!("Failed to create service: {}", e))
+        }
+    })?;
 
     if service_handle.is_invalid() {
-        let error = unsafe { windows::Win32::Foundation::GetLastError() };
-        if error == ERROR_SERVICE_EXISTS {
-            return Err(InstallerError::System(format!(
-                "Service '{}' already exists",
-                builder.label
-            )));
-        } else {
-            return Err(InstallerError::System(format!(
-                "Failed to create service: {}",
-                error.0
-            )));
-        }
+        return Err(InstallerError::System(format!(
+            "Service handle is invalid for '{}'",
+            builder.label
+        )));
     }
 
     Ok(ServiceHandle(service_handle))
@@ -108,7 +107,7 @@ pub(super) fn configure_service_description(
     let mut desc_buf: [u16; MAX_DESCRIPTION] = [0; MAX_DESCRIPTION];
     str_to_wide(description, &mut desc_buf)?;
 
-    let service_desc = SERVICE_CONFIG_DESCRIPTION_W {
+    let service_desc = SERVICE_DESCRIPTIONW {
         lpDescription: PWSTR::from_raw(desc_buf.as_mut_ptr()),
     };
 
@@ -208,7 +207,7 @@ pub(super) fn configure_service_sid(service: &ServiceHandle) -> Result<(), Insta
 /// Start the service
 pub(super) fn start_service(service: &ServiceHandle) -> Result<(), InstallerError> {
     unsafe {
-        StartServiceW(service.handle(), &[])
+        StartServiceW(service.handle(), None)
             .map_err(|e| InstallerError::System(format!("Failed to start service: {}", e)))?;
     }
     Ok(())
@@ -245,12 +244,13 @@ pub(super) fn open_service(
             PCWSTR::from_raw(service_name_buf.as_ptr()),
             SERVICE_ALL_ACCESS,
         )
-    };
+    }
+    .map_err(|e| InstallerError::System(format!("Failed to open service '{}': {}", label, e)))?;
 
     if service_handle.is_invalid() {
         return Err(InstallerError::System(format!(
-            "Failed to open service for deletion: {}",
-            unsafe { windows::Win32::Foundation::GetLastError().0 }
+            "Service handle is invalid for '{}'",
+            label
         )));
     }
 

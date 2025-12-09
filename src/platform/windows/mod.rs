@@ -19,7 +19,7 @@ mod handles;
 pub(crate) use handles::{ProcessHandle, TokenHandle};
 
 pub mod named_pipe;
-pub use named_pipe::{NamedPipeStream, connect_named_pipe, create_named_pipe_server};
+pub(crate) use named_pipe::create_named_pipe_server;
 
 use anyhow::{Result, bail};
 use kodegen_config::KodegenConfig;
@@ -96,7 +96,9 @@ pub(super) fn platform_running_under_service_manager() -> bool {
         // If GetConsoleWindow returns NULL, we're likely a service
         // (Services don't have console windows)
         use windows::Win32::System::Console::GetConsoleWindow;
-        let is_service = GetConsoleWindow().0 == 0;
+        use std::ptr;
+        let console_window = GetConsoleWindow();
+        let is_service = console_window.0.is_null();
 
         log::debug!(
             "Service manager detection: {} (console window: {})",

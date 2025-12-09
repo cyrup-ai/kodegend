@@ -3,8 +3,7 @@
 //! This module handles extraction, verification, and initialization of the embedded
 //! helper executable used for privileged operations.
 
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use anyhow::Result;

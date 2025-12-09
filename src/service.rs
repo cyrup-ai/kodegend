@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+#[cfg(unix)]
 use wait_timeout::ChildExt;
 
 use anyhow::{Context, Result};

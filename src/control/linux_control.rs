@@ -113,7 +113,7 @@ pub async fn start_daemon() -> Result<()> {
     }
     
     // Layer 1: Check if already running (fast path)
-    if check_status().await? {
+    if check_status().await?.is_running() {
         debug!("Service already running - idempotent success");
         return Ok(());
     }
@@ -184,7 +184,7 @@ pub async fn stop_daemon() -> Result<()> {
     }
     
     // Layer 1: Check if already stopped (fast path)
-    if !check_status().await? {
+    if !check_status().await?.is_running() {
         debug!("Service already stopped - idempotent success");
         return Ok(());
     }

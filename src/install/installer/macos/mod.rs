@@ -1,15 +1,21 @@
-//! macOS platform implementation using osascript and launchd.
+//! macOS platform implementation using Authorization Services and launchd.
 
 use std::{path::PathBuf, process::Command};
 
 use super::{InstallerBuilder, InstallerError};
 
 mod command_builder;
-mod executor;
-mod helper;
 mod plist;
 
 use command_builder::CommandBuilder;
+use crate::install::privilege::macos::{execute_privileged_macos, AuthorizationError};
+
+/// Convert a CommandBuilder into a shell script fragment
+fn command_to_script(cmd: &CommandBuilder) -> String {
+    let mut parts = vec![cmd.program.to_string_lossy().to_string()];
+    parts.extend(cmd.args.iter().cloned());
+    parts.join(" ")
+}
 
 #[allow(dead_code)]
 pub(crate) struct PlatformExecutor;
@@ -17,9 +23,6 @@ pub(crate) struct PlatformExecutor;
 #[allow(dead_code)]
 impl PlatformExecutor {
     pub fn install(b: InstallerBuilder) -> Result<(), InstallerError> {
-        // Initialize helper path if not already set
-        helper::ensure_helper_path()?;
-
         // System daemons always use system directories
         let plist_dir = PathBuf::from("/Library/LaunchDaemons");
         let bin_dir = PathBuf::from("/usr/local/bin");
@@ -82,13 +85,13 @@ impl PlatformExecutor {
             .to_str()
             .ok_or_else(|| InstallerError::System("Invalid temp plist path".to_string()))?;
 
-        let mut script = format!("set -e\n{}", executor::command_to_script(&mkdir_cmd));
-        script.push_str(&format!(" && {}", executor::command_to_script(&cp_cmd)));
+        let mut script = format!("set -e\n{}", command_to_script(&mkdir_cmd));
+        script.push_str(&format!(" && {}", command_to_script(&cp_cmd)));
         if needs_sudo {
-            script.push_str(&format!(" && {}", executor::command_to_script(&chown_cmd)));
+            script.push_str(&format!(" && {}", command_to_script(&chown_cmd)));
         }
-        script.push_str(&format!(" && {}", executor::command_to_script(&chmod_cmd)));
-        script.push_str(&format!(" && {}", executor::command_to_script(&rm_cmd)));
+        script.push_str(&format!(" && {}", command_to_script(&chmod_cmd)));
+        script.push_str(&format!(" && {}", command_to_script(&rm_cmd)));
         script.push_str(&format!(" && mv {temp_plist_str} {plist_file_str}"));
 
         // Set plist permissions (only for system-wide installs)
@@ -99,11 +102,11 @@ impl PlatformExecutor {
 
             script.push_str(&format!(
                 " && {}",
-                executor::command_to_script(&plist_perms_chown)
+                command_to_script(&plist_perms_chown)
             ));
             script.push_str(&format!(
                 " && {}",
-                executor::command_to_script(&plist_perms_chmod)
+                command_to_script(&plist_perms_chmod)
             ));
         }
 
@@ -112,7 +115,7 @@ impl PlatformExecutor {
 
         script.push_str(&format!(
             " && {}",
-            executor::command_to_script(&services_dir)
+            command_to_script(&services_dir)
         ));
 
         // Add service definitions using CommandBuilder
@@ -142,11 +145,11 @@ impl PlatformExecutor {
 
                 script.push_str(&format!(
                     " && {}",
-                    executor::command_to_script(&service_perms_chown)
+                    command_to_script(&service_perms_chown)
                 ));
                 script.push_str(&format!(
                     " && {}",
-                    executor::command_to_script(&service_perms_chmod)
+                    command_to_script(&service_perms_chmod)
                 ));
             }
         }
@@ -157,13 +160,18 @@ impl PlatformExecutor {
 
             script.push_str(&format!(
                 " && {}",
-                executor::command_to_script(&load_daemon)
+                command_to_script(&load_daemon)
             ));
         }
 
-        // For user installs, run script without helper (no sudo needed)
+        // For user installs, run script without elevation (no sudo needed)
         if needs_sudo {
-            executor::run_helper(&script)
+            execute_privileged_macos(&script)
+                .map_err(|e: AuthorizationError| match e {
+                    AuthorizationError::Cancelled => InstallerError::Cancelled,
+                    AuthorizationError::Denied => InstallerError::PermissionDenied,
+                    _ => InstallerError::System(e.to_string()),
+                })
         } else {
             // User install - run directly with sh
             let output = Command::new("sh")
@@ -199,6 +207,11 @@ impl PlatformExecutor {
         "
         );
 
-        executor::run_helper(&script)
+        execute_privileged_macos(&script)
+            .map_err(|e: AuthorizationError| match e {
+                AuthorizationError::Cancelled => InstallerError::Cancelled,
+                AuthorizationError::Denied => InstallerError::PermissionDenied,
+                _ => InstallerError::System(e.to_string()),
+            })
     }
 }

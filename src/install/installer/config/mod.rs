@@ -6,7 +6,7 @@
 pub mod certificates;
 mod hosts;
 mod installer;
-mod services;
+pub(crate) mod services;
 pub mod toolchain;
 
 // Re-export public API

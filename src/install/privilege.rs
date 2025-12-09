@@ -3,6 +3,20 @@
 //! This module handles operations that require elevated privileges (root/admin),
 //! including certificate installation, hosts file updates, and binary installation
 //! to system directories.
+//!
+//! # Platform-Native GUI Authentication
+//!
+//! When running in GUI mode (no TTY available), this module uses platform-native
+//! authentication APIs:
+//! - **macOS**: Authorization Services via `security-framework` crate
+//! - **Linux**: PolicyKit via `pkexec`
+//! - **Windows**: UAC via `ShellExecuteExW` (already implemented)
+
+// Platform-specific privilege escalation submodules
+#[cfg(target_os = "macos")]
+pub mod macos;
+#[cfg(target_os = "linux")]
+mod linux;
 
 use anyhow::{Context, Result};
 use log::info;
@@ -506,7 +520,7 @@ pub async fn install_with_elevated_privileges(
             lpClass: PCWSTR::null(),
             hkeyClass: Default::default(),
             dwHotKey: 0,
-            hMonitor: Default::default(),
+            Anonymous: Default::default(),
             hProcess: Default::default(),
         };
 
@@ -592,7 +606,7 @@ async fn register_windows_service(binary_path: &std::path::Path) -> Result<()> {
     use crate::install::installer::InstallerBuilder;
     use crate::install::installer::windows::PlatformExecutor;
     use crate::install::installer::core::InstallContext;
-    use crate::install::config::{configure_services, build_installer_config};
+    use crate::install::installer::config::services::{configure_services, build_installer_config};
 
     eprintln!("🔧 Registering Windows service...");
 
@@ -668,10 +682,14 @@ async fn register_windows_service(binary_path: &std::path::Path) -> Result<()> {
 // - Validate credentials once with `sudo -v`
 // ============================================================================
 
+#[cfg(unix)]
 use std::path::Path;
+#[cfg(unix)]
 use std::process::Stdio;
+#[cfg(unix)]
 use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
+#[cfg(unix)]
+use tokio::process::Command as TokioCommand;
 
 /// Privileged command executor with proper exit status handling.
 ///
@@ -718,7 +736,7 @@ impl PrivilegedExecutor {
         }
 
         // Step 2: Sudo credentials already cached?
-        let cached = Command::new("sudo")
+        let cached = TokioCommand::new("sudo")
             .args(["-n", "true"]) // non-interactive check
             .output()
             .await
@@ -729,19 +747,53 @@ impl PrivilegedExecutor {
             return Ok(Self { use_sudo: true });
         }
 
-        // Step 3: Need to prompt for credentials (once only)
-        log::info!("Requesting sudo credentials...");
-        let status = Command::new("sudo")
-            .arg("-v")
-            .status()
-            .await
-            .context("Failed to execute sudo -v")?;
+        // Step 3: Need to prompt for credentials
+        // Use is_gui_available() to determine authentication method
+        use crate::platform::is_gui_available;
 
-        if !status.success() {
-            anyhow::bail!("Sudo authentication failed");
+        if is_gui_available() {
+            // GUI mode - use platform-native authentication
+            log::info!("GUI mode detected, using native authentication...");
+
+            #[cfg(target_os = "macos")]
+            {
+                // macOS: Use Authorization Services (shows native dialog with Touch ID)
+                // execute_privileged_macos handles GCD main queue dispatch internally
+                // Source: tmp/dispatch/src/queue.rs:135-153
+                macos::execute_privileged_macos("true") // Just validate auth
+                    .map_err(|e| anyhow::anyhow!("macOS authentication failed: {}", e))?;
+            }
+
+            #[cfg(target_os = "linux")]
+            {
+                // Linux: Use PolicyKit (shows native desktop auth dialog)
+                // pkexec doesn't cache, so we bootstrap sudo credentials
+                linux::execute_privileged_linux("sudo -v")
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Linux authentication failed: {}", e))?;
+            }
+
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            {
+                anyhow::bail!(
+                    "GUI privilege escalation not supported on this platform. Run from terminal."
+                );
+            }
+        } else {
+            // CLI mode - use terminal-based sudo prompt
+            log::info!("Requesting sudo credentials via terminal...");
+            let status = TokioCommand::new("sudo")
+                .arg("-v")
+                .status()
+                .await
+                .context("Failed to execute sudo -v")?;
+
+            if !status.success() {
+                anyhow::bail!("Sudo authentication failed");
+            }
         }
 
-        log::info!("Sudo credentials validated successfully");
+        log::info!("Credentials validated successfully");
         Ok(Self { use_sudo: true })
     }
 
@@ -765,7 +817,7 @@ impl PrivilegedExecutor {
 
         let output = if self.use_sudo {
             // Use sudo -n (non-interactive) - fails instead of prompting
-            Command::new("sudo")
+            TokioCommand::new("sudo")
                 .arg("-n")
                 .args(args)
                 .output()
@@ -773,7 +825,7 @@ impl PrivilegedExecutor {
                 .context("Failed to execute sudo command")?
         } else {
             // Already root - run directly
-            Command::new(args[0])
+            TokioCommand::new(args[0])
                 .args(&args[1..])
                 .output()
                 .await
@@ -820,7 +872,7 @@ impl PrivilegedExecutor {
 
         if self.use_sudo {
             // Write via sudo -n tee (stdin -> file)
-            let mut child = Command::new("sudo")
+            let mut child = TokioCommand::new("sudo")
                 .args(["-n", "tee", &path.to_string_lossy()])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null()) // tee echoes to stdout, suppress it
@@ -871,3 +923,110 @@ impl PrivilegedExecutor {
         self.exec(&["chmod", mode, &path.to_string_lossy()]).await
     }
 }
+
+// Windows implementation using UAC elevation via helper executable
+#[cfg(windows)]
+pub struct PrivilegedExecutor {
+    helper_path: std::path::PathBuf,
+}
+
+#[cfg(windows)]
+impl PrivilegedExecutor {
+    /// Spawn privileged executor using Windows UAC
+    ///
+    /// Extracts and verifies the KodegenHelper.exe which has requireAdministrator
+    /// manifest, causing UAC prompt when first invoked.
+    pub async fn spawn() -> Result<Self> {
+        use crate::install::installer::windows::privileges::{ensure_helper_path, HELPER_PATH};
+
+        // Extract and verify helper executable (shows UAC if needed)
+        ensure_helper_path()?;
+
+        let helper_path = HELPER_PATH
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("Helper path not initialized"))?
+            .clone();
+
+        Ok(Self { helper_path })
+    }
+
+    /// Execute command with elevated privileges via helper
+    pub async fn exec(&self, args: &[&str]) -> Result<()> {
+        if args.is_empty() {
+            anyhow::bail!("exec() called with empty args");
+        }
+
+        let status = tokio::process::Command::new(&self.helper_path)
+            .args(args)
+            .status()
+            .await
+            .context("Failed to execute privileged command")?;
+
+        if !status.success() {
+            anyhow::bail!("Privileged command failed: {:?}", args);
+        }
+
+        Ok(())
+    }
+
+    /// Write file with elevated privileges
+    pub async fn write_file(&self, path: &std::path::Path, content: &str) -> Result<()> {
+        // Create parent directory first
+        if let Some(parent) = path.parent() {
+            if !parent.exists() {
+                self.exec(&["cmd", "/c", "mkdir", &parent.to_string_lossy()]).await?;
+            }
+        }
+
+        // Write content to temp file first (unprivileged)
+        let temp_dir = std::env::temp_dir();
+        let temp_file = temp_dir.join(format!("kodegen_temp_{}", uuid::Uuid::new_v4()));
+        tokio::fs::write(&temp_file, content).await?;
+
+        // Copy temp file to destination with privileges
+        self.exec(&[
+            "cmd",
+            "/c",
+            "copy",
+            "/Y",
+            &temp_file.to_string_lossy(),
+            &path.to_string_lossy(),
+        ])
+        .await?;
+
+        // Clean up temp file
+        let _ = tokio::fs::remove_file(&temp_file).await;
+
+        Ok(())
+    }
+
+    /// Copy file with elevated privileges
+    pub async fn copy_file(&self, src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
+        self.exec(&[
+            "cmd",
+            "/c",
+            "copy",
+            "/Y",
+            &src.to_string_lossy(),
+            &dst.to_string_lossy(),
+        ])
+        .await
+    }
+
+    /// Set file permissions (Windows ACL)
+    pub async fn chmod(&self, path: &std::path::Path, _mode: &str) -> Result<()> {
+        // Windows uses icacls for permissions
+        // Reset to owner-only access (equivalent to Unix 600/755)
+        self.exec(&[
+            "icacls",
+            &path.to_string_lossy(),
+            "/inheritance:r",
+            "/grant:r",
+            "*S-1-5-32-544:(F)", // Administrators: Full
+            "/grant:r",
+            "*S-1-5-18:(F)", // SYSTEM: Full
+        ])
+        .await
+    }
+}
+

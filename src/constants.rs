@@ -22,13 +22,14 @@ use std::time::Duration;
 ///
 /// Standard Unix daemon umask: 0o022
 /// - Owner: read/write (6)
-/// - Group: read (4) 
+/// - Group: read (4)
 /// - Others: read (4)
 ///
 /// This allows daemon-created files to be readable by all users while
 /// only writable by the daemon user.
 ///
 /// Reference: daemon(7), Stevens APUE §13.3
+#[cfg(unix)]
 pub const DAEMON_UMASK: u32 = 0o022;
 
 /// PID file permissions (Unix only)
@@ -43,6 +44,7 @@ pub const DAEMON_UMASK: u32 = 0o022;
 ///
 /// Matches industry standard (systemd, nginx, redis, Apache httpd).
 /// Reference: LSB FHS 3.0, systemd pidfile.c
+#[cfg(unix)]
 pub const PID_FILE_MODE: u32 = 0o644;
 
 /// PID file directory permissions (Unix only)
@@ -56,6 +58,7 @@ pub const PID_FILE_MODE: u32 = 0o644;
 /// for directory traversal.
 ///
 /// Reference: FHS 3.0 §5.13, systemd-tmpfiles
+#[cfg(unix)]
 pub const PID_DIR_MODE: u32 = 0o755;
 
 /// Maximum file descriptor soft limit cap
@@ -65,6 +68,7 @@ pub const PID_DIR_MODE: u32 = 0o755;
 /// This is the typical macOS default (kern.maxfilesperproc).
 ///
 /// Reference: getrlimit(2), RLIMIT_NOFILE
+#[cfg(unix)]
 pub const MAX_FD_SOFT_LIMIT: i32 = 65536;
 
 /// Fallback maximum file descriptor count
@@ -73,6 +77,7 @@ pub const MAX_FD_SOFT_LIMIT: i32 = 65536;
 /// This is also the historical Linux default (ulimit -n).
 ///
 /// Reference: POSIX.1-2001 _POSIX_OPEN_MAX
+#[cfg(unix)]
 pub const FALLBACK_MAX_FD: i32 = 1024;
 
 /// First non-standard file descriptor
@@ -81,26 +86,32 @@ pub const FALLBACK_MAX_FD: i32 = 1024;
 /// FD ≥3 are user-opened files that should be closed during daemonization.
 ///
 /// Reference: ISO C standard streams, daemon(7)
+#[cfg(unix)]
 pub const FIRST_USER_FD: i32 = 3;
 
 /// Standard input file descriptor
+#[cfg(unix)]
 pub const STDIN_FD: i32 = 0;
 
-/// Standard output file descriptor  
+/// Standard output file descriptor
+#[cfg(unix)]
 pub const STDOUT_FD: i32 = 1;
 
 /// Standard error file descriptor
+#[cfg(unix)]
 pub const STDERR_FD: i32 = 2;
 
 /// Readiness signal sent from grandchild to original parent
 ///
 /// After double-fork daemonization, the grandchild writes this to a
 /// pipe to signal successful initialization.
+#[cfg(unix)]
 pub const READINESS_SIGNAL: &[u8] = b"OK";
 
 /// Size of buffer for reading readiness signal
 ///
 /// Must match READINESS_SIGNAL length (2 bytes for "OK")
+#[cfg(unix)]
 pub const READINESS_BUFFER_SIZE: usize = 2;
 
 // ============================================================================
@@ -118,6 +129,7 @@ pub const READINESS_BUFFER_SIZE: usize = 2;
 /// - Clean up temporary resources
 ///
 /// Reference: systemd.service(5) DefaultTimeoutStopSec
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Startup verification timeout
@@ -131,6 +143,7 @@ pub const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 /// - Safety margin for loaded systems (~20s)
 ///
 /// Reference: systemd.service(5) DefaultTimeoutStartSec (90s default)
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub const STARTUP_VERIFICATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Post-graceful-shutdown wait before bootout/unload
@@ -141,6 +154,7 @@ pub const STARTUP_VERIFICATION_TIMEOUT: Duration = Duration::from_secs(30);
 ///
 /// 500ms is empirically sufficient for typical cleanup operations
 /// without adding noticeable delay to restart operations.
+#[cfg(unix)]
 pub const POST_SIGTERM_DELAY: Duration = Duration::from_millis(500);
 
 /// Port release delay before restart
@@ -153,6 +167,7 @@ pub const POST_SIGTERM_DELAY: Duration = Duration::from_millis(500);
 ///
 /// 500ms is conservative and prevents "address already in use" errors
 /// on restart. Can be reduced to 100ms on systems with SO_REUSEPORT.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub const PORT_RELEASE_DELAY: Duration = Duration::from_millis(500);
 
 /// Graceful kill wait time before force kill
@@ -172,6 +187,7 @@ pub const GRACEFUL_KILL_WAIT: Duration = Duration::from_secs(2);
 /// processes should die within 1 second unless stuck in kernel code.
 ///
 /// Uses 10 attempts × 100ms = 1 second total
+#[cfg(unix)]
 pub const FORCE_KILL_VERIFICATION_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Force kill verification poll interval
@@ -179,6 +195,7 @@ pub const FORCE_KILL_VERIFICATION_TIMEOUT: Duration = Duration::from_secs(1);
 /// Check process death every 100ms after SIGKILL. This is approximately
 /// the Linux scheduler tick on many systems (HZ=100 → 10ms, but we add
 /// margin for scheduler jitter).
+#[cfg(unix)]
 pub const FORCE_KILL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Maximum attempts to verify force kill succeeded
@@ -195,6 +212,7 @@ pub const FORCE_KILL_MAX_ATTEMPTS: u32 = 10;
 ///
 /// Start with 1ms to catch immediate state transitions (e.g., process
 /// already stopped). Doubles each iteration up to BACKOFF_MAX_DELAY.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub const BACKOFF_INITIAL_DELAY_MS: u64 = 1;
 
 /// Maximum backoff delay cap
@@ -204,6 +222,7 @@ pub const BACKOFF_INITIAL_DELAY_MS: u64 = 1;
 /// improves user experience and wastes resources.
 ///
 /// Sequence: 1ms → 2ms → 4ms → 8ms → 16ms → 32ms → 64ms → 100ms (capped)
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub const BACKOFF_MAX_DELAY_MS: u64 = 100;
 
 // ============================================================================
@@ -270,6 +289,7 @@ pub const TIME_WAIT_TOLERANCE_DELAY: Duration = Duration::from_millis(500);
 /// Used during daemonization to redirect standard streams to /dev/null.
 ///
 /// Reference: Stevens APUE §13.3 - Daemon Conventions
+#[cfg(unix)]
 pub const fn standard_fds() -> [i32; 3] {
     [STDIN_FD, STDOUT_FD, STDERR_FD]
 }

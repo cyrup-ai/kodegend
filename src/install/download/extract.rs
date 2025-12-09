@@ -326,7 +326,7 @@ pub async fn extract_from_dmg(
 ) -> Result<PathBuf> {
     #[cfg(not(target_os = "macos"))]
     {
-        return Err(anyhow!("DMG extraction only supported on macOS"));
+        Err(anyhow!("DMG extraction only supported on macOS"))
     }
 
     #[cfg(target_os = "macos")]

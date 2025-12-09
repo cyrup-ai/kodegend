@@ -10,11 +10,12 @@ use super::InstallerError;
 use super::file_ops::write_file_atomic;
 
 // Pre-computed systemd unit template for zero allocation
-const UNIT_TEMPLATE: &str = include_str!("../../../templates/systemd.service.template");
+#[allow(dead_code)]
+const UNIT_TEMPLATE: &str = include_str!("../../../../templates/systemd.service.template");
 
 /// Systemd service configuration with zero-allocation patterns
 #[derive(Clone)]
-pub(super) struct SystemdConfig<'a> {
+pub struct SystemdConfig<'a> {
     pub service_name: &'a str,
     pub description: &'a str,
     pub binary_path: &'a str,

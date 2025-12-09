@@ -543,7 +543,7 @@ impl InstallContext {
             lpClass: PCWSTR::null(),
             hkeyClass: Default::default(),
             dwHotKey: 0,
-            hMonitor: Default::default(),
+            Anonymous: Default::default(),
             hProcess: Default::default(),
         };
 

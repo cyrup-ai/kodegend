@@ -8,16 +8,14 @@
 //! - https://doc.rust-lang.org/std/os/windows/io/struct.OwnedHandle.html
 
 use anyhow::{anyhow, Result};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, ERROR_INVALID_PARAMETER, ERROR_ACCESS_DENIED};
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::Threading::{
     OpenProcess, 
     PROCESS_QUERY_LIMITED_INFORMATION,
     PROCESS_TERMINATE,
 };
-use windows::Win32::Security::{
-    OpenProcessToken,
-    TOKEN_QUERY,
-};
+use windows::Win32::System::Threading::OpenProcessToken;
+use windows::Win32::Security::TOKEN_QUERY;
 
 /// RAII wrapper for Windows process handles (PROCESS_*)
 ///

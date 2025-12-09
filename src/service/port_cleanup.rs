@@ -107,6 +107,7 @@ pub async fn kill_process_graceful(pid: u32) -> Result<()> {
 
         let sysinfo_pid = Pid::from(pid as usize);
 
+        #[cfg(unix)]
         let process = system
             .process(sysinfo_pid)
             .ok_or_else(|| anyhow::anyhow!("Process {} not found", pid))?;
@@ -114,6 +115,12 @@ pub async fn kill_process_graceful(pid: u32) -> Result<()> {
         // Try graceful termination first (SIGTERM on Unix)
         #[cfg(unix)]
         let graceful_result = process.kill_with(Signal::Term);
+
+        // On Windows, we don't need the process handle for graceful termination
+        #[cfg(windows)]
+        if system.process(sysinfo_pid).is_none() {
+            return Err(anyhow::anyhow!("Process {} not found", pid));
+        }
 
         #[cfg(windows)]
         let graceful_result = Some(true); // Windows doesn't distinguish

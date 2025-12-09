@@ -10,16 +10,16 @@ use windows::Win32::Security::TOKEN_ELEVATION;
 use super::InstallerError;
 
 // Global helper path - initialized once, used everywhere (like macOS implementation)
-pub(super) static HELPER_PATH: OnceCell<PathBuf> = OnceCell::new();
+pub(crate) static HELPER_PATH: OnceCell<PathBuf> = OnceCell::new();
 
 // Process-wide lock for helper extraction
-pub(super) static HELPER_EXTRACTION_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+pub(crate) static HELPER_EXTRACTION_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 // Embedded helper executable data (like macOS APP_ZIP_DATA)
 const HELPER_EXE_DATA: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/KodegenHelper.exe"));
 
 /// Check if we have sufficient privileges for service operations
-pub(super) fn check_privileges() -> Result<(), InstallerError> {
+pub(crate) fn check_privileges() -> Result<(), InstallerError> {
     use crate::platform::windows::TokenHandle;
     
     // Open current process token - handle auto-closed on drop
@@ -49,7 +49,7 @@ pub(super) fn check_privileges() -> Result<(), InstallerError> {
 }
 
 /// Ensure helper executable is extracted and available
-pub(super) fn ensure_helper_path() -> Result<(), InstallerError> {
+pub(crate) fn ensure_helper_path() -> Result<(), InstallerError> {
     // Acquire lock FIRST (released automatically when _guard drops)
     let _guard = HELPER_EXTRACTION_LOCK
         .lock()

@@ -3,24 +3,21 @@
 //! This implementation provides sophisticated service management with zero allocation,
 //! blazing-fast performance, and comprehensive error handling to match the macOS implementation.
 
-use std::sync::atomic::{AtomicU32, Ordering};
-
-use anyhow::{Context, Result};
-use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
+use anyhow::Result;
 use windows::Win32::System::Services::{OpenSCManagerW, SC_MANAGER_ALL_ACCESS};
 use windows::core::PCWSTR;
 
 use super::{InstallerBuilder, InstallerError};
 
 mod handles;
-mod paths;
-mod privileges;
+pub(crate) mod paths;
+pub(crate) mod privileges;
 mod registry;
 mod service_creation;
-mod utils;
+pub(crate) mod utils;
 
-use handles::{ScManagerHandle, ServiceHandle};
-use privileges::{HELPER_EXTRACTION_LOCK, HELPER_PATH, check_privileges, ensure_helper_path};
+use handles::ScManagerHandle;
+use privileges::{check_privileges, ensure_helper_path};
 use registry::{
     cleanup_registry_entries, create_registry_entries, register_event_source,
     unregister_event_source,
@@ -30,23 +27,20 @@ use service_creation::{
     configure_service_sid, create_service, install_services, open_service, start_service,
     stop_service,
 };
-use utils::{MAX_SERVICE_NAME, str_to_wide};
-
 // Re-export paths module for use in other modules
-pub use paths::{
-    InstallScope, hosts_file, install_dir, installer_data_dir, kodegend_exe, temp_cert_file,
-};
+pub use paths::{hosts_file, install_dir, installer_data_dir, temp_cert_file};
 
+#[allow(dead_code)]
 pub(crate) struct PlatformExecutor;
-
-// Atomic state for service operations
-static SERVICE_OPERATION_STATE: AtomicU32 = AtomicU32::new(0);
 
 impl ScManagerHandle {
     #[inline]
     fn new() -> Result<Self, InstallerError> {
         let handle =
-            unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_ALL_ACCESS) };
+            unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_ALL_ACCESS) }
+            .map_err(|e| InstallerError::System(format!(
+                "Failed to open Service Control Manager: {}", e
+            )))?;
 
         if handle.is_invalid() {
             return Err(InstallerError::System(format!(
@@ -59,6 +53,7 @@ impl ScManagerHandle {
     }
 }
 
+#[allow(dead_code)]
 impl PlatformExecutor {
     /// Install the daemon as a Windows service with comprehensive configuration
     pub fn install(b: InstallerBuilder) -> Result<(), InstallerError> {
@@ -120,18 +115,5 @@ impl PlatformExecutor {
         unregister_event_source(label)?;
 
         Ok(())
-    }
-
-    pub async fn install_async(b: InstallerBuilder) -> Result<(), InstallerError> {
-        tokio::task::spawn_blocking(move || Self::install(b))
-            .await
-            .context("task join failed")?
-    }
-
-    pub async fn uninstall_async(label: &str) -> Result<(), InstallerError> {
-        let label = label.to_string();
-        tokio::task::spawn_blocking(move || Self::uninstall(&label))
-            .await
-            .context("task join failed")?
     }
 }

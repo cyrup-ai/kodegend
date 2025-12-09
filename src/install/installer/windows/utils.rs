@@ -29,3 +29,12 @@ pub(super) fn str_to_wide(s: &str, buffer: &mut [u16]) -> Result<(), InstallerEr
     buffer[..wide.len()].copy_from_slice(&wide);
     Ok(())
 }
+
+/// Convert string to wide (UTF-16) returning a Vec
+#[inline]
+pub(crate) fn to_wide_string(s: &str) -> Vec<u16> {
+    OsStr::new(s)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}

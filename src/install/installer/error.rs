@@ -6,6 +6,7 @@ use thiserror::Error;
 pub enum InstallerError {
     /// User cancelled the authorization prompt
     #[error("User cancelled authorization")]
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     Cancelled,
 
     /// Permission was denied (incorrect password, policy restriction, etc.)

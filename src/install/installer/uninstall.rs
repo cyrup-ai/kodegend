@@ -92,6 +92,7 @@ pub fn validate_existing_wildcard_cert(cert_path: &Path) -> Result<()> {
 
 /// Import wildcard certificate on Linux
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 fn import_wildcard_certificate_linux(cert_path: &str) -> Result<()> {
     info!("Importing Kodegen wildcard certificate to Linux system trust store");
 

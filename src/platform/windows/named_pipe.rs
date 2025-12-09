@@ -42,7 +42,6 @@ impl Read for NamedPipeStream {
                 Some(&mut bytes_read),
                 None,
             )
-            .ok()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("ReadFile failed: {}", e)))?;
         }
 
@@ -61,7 +60,6 @@ impl Write for NamedPipeStream {
                 Some(&mut bytes_written),
                 None,
             )
-            .ok()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("WriteFile failed: {}", e)))?;
         }
 
@@ -82,6 +80,12 @@ impl Drop for NamedPipeStream {
         }
     }
 }
+
+// SAFETY: Windows HANDLE is a kernel object identifier (essentially an index into a
+// per-process handle table). HANDLEs can be safely sent between threads as they
+// reference kernel objects that are process-global. The kernel handles synchronization.
+// This is required because windows-rs HANDLE contains *mut c_void which isn't Send.
+unsafe impl Send for NamedPipeStream {}
 
 /// Connect to named pipe at given path (client-side)
 ///
@@ -105,8 +109,9 @@ pub fn connect_named_pipe(path: &str) -> io::Result<NamedPipeStream> {
         .collect();
 
     let handle = unsafe {
+        use windows::core::PCWSTR;
         CreateFileW(
-            wide.as_ptr(),
+            PCWSTR::from_raw(wide.as_ptr()),
             FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0,
             FILE_SHARE_READ,
             None,
@@ -141,10 +146,14 @@ pub fn connect_named_pipe(path: &str) -> io::Result<NamedPipeStream> {
 pub fn create_named_pipe_server(path: &str, max_instances: u32) -> io::Result<NamedPipeStream> {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
-    use windows::Win32::System::Pipes::{
-        CreateNamedPipeW, PIPE_ACCESS_DUPLEX, PIPE_READMODE_MESSAGE,
-        PIPE_TYPE_MESSAGE, PIPE_WAIT, PIPE_REJECT_REMOTE_CLIENTS,
-    };
+    use windows::Win32::System::Pipes::{CreateNamedPipeW, NAMED_PIPE_MODE};
+    use windows::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
+
+    // Pipe mode constants
+    const PIPE_TYPE_MESSAGE: u32 = 0x00000004;
+    const PIPE_READMODE_MESSAGE: u32 = 0x00000002;
+    const PIPE_WAIT: u32 = 0x00000000;
+    const PIPE_REJECT_REMOTE_CLIENTS: u32 = 0x00000008;
 
     // Convert path to wide string
     let wide: Vec<u16> = OsStr::new(path)
@@ -153,26 +162,23 @@ pub fn create_named_pipe_server(path: &str, max_instances: u32) -> io::Result<Na
         .collect();
 
     let handle = unsafe {
+        use windows::core::PCWSTR;
         CreateNamedPipeW(
-            wide.as_ptr(),
-            PIPE_ACCESS_DUPLEX.0,
-            PIPE_TYPE_MESSAGE.0 | PIPE_READMODE_MESSAGE.0 | PIPE_WAIT.0 | PIPE_REJECT_REMOTE_CLIENTS.0,
+            PCWSTR::from_raw(wide.as_ptr()),
+            PIPE_ACCESS_DUPLEX,
+            NAMED_PIPE_MODE(PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS),
             max_instances,
             1024 * 1024, // 1MB output buffer
             1024 * 1024, // 1MB input buffer
             0,           // Default timeout
             None,        // Default security
         )
-        .map_err(|e| io::Error::new(
-            io::ErrorKind::Other,
-            format!("Failed to create named pipe {}: {}", path, e),
-        ))?
     };
 
     if handle == INVALID_HANDLE_VALUE {
         return Err(io::Error::new(
             io::ErrorKind::Other,
-            format!("Invalid handle when creating named pipe {}", path),
+            format!("Failed to create named pipe {}: {:?}", path, unsafe { windows::Win32::Foundation::GetLastError() }),
         ));
     }
 

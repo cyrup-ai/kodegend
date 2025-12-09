@@ -15,9 +15,8 @@
 //! - `services` - Service definition installation
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 use super::{InstallerBuilder, InstallerError};
 
@@ -33,15 +32,6 @@ mod unit;
 
 // Re-export for internal use
 pub(crate) use unit::SystemdConfig;
-
-// Constants for zero-allocation buffers
-const UNIT_NAME_MAX: usize = 256;
-const UNIT_PATH_MAX: usize = 512;
-const MAX_SERVICE_NAME: usize = 256;
-const MAX_DESCRIPTION: usize = 512;
-
-// Atomic state for service operations
-static SERVICE_OPERATION_STATE: AtomicU32 = AtomicU32::new(0);
 
 pub(crate) struct PlatformExecutor;
 
@@ -135,18 +125,5 @@ impl PlatformExecutor {
         service_control::reload_systemd_daemon()?;
 
         Ok(())
-    }
-
-    pub async fn install_async(b: InstallerBuilder) -> Result<(), InstallerError> {
-        tokio::task::spawn_blocking(move || Self::install(b))
-            .await
-            .context("task join failed")?
-    }
-
-    pub async fn uninstall_async(label: &str) -> Result<(), InstallerError> {
-        let label = label.to_string();
-        tokio::task::spawn_blocking(move || Self::uninstall(&label))
-            .await
-            .context("task join failed")?
     }
 }

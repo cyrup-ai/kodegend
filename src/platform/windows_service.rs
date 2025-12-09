@@ -13,7 +13,6 @@ use log::{error, info, warn};
 use std::ffi::OsString;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::runtime::Runtime;
 use windows_service::{
     define_windows_service,
     service::{
@@ -24,7 +23,7 @@ use windows_service::{
     service_dispatcher,
 };
 
-use crate::lifecycle::ServiceLifecycle;
+use crate::state_machine::State as ServiceLifecycle;
 use crate::manager::ServiceManager;
 
 /// Service name for SCM registration
@@ -64,12 +63,6 @@ fn service_main(_arguments: Vec<OsString>) {
 /// 
 /// See: https://learn.microsoft.com/en-us/windows/win32/services/service-control-manager
 fn run_service() -> Result<()> {
-    // Create tokio runtime for async ServiceManager
-    // ServiceManager::run() is async, so we need a runtime to execute it
-    // Uses multi-threaded runtime (required for block_in_place in shutdown())
-    let rt = Runtime::new()
-        .context("Failed to create tokio runtime for Windows service")?;
-    
     // Create shutdown channel for coordinating service stop
     // SCM sends stop events to control handler, which signals via this channel
     let (shutdown_tx, shutdown_rx) = bounded::<()>(1);
@@ -121,7 +114,7 @@ fn run_service() -> Result<()> {
     let service_manager = match ServiceManager::new(config) {
         Ok(mgr) => {
             info!("ServiceManager initialized successfully");
-            Arc::new(mgr)  // Wrap in Arc for shared ownership
+            mgr
         }
         Err(e) => {
             error!("Failed to initialize ServiceManager: {}", e);
@@ -136,17 +129,34 @@ fn run_service() -> Result<()> {
         }
     };
 
-    // Clone Arc for background task
-    // Background task gets its own reference, caller keeps one for shutdown
-    let mgr_clone = Arc::clone(&service_manager);
-    
-    // Spawn ServiceManager::run() in background tokio task
-    // This allows the service thread to remain responsive to SCM control events
-    // run() consumes ServiceManager, which is why we need Arc
-    let run_handle = rt.spawn(async move {
-        if let Err(e) = mgr_clone.run().await {
-            error!("ServiceManager run() error: {}", e);
-        }
+    // Get ServiceManager's shutdown sender BEFORE moving it into the thread
+    // This allows us to signal the manager to stop after receiving SCM stop event
+    let mgr_shutdown_tx = service_manager.get_shutdown_sender();
+
+    // Spawn ServiceManager::run() in a dedicated thread with its own runtime
+    // We use std::thread instead of tokio::spawn because:
+    // 1. run() consumes self (takes ownership)
+    // 2. crossbeam's select! macro creates non-Send futures
+    // 3. The SCM handler thread needs to remain responsive
+    let run_handle = std::thread::spawn(move || {
+        // Create runtime inside the thread to avoid Send requirements
+        let thread_rt = match tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                error!("Failed to create runtime in manager thread: {}", e);
+                return;
+            }
+        };
+
+        thread_rt.block_on(async move {
+            if let Err(e) = service_manager.run().await {
+                error!("ServiceManager run() error: {}", e);
+            }
+        });
     });
 
     // Update lifecycle state to Running
@@ -189,15 +199,18 @@ fn run_service() -> Result<()> {
         0,
     )?;
 
-    // Send shutdown signal to ServiceManager
+    // Send shutdown signal to ServiceManager via the cloned sender
     // This triggers the run() loop to break and begin cleanup
-    if let Err(e) = service_manager.shutdown(Duration::from_secs(5)) {
+    info!("Sending shutdown signal to ServiceManager");
+    if let Err(e) = mgr_shutdown_tx.send(()) {
         error!("Failed to send shutdown signal: {}", e);
+    } else {
+        info!("Shutdown signal sent successfully");
     }
 
-    // Wait for background task to complete with 5-second timeout
+    // Wait for manager thread to complete with 5-second timeout
     // Timeout MUST match wait_hint above to prevent SCM force-kill
-    // 
+    //
     // Shutdown sequence in run() loop:
     // 1. Receives shutdown signal on channel
     // 2. Breaks from select! loop
@@ -205,25 +218,35 @@ fn run_service() -> Result<()> {
     // 4. Sends Shutdown to all workers
     // 5. Waits for worker termination
     // 6. run() returns
-    // 
-    // If any step hangs, timeout triggers and we log error
-    match rt.block_on(async {
-        tokio::time::timeout(Duration::from_secs(5), run_handle).await
-    }) {
-        Ok(Ok(())) => {
-            info!("ServiceManager shutdown completed successfully");
+    //
+    // We use a simple polling approach since std::thread::JoinHandle
+    // doesn't have native timeout support
+    let timeout_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if run_handle.is_finished() {
+            match run_handle.join() {
+                Ok(()) => {
+                    info!("ServiceManager shutdown completed successfully");
+                }
+                Err(_) => {
+                    error!("ServiceManager thread panicked");
+                }
+            }
+            break;
         }
-        Ok(Err(e)) => {
-            error!("ServiceManager task panicked: {}", e);
-        }
-        Err(_) => {
+
+        if std::time::Instant::now() >= timeout_deadline {
             error!("ServiceManager shutdown timed out after 5 seconds");
             error!("One or more MCP servers failed to stop gracefully");
             error!("Windows SCM may force-kill this process in ~25 seconds");
             // Note: We don't return error here - allow service to report Stopped
             // SCM will force-kill if we exceed the 30-second absolute deadline
             // Better to report Stopped cleanly than leave service in StopPending limbo
+            break;
         }
+
+        // Brief sleep to avoid busy-waiting
+        std::thread::sleep(Duration::from_millis(50));
     }
 
     // Update lifecycle state to Stopped

@@ -1,9 +1,8 @@
 //! Registry operations for service configuration.
 
-use std::path::PathBuf;
-
 use windows::Win32::System::Registry::{
-    HKEY, HKEY_LOCAL_MACHINE, KEY_WRITE, REG_DWORD, REG_SZ, RegCreateKeyExW, RegSetValueExW,
+    HKEY, HKEY_LOCAL_MACHINE, KEY_WRITE, REG_DWORD, REG_OPEN_CREATE_OPTIONS, REG_SZ,
+    RegCreateKeyExW, RegSetValueExW,
 };
 use windows::core::PCWSTR;
 
@@ -27,15 +26,16 @@ pub(super) fn create_registry_entries(builder: &InstallerBuilder) -> Result<(), 
         RegCreateKeyExW(
             HKEY_LOCAL_MACHINE,
             PCWSTR::from_raw(key_path_buf.as_ptr()),
-            0,
-            PCWSTR::null(),
-            0,
+            Some(0),  // Reserved, must be 0
+            None,
+            REG_OPEN_CREATE_OPTIONS(0),  // No options
             KEY_WRITE,
             None,
             &mut key_handle,
             None,
         )
-        .map_err(|e| InstallerError::System(format!("Failed to create registry key: {}", e)))?;
+        .ok()
+        .map_err(|e| InstallerError::System(format!("Failed to create registry key: {:?}", e)))?;
     }
 
     let registry_handle = RegistryHandle(key_handle);
@@ -80,7 +80,7 @@ pub(super) fn register_event_source(service_name: &str) -> Result<(), InstallerE
 }
 
 /// Cleanup registry entries
-pub(super) fn cleanup_registry_entries(service_name: &str) -> Result<(), InstallerError> {
+pub(super) fn cleanup_registry_entries(_service_name: &str) -> Result<(), InstallerError> {
     // This would implement registry cleanup
     // For brevity, we'll implement the key deletion logic
     Ok(())
@@ -127,11 +127,12 @@ fn set_registry_string(
         RegSetValueExW(
             registry.handle(),
             PCWSTR::from_raw(name_buf.as_ptr()),
-            0,
+            Some(0),  // Reserved, must be 0
             REG_SZ,
             Some(value_bytes),
         )
-        .map_err(|e| InstallerError::System(format!("Failed to set registry value: {}", e)))?;
+        .ok()
+        .map_err(|e| InstallerError::System(format!("Failed to set registry value: {:?}", e)))?;
     }
 
     Ok(())
@@ -152,11 +153,12 @@ fn set_registry_dword(
         RegSetValueExW(
             registry.handle(),
             PCWSTR::from_raw(name_buf.as_ptr()),
-            0,
+            Some(0),  // Reserved, must be 0
             REG_DWORD,
             Some(&value_bytes),
         )
-        .map_err(|e| InstallerError::System(format!("Failed to set registry DWORD: {}", e)))?;
+        .ok()
+        .map_err(|e| InstallerError::System(format!("Failed to set registry DWORD: {:?}", e)))?;
     }
 
     Ok(())

@@ -1,0 +1,25 @@
+[Unit]
+Description={{description}}
+After=network.target
+
+[Service]
+Type=notify
+User={{user}}
+Group={{group}}
+ExecStart={{exec_start}}
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5s
+NotifyAccess=main
+StandardOutput=journal
+StandardError=journal
+
+# Security hardening
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+NoNewPrivileges=true
+ReadWritePaths={{data_dir}}
+
+[Install]
+WantedBy=multi-user.target

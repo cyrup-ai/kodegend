@@ -160,23 +160,23 @@ pub async fn start_server(
     log::debug!("Starting embedded {} server on {}", category, addr);
 
     match category {
-        kodegen_config::CATEGORY_FILESYSTEM => kodegen_tools_filesystem::start_server(addr, tls_cert, tls_key).await,
-        kodegen_config::CATEGORY_TERMINAL => kodegen_tools_terminal::start_server(addr, tls_cert, tls_key).await,
-        kodegen_config::CATEGORY_PROCESS => kodegen_tools_process::start_server(addr, tls_cert, tls_key).await,
-        kodegen_config::CATEGORY_SEQUENTIAL_THINKING => {
+        name if name == kodegen_config::CATEGORY_FILESYSTEM.name => kodegen_tools_filesystem::start_server(addr, tls_cert, tls_key).await,
+        name if name == kodegen_config::CATEGORY_TERMINAL.name => kodegen_tools_terminal::start_server(addr, tls_cert, tls_key).await,
+        name if name == kodegen_config::CATEGORY_PROCESS.name => kodegen_tools_process::start_server(addr, tls_cert, tls_key).await,
+        name if name == kodegen_config::CATEGORY_SEQUENTIAL_THINKING.name => {
             kodegen_tools_sequential_thinking::start_server(addr, tls_cert, tls_key).await
         }
-        kodegen_config::CATEGORY_CITESCRAPE => kodegen_tools_citescrape::start_server(addr, tls_cert, tls_key).await,
-        kodegen_config::CATEGORY_PROMPT => kodegen_tools_prompt::start_server(addr, tls_cert, tls_key).await,
-        kodegen_config::CATEGORY_INTROSPECTION => kodegen_tools_introspection::start_server(addr, tls_cert, tls_key).await,
-        kodegen_config::CATEGORY_GIT => kodegen_tools_git::start_server(addr, tls_cert, tls_key).await,
-        kodegen_config::CATEGORY_GITHUB => kodegen_tools_github::start_server(addr, tls_cert, tls_key).await,
-        kodegen_config::CATEGORY_DATABASE => kodegen_tools_database::start_server(addr, tls_cert, tls_key).await,
-        kodegen_config::CATEGORY_BROWSER => kodegen_tools_browser::start_server(addr, tls_cert, tls_key).await,
-        kodegen_config::CATEGORY_REASONER => kodegen_tools_reasoner::start_server(addr, tls_cert, tls_key).await,
-        kodegen_config::CATEGORY_CLAUDE_AGENT => kodegen_claude_agent::start_server(addr, tls_cert, tls_key).await,
-        kodegen_config::CATEGORY_CANDLE_AGENT => kodegen_candle_agent::start_server(addr, tls_cert, tls_key).await,
-        kodegen_config::CATEGORY_CONFIG => kodegen_tools_config::start_server(addr, tls_cert, tls_key).await,
+        name if name == kodegen_config::CATEGORY_CITESCRAPE.name => kodegen_tools_citescrape::start_server(addr, tls_cert, tls_key).await,
+        name if name == kodegen_config::CATEGORY_PROMPT.name => kodegen_tools_prompt::start_server(addr, tls_cert, tls_key).await,
+        name if name == kodegen_config::CATEGORY_INTROSPECTION.name => kodegen_tools_introspection::start_server(addr, tls_cert, tls_key).await,
+        name if name == kodegen_config::CATEGORY_GIT.name => kodegen_tools_git::start_server(addr, tls_cert, tls_key).await,
+        name if name == kodegen_config::CATEGORY_GITHUB.name => kodegen_tools_github::start_server(addr, tls_cert, tls_key).await,
+        name if name == kodegen_config::CATEGORY_DATABASE.name => kodegen_tools_database::start_server(addr, tls_cert, tls_key).await,
+        name if name == kodegen_config::CATEGORY_BROWSER.name => kodegen_tools_browser::start_server(addr, tls_cert, tls_key).await,
+        name if name == kodegen_config::CATEGORY_REASONER.name => kodegen_tools_reasoner::start_server(addr, tls_cert, tls_key).await,
+        name if name == kodegen_config::CATEGORY_CLAUDE_AGENT.name => kodegen_claude_agent::start_server(addr, tls_cert, tls_key).await,
+        name if name == kodegen_config::CATEGORY_CANDLE_AGENT.name => kodegen_candle_agent::start_server(addr, tls_cert, tls_key).await,
+        name if name == kodegen_config::CATEGORY_CONFIG.name => kodegen_tools_config::start_server(addr, tls_cert, tls_key).await,
         _ => Err(anyhow::anyhow!("Unknown server category: {}", category)),
     }
 }
@@ -220,40 +220,40 @@ async fn start_server_with_listener(
     // Each package will need to add a `start_server_with_listener()` function
     // that calls `create_http_server_with_listener()` instead of `create_http_server()`
     match category {
-        kodegen_config::CATEGORY_FILESYSTEM => {
+        name if name == kodegen_config::CATEGORY_FILESYSTEM.name => {
             kodegen_tools_filesystem::start_server_with_listener(listener, tls_config).await
         }
-        kodegen_config::CATEGORY_TERMINAL => {
+        name if name == kodegen_config::CATEGORY_TERMINAL.name => {
             kodegen_tools_terminal::start_server_with_listener(listener, tls_config).await
         }
-        kodegen_config::CATEGORY_PROCESS => kodegen_tools_process::start_server_with_listener(listener, tls_config).await,
-        kodegen_config::CATEGORY_SEQUENTIAL_THINKING => {
+        name if name == kodegen_config::CATEGORY_PROCESS.name => kodegen_tools_process::start_server_with_listener(listener, tls_config).await,
+        name if name == kodegen_config::CATEGORY_SEQUENTIAL_THINKING.name => {
             kodegen_tools_sequential_thinking::start_server_with_listener(listener, tls_config)
                 .await
         }
-        kodegen_config::CATEGORY_CITESCRAPE => {
+        name if name == kodegen_config::CATEGORY_CITESCRAPE.name => {
             kodegen_tools_citescrape::start_server_with_listener(listener, tls_config).await
         }
-        kodegen_config::CATEGORY_PROMPT => kodegen_tools_prompt::start_server_with_listener(listener, tls_config).await,
-        kodegen_config::CATEGORY_INTROSPECTION => {
+        name if name == kodegen_config::CATEGORY_PROMPT.name => kodegen_tools_prompt::start_server_with_listener(listener, tls_config).await,
+        name if name == kodegen_config::CATEGORY_INTROSPECTION.name => {
             kodegen_tools_introspection::start_server_with_listener(listener, tls_config).await
         }
-        kodegen_config::CATEGORY_GIT => kodegen_tools_git::start_server_with_listener(listener, tls_config).await,
-        kodegen_config::CATEGORY_GITHUB => kodegen_tools_github::start_server_with_listener(listener, tls_config).await,
-        kodegen_config::CATEGORY_DATABASE => {
+        name if name == kodegen_config::CATEGORY_GIT.name => kodegen_tools_git::start_server_with_listener(listener, tls_config).await,
+        name if name == kodegen_config::CATEGORY_GITHUB.name => kodegen_tools_github::start_server_with_listener(listener, tls_config).await,
+        name if name == kodegen_config::CATEGORY_DATABASE.name => {
             kodegen_tools_database::start_server_with_listener(listener, tls_config).await
         }
-        kodegen_config::CATEGORY_BROWSER => kodegen_tools_browser::start_server_with_listener(listener, tls_config).await,
-        kodegen_config::CATEGORY_REASONER => {
+        name if name == kodegen_config::CATEGORY_BROWSER.name => kodegen_tools_browser::start_server_with_listener(listener, tls_config).await,
+        name if name == kodegen_config::CATEGORY_REASONER.name => {
             kodegen_tools_reasoner::start_server_with_listener(listener, tls_config).await
         }
-        kodegen_config::CATEGORY_CLAUDE_AGENT => {
+        name if name == kodegen_config::CATEGORY_CLAUDE_AGENT.name => {
             kodegen_claude_agent::start_server_with_listener(listener, tls_config).await
         }
-        kodegen_config::CATEGORY_CANDLE_AGENT => {
+        name if name == kodegen_config::CATEGORY_CANDLE_AGENT.name => {
             kodegen_candle_agent::start_server_with_listener(listener, tls_config).await
         }
-        kodegen_config::CATEGORY_CONFIG => kodegen_tools_config::start_server_with_listener(listener, tls_config).await,
+        name if name == kodegen_config::CATEGORY_CONFIG.name => kodegen_tools_config::start_server_with_listener(listener, tls_config).await,
         _ => Err(anyhow::anyhow!("Unknown server category: {}", category)),
     }
 }

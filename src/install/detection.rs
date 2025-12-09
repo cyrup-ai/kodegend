@@ -103,6 +103,19 @@ impl ComponentStatusReport {
             || self.certificates != ComponentStatus::Ok
             || self.kodegen_version != ComponentStatus::Ok
     }
+
+    /// Check if any pending fix requires Administrator (Windows)
+    ///
+    /// Returns true if any component needing action requires elevated privileges:
+    /// - hosts: writes to C:\Windows\System32\drivers\etc\hosts
+    /// - certificates: writes to %PROGRAMDATA%\kodegen\certs and imports to cert store
+    /// - kodegen_version: writes to %PROGRAMFILES%\kodegen\bin
+    #[cfg(windows)]
+    pub fn needs_sudo(&self) -> bool {
+        self.hosts != ComponentStatus::Ok
+            || self.certificates != ComponentStatus::Ok
+            || self.kodegen_version != ComponentStatus::Ok
+    }
 }
 
 /// Result of fixing all components

@@ -29,7 +29,7 @@ mod unix;
 pub use unix::*;
 
 #[cfg(windows)]
-mod windows;
+pub(crate) mod windows;
 #[cfg(windows)]
 pub use windows::*;
 

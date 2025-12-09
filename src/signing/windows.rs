@@ -58,8 +58,8 @@ pub fn verify_signature(exe_path: &Path) -> Result<(), Box<dyn std::error::Error
     let mut file_info = WINTRUST_FILE_INFO {
         cbStruct: std::mem::size_of::<WINTRUST_FILE_INFO>() as u32,
         pcwszFilePath: windows::core::PCWSTR(path_wide.as_ptr()),
-        hFile: HANDLE(ptr::null_mut()),
-        pgKnownSubject: ptr::null(),
+        hFile: HANDLE(ptr::null_mut() as _),
+        pgKnownSubject: ptr::null_mut(),
     };
 
     // Initialize WINTRUST_DATA structure
@@ -71,10 +71,10 @@ pub fn verify_signature(exe_path: &Path) -> Result<(), Box<dyn std::error::Error
     trust_data.fdwRevocationChecks = WTD_REVOKE_WHOLECHAIN; // Check entire cert chain
     trust_data.dwUnionChoice = WTD_CHOICE_FILE; // Verifying a file
     trust_data.dwStateAction = WTD_STATEACTION_VERIFY;
-    trust_data.hWVTStateData = HANDLE(ptr::null_mut());
-    trust_data.pwszURLReference = windows::core::PCWSTR(ptr::null());
-    trust_data.dwProvFlags = 0;
-    trust_data.dwUIContext = 0;
+    trust_data.hWVTStateData = HANDLE(ptr::null_mut() as _);
+    trust_data.pwszURLReference = windows::core::PWSTR::null();
+    trust_data.dwProvFlags = windows::Win32::Security::WinTrust::WINTRUST_DATA_PROVIDER_FLAGS(0);
+    trust_data.dwUIContext = windows::Win32::Security::WinTrust::WINTRUST_DATA_UICONTEXT(0);
     trust_data.pPolicyCallbackData = ptr::null_mut();
     trust_data.pSIPClientData = ptr::null_mut();
 
@@ -85,12 +85,12 @@ pub fn verify_signature(exe_path: &Path) -> Result<(), Box<dyn std::error::Error
 
     // Call WinVerifyTrust to verify the signature
     // WINTRUST_ACTION_GENERIC_VERIFY_V2 verifies embedded Authenticode signature
-    let action_id = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    let mut action_id = WINTRUST_ACTION_GENERIC_VERIFY_V2;
 
     let status = unsafe {
         WinVerifyTrust(
-            INVALID_HANDLE_VALUE,           // No window handle
-            &action_id as *const GUID,      // Verification action
+            windows::Win32::Foundation::HWND(INVALID_HANDLE_VALUE.0),           // No window handle
+            &mut action_id as *mut GUID,      // Verification action
             &mut trust_data as *mut _ as _, // Trust data
         )
     };
@@ -98,7 +98,7 @@ pub fn verify_signature(exe_path: &Path) -> Result<(), Box<dyn std::error::Error
     // Check verification result
     // Per Microsoft docs: return value is LONG, not HRESULT
     // Zero (0) = success, non-zero = failure
-    if status.0 != 0 {
+    if status != 0 {
         return Err(format!(
             "Authenticode signature verification failed. Status code: 0x{:08X}. \
              Binary may be unsigned, tampered with, or signed with untrusted certificate. \
@@ -108,7 +108,7 @@ pub fn verify_signature(exe_path: &Path) -> Result<(), Box<dyn std::error::Error
              - Certificate doesn't chain to trusted root\n\
              - Binary modified after signing (hash mismatch)\n\
              - Trust provider not available",
-            status.0
+            status
         )
         .into());
     }

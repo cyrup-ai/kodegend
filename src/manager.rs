@@ -1904,14 +1904,23 @@ impl ServiceManager {
     #[cfg_attr(not(windows), allow(dead_code))]
     pub fn shutdown(&self, _timeout: Duration) -> Result<()> {
         info!("Sending shutdown signal to ServiceManager");
-        
+
         // Send shutdown signal to run() loop
         // This will cause the select! to break and cleanup to begin
         self.shutdown_tx
             .send(())
             .context("Failed to send shutdown signal - channel disconnected")?;
-        
+
         info!("Shutdown signal sent successfully");
         Ok(())
+    }
+
+    /// Get a clone of the shutdown sender for external signaling
+    ///
+    /// This allows external code (like Windows SCM handler) to send shutdown
+    /// signals even after the ServiceManager is moved into a thread.
+    #[cfg(windows)]
+    pub fn get_shutdown_sender(&self) -> crossbeam_channel::Sender<()> {
+        self.shutdown_tx.clone()
     }
 }

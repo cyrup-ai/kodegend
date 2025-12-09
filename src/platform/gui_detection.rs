@@ -80,11 +80,11 @@ fn platform_is_gui_available() -> bool {
     }
 
     // Priority 3: XDG_SESSION_TYPE environment variable
-    if let Ok(session_type) = std::env::var("XDG_SESSION_TYPE") {
-        if session_type == "wayland" || session_type == "x11" {
-            log::debug!("Linux: XDG_SESSION_TYPE={}", session_type);
-            return true;
-        }
+    if let Ok(session_type) = std::env::var("XDG_SESSION_TYPE")
+        && (session_type == "wayland" || session_type == "x11")
+    {
+        log::debug!("Linux: XDG_SESSION_TYPE={}", session_type);
+        return true;
     }
 
     // Priority 4: systemd graphical session target
@@ -99,32 +99,32 @@ fn platform_is_gui_available() -> bool {
 
 #[cfg(target_os = "linux")]
 fn is_wayland_available() -> bool {
-    if let Ok(display) = std::env::var("WAYLAND_DISPLAY") {
-        if !display.is_empty() {
-            // Verify the socket actually exists
-            let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
-                .unwrap_or_else(|_| format!("/run/user/{}", unsafe { libc::getuid() }));
-            let socket_path = std::path::Path::new(&runtime_dir).join(&display);
-            return socket_path.exists();
-        }
+    if let Ok(display) = std::env::var("WAYLAND_DISPLAY")
+        && !display.is_empty()
+    {
+        // Verify the socket actually exists
+        let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
+            .unwrap_or_else(|_| format!("/run/user/{}", unsafe { libc::getuid() }));
+        let socket_path = std::path::Path::new(&runtime_dir).join(&display);
+        return socket_path.exists();
     }
     false
 }
 
 #[cfg(target_os = "linux")]
 fn is_x11_available() -> bool {
-    if let Ok(display) = std::env::var("DISPLAY") {
-        if !display.is_empty() {
-            // Quick verification: try xdpyinfo with timeout
-            return std::process::Command::new("timeout")
-                .args(["0.5", "xdpyinfo"])
-                .env("DISPLAY", &display)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-        }
+    if let Ok(display) = std::env::var("DISPLAY")
+        && !display.is_empty()
+    {
+        // Quick verification: try xdpyinfo with timeout
+        return std::process::Command::new("timeout")
+            .args(["0.5", "xdpyinfo"])
+            .env("DISPLAY", &display)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
     }
     false
 }

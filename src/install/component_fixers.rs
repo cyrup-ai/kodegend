@@ -14,6 +14,8 @@ use super::core::InstallProgress;
 use super::detection::{ComponentFixResult, ComponentStatus};
 #[cfg(unix)]
 use super::privilege::PrivilegedExecutor;
+#[cfg(windows)]
+use super::privilege::PrivilegedExecutor;
 
 /// Helper to send progress (best effort, ignores errors)
 fn send_progress(tx: &Option<mpsc::Sender<InstallProgress>>, progress: InstallProgress) {
@@ -53,6 +55,68 @@ pub async fn fix_hosts(_executor: &mut PrivilegedExecutor) -> ComponentFixResult
                 required_sudo: true,
             }
         }
+    }
+}
+
+/// Fix hosts file entry on Windows
+///
+/// Windows hosts file: C:\Windows\System32\drivers\etc\hosts
+/// Requires Administrator privileges to modify.
+#[cfg(windows)]
+pub async fn fix_hosts_windows(executor: &mut PrivilegedExecutor) -> ComponentFixResult {
+    log::info!("Fixing Windows hosts file entry...");
+
+    let hosts_path = PathBuf::from(r"C:\Windows\System32\drivers\etc\hosts");
+
+    // Read existing hosts file (no elevation needed for reading)
+    let existing_content = match tokio::fs::read_to_string(&hosts_path).await {
+        Ok(content) => content,
+        Err(e) => {
+            return ComponentFixResult {
+                component: "hosts",
+                success: false,
+                error: Some(format!("Failed to read hosts file: {}", e)),
+                required_sudo: true,
+            };
+        }
+    };
+
+    // Check if kodegen entries already exist
+    if existing_content.contains("mcp.kodegen.ai") {
+        log::info!("Hosts entry already exists");
+        return ComponentFixResult {
+            component: "hosts",
+            success: true,
+            error: None,
+            required_sudo: false,
+        };
+    }
+
+    // Append kodegen entries
+    let new_content = format!(
+        "{}\n\n# Kodegen MCP Server\n127.0.0.1 mcp.kodegen.ai\n::1 mcp.kodegen.ai\n",
+        existing_content.trim_end()
+    );
+
+    // Write using privileged executor
+    if let Err(e) = executor.write_file(&hosts_path, &new_content).await {
+        return ComponentFixResult {
+            component: "hosts",
+            success: false,
+            error: Some(format!("Failed to write hosts file: {}", e)),
+            required_sudo: true,
+        };
+    }
+
+    // Flush DNS cache
+    let _ = executor.exec(&["ipconfig", "/flushdns"]).await;
+
+    log::info!("Hosts entry added successfully");
+    ComponentFixResult {
+        component: "hosts",
+        success: true,
+        error: None,
+        required_sudo: true,
     }
 }
 
@@ -123,6 +187,86 @@ pub async fn fix_certificates(executor: &mut PrivilegedExecutor) -> ComponentFix
 
     log::info!(
         "Certificate generated and written to {}",
+        cert_path.display()
+    );
+    ComponentFixResult {
+        component: "certificates",
+        success: true,
+        error: None,
+        required_sudo: true,
+    }
+}
+
+/// Fix certificates on Windows
+///
+/// 1. Generate certificate content (same as Unix - uses generate_certificate_content_only())
+/// 2. Write to %PROGRAMDATA%\kodegen\certs\wildcard.pem
+/// 3. Import to Windows Certificate Store using existing import_certificate_windows()
+/// 4. Set ACLs using icacls
+#[cfg(windows)]
+pub async fn fix_certificates_windows(executor: &mut PrivilegedExecutor) -> ComponentFixResult {
+    use crate::install::installer::config::certificates::import_certificate_to_system;
+
+    log::info!("Fixing Windows certificates...");
+
+    // Step 1: Generate certificate content in memory (reuse existing function)
+    let cert_content = match generate_certificate_content_only() {
+        Ok(content) => content,
+        Err(e) => {
+            return ComponentFixResult {
+                component: "certificates",
+                success: false,
+                error: Some(format!("Failed to generate certificate: {}", e)),
+                required_sudo: false,
+            };
+        }
+    };
+
+    // Step 2: Get Windows certificate path
+    // %PROGRAMDATA%\kodegen\certs\wildcard.pem (typically C:\ProgramData\kodegen\certs\)
+    let cert_dir = std::env::var("PROGRAMDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(r"C:\ProgramData"))
+        .join("kodegen")
+        .join("certs");
+    let cert_path = cert_dir.join("wildcard.pem");
+
+    // Step 3: Create directory using privileged executor
+    if let Err(e) = executor
+        .exec(&["cmd", "/c", "mkdir", &cert_dir.to_string_lossy()])
+        .await
+    {
+        log::warn!("Directory creation warning (may already exist): {}", e);
+    }
+
+    // Step 4: Write certificate using privileged executor
+    if let Err(e) = executor.write_file(&cert_path, &cert_content).await {
+        return ComponentFixResult {
+            component: "certificates",
+            success: false,
+            error: Some(format!("Failed to write certificate: {}", e)),
+            required_sudo: true,
+        };
+    }
+
+    // Step 5: Set ACLs (owner-only access)
+    if let Err(e) = executor.chmod(&cert_path, "600").await {
+        log::warn!("Failed to set certificate permissions: {}", e);
+    }
+
+    // Step 6: Import to Windows Certificate Store
+    // This uses the EXISTING import_certificate_windows() in certificates.rs
+    if let Err(e) = import_certificate_to_system(&cert_path).await {
+        return ComponentFixResult {
+            component: "certificates",
+            success: false,
+            error: Some(format!("Failed to import certificate to Windows store: {}", e)),
+            required_sudo: true,
+        };
+    }
+
+    log::info!(
+        "Certificate generated, written to {}, and imported to Windows Root store",
         cert_path.display()
     );
     ComponentFixResult {
@@ -339,6 +483,229 @@ pub async fn fix_kodegen_version(
     }
 }
 
+/// Fix kodegen binary version on Windows
+///
+/// 1. Download binaries (same as Unix - uses download::download_all_binaries())
+/// 2. Stage binaries (same as Unix - uses binary_staging::stage_binaries_for_install())
+/// 3. Install to %PROGRAMFILES%\kodegen\bin\
+/// 4. Add to system PATH via registry
+#[cfg(windows)]
+pub async fn fix_kodegen_version_windows(
+    executor: &mut PrivilegedExecutor,
+    progress_tx: Option<mpsc::Sender<InstallProgress>>,
+) -> ComponentFixResult {
+    use super::binary_staging;
+    use super::download;
+
+    log::info!("Fixing kodegen version on Windows...");
+
+    // Check current status
+    let status = super::detection::check_kodegen_version_status().await;
+
+    match status {
+        ComponentStatus::Ok => {
+            log::info!("Kodegen version is already up to date");
+            return ComponentFixResult {
+                component: "kodegen_version",
+                success: true,
+                error: None,
+                required_sudo: false,
+            };
+        }
+        ComponentStatus::Missing | ComponentStatus::NeedsUpdate => {
+            // Continue with installation
+        }
+        ComponentStatus::CheckFailed => {
+            return ComponentFixResult {
+                component: "kodegen_version",
+                success: false,
+                error: Some("Could not determine kodegen version status".to_string()),
+                required_sudo: false,
+            };
+        }
+    }
+
+    // Create cleanup context
+    let mut cleanup_ctx = InstallationCleanupContext::new();
+
+    // Step 1: Download binaries (reuse existing)
+    let (tx, _rx) = if let Some(ref sender) = progress_tx {
+        (sender.clone(), None)
+    } else {
+        let (tx, mut rx) = mpsc::channel(100);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        (tx, None::<mpsc::Receiver<InstallProgress>>)
+    };
+
+    let binary_paths = match download::download_all_binaries(tx).await {
+        Ok((paths, download_dir)) => {
+            cleanup_ctx.downloaded_binaries_dir = Some(download_dir);
+            paths
+        }
+        Err(e) => {
+            return ComponentFixResult {
+                component: "kodegen_version",
+                success: false,
+                error: Some(format!("Failed to download kodegen: {}", e)),
+                required_sudo: false,
+            };
+        }
+    };
+
+    if binary_paths.is_empty() {
+        return ComponentFixResult {
+            component: "kodegen_version",
+            success: true,
+            error: None,
+            required_sudo: false,
+        };
+    }
+
+    // Step 2: Stage binaries (reuse existing)
+    let staging_dir = match binary_staging::stage_binaries_for_install(&binary_paths).await {
+        Ok(dir) => {
+            cleanup_ctx.staging_dir = Some(dir.clone());
+            dir
+        }
+        Err(e) => {
+            return ComponentFixResult {
+                component: "kodegen_version",
+                success: false,
+                error: Some(format!("Failed to stage binaries: {}", e)),
+                required_sudo: false,
+            };
+        }
+    };
+
+    // Step 3: Windows installation path: %PROGRAMFILES%\kodegen\bin\
+    let install_dir = std::env::var("PROGRAMFILES")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(r"C:\Program Files"))
+        .join("kodegen")
+        .join("bin");
+
+    // Create installation directory
+    if let Err(e) = executor
+        .exec(&["cmd", "/c", "mkdir", &install_dir.to_string_lossy()])
+        .await
+    {
+        log::warn!("Directory creation warning (may exist): {}", e);
+    }
+
+    // Copy each staged binary
+    for entry in std::fs::read_dir(&staging_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let src = entry.path();
+        let filename = src.file_name().unwrap();
+        let dst = install_dir.join(filename);
+
+        if let Err(e) = executor.copy_file(&src, &dst).await {
+            return ComponentFixResult {
+                component: "kodegen_version",
+                success: false,
+                error: Some(format!("Failed to copy {}: {}", src.display(), e)),
+                required_sudo: true,
+            };
+        }
+    }
+
+    // Step 4: Add to system PATH via registry
+    if let Err(e) = add_to_system_path_windows(executor, &install_dir).await {
+        log::warn!("Failed to add to PATH (may already be present): {}", e);
+    }
+
+    // Cleanup staging directory
+    let _ = std::fs::remove_dir_all(&staging_dir);
+
+    log::info!("Kodegen binaries installed to {}", install_dir.display());
+    cleanup_ctx.defuse();
+
+    ComponentFixResult {
+        component: "kodegen_version",
+        success: true,
+        error: None,
+        required_sudo: true,
+    }
+}
+
+/// Add installation directory to system PATH via registry
+#[cfg(windows)]
+async fn add_to_system_path_windows(
+    executor: &mut PrivilegedExecutor,
+    install_dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    use std::process::Command;
+
+    let install_dir_str = install_dir.to_string_lossy();
+
+    // Read current PATH from registry (no elevation needed for reading)
+    let output = Command::new("reg")
+        .args([
+            "query",
+            r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+            "/v",
+            "Path",
+        ])
+        .output()?;
+
+    let current_path = String::from_utf8_lossy(&output.stdout);
+
+    // Check if already in PATH
+    if current_path.to_lowercase().contains(&install_dir_str.to_lowercase()) {
+        log::info!("Installation directory already in PATH");
+        return Ok(());
+    }
+
+    // Extract current PATH value (after "REG_EXPAND_SZ" or "REG_SZ")
+    let path_value = current_path
+        .lines()
+        .find(|line| line.contains("REG_"))
+        .and_then(|line| {
+            // Format is "    Path    REG_EXPAND_SZ    value"
+            let parts: Vec<&str> = line.splitn(3, "    ").collect();
+            parts.get(2).map(|s| s.trim())
+        })
+        .unwrap_or("");
+
+    // Append our directory
+    let new_path = if path_value.is_empty() {
+        install_dir_str.to_string()
+    } else {
+        format!("{};{}", path_value, install_dir_str)
+    };
+
+    // Set new PATH using reg command via elevated helper
+    executor
+        .exec(&[
+            "reg",
+            "add",
+            r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+            "/v",
+            "Path",
+            "/t",
+            "REG_EXPAND_SZ",
+            "/d",
+            &new_path,
+            "/f",
+        ])
+        .await?;
+
+    // Broadcast WM_SETTINGCHANGE to notify other processes (best effort)
+    let _ = executor
+        .exec(&[
+            "powershell",
+            "-Command",
+            "Add-Type -Namespace Win32 -Name NativeMethods -MemberDefinition '[DllImport(\"user32.dll\", SetLastError = true, CharSet = CharSet.Auto)] public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wParam, string lParam, uint fuFlags, uint uTimeout, out UIntPtr lpdwResult);'; $HWND_BROADCAST = [IntPtr]0xffff; $WM_SETTINGCHANGE = 0x1a; $result = [UIntPtr]::Zero; [Win32.NativeMethods]::SendMessageTimeout($HWND_BROADCAST, $WM_SETTINGCHANGE, [UIntPtr]::Zero, 'Environment', 2, 5000, [ref]$result)",
+        ])
+        .await;
+
+    log::info!("Added {} to system PATH", install_dir.display());
+    Ok(())
+}
+
 /// Fix Rust toolchain using shared privileged executor
 ///
 /// Ensures Rust nightly toolchain is installed without changing user's default.
@@ -379,15 +746,41 @@ pub async fn fix_toolchain(_executor: &mut PrivilegedExecutor) -> ComponentFixRe
     }
 }
 
-#[cfg(not(unix))]
-pub async fn fix_toolchain(_executor: &mut PrivilegedExecutor) -> ComponentFixResult {
-    // TODO: Implement Windows toolchain installation
-    log::warn!("Toolchain verification not yet implemented for Windows");
-    ComponentFixResult {
-        component: "toolchain",
-        success: true,
-        error: None,
-        required_sudo: false,
+/// Fix Rust toolchain on Windows
+///
+/// Ensures Rust nightly toolchain is installed via rustup.
+/// Does NOT require Administrator privileges.
+#[cfg(windows)]
+pub async fn fix_toolchain_windows() -> ComponentFixResult {
+    use super::installer::config::toolchain::{ensure_rust_toolchain, verify_rust_toolchain_file};
+
+    log::info!("Checking Rust toolchain on Windows...");
+
+    // Verify rust-toolchain.toml exists
+    if let Err(e) = verify_rust_toolchain_file() {
+        log::warn!("rust-toolchain.toml verification failed: {}", e);
+    }
+
+    // Ensure nightly toolchain is available (uses existing function)
+    match ensure_rust_toolchain().await {
+        Ok(()) => {
+            log::info!("Rust toolchain: verified");
+            ComponentFixResult {
+                component: "toolchain",
+                success: true,
+                error: None,
+                required_sudo: false,
+            }
+        }
+        Err(e) => {
+            log::error!("Failed to ensure Rust toolchain: {}", e);
+            ComponentFixResult {
+                component: "toolchain",
+                success: false,
+                error: Some(e.to_string()),
+                required_sudo: false,
+            }
+        }
     }
 }
 
@@ -694,14 +1087,15 @@ pub async fn fix_all_components(
             InstallProgress::new("service".into(), 1.0, "✓ Service registered".into()),
         );
     } else {
+        // Service registration failure is not fatal - daemon can still run manually
+        // Use warning() instead of error() because installation continues
         send_progress(
             &progress_tx,
-            InstallProgress::error(
+            InstallProgress::warning(
                 "service".into(),
-                format!("✗ Service registration failed: {}", service_result.error.as_deref().unwrap_or("unknown")),
+                format!("⚠ Service registration failed: {}", service_result.error.as_deref().unwrap_or("unknown")),
             ),
         );
-        // Service registration failure is not fatal - daemon can still run manually
         log::warn!("Service registration failed, daemon will run but not as system service");
     }
 
@@ -903,10 +1297,10 @@ fn check_linux_unit_needs_update() -> bool {
     let current_exe = std::env::current_exe().ok();
 
     for path in unit_paths.iter().filter(|p| p.exists()) {
-        if let (Some(exe), Ok(content)) = (&current_exe, fs::read_to_string(path)) {
-            if content.contains(&exe.to_string_lossy().to_string()) {
-                return false; // Unit is up-to-date
-            }
+        if let (Some(exe), Ok(content)) = (&current_exe, fs::read_to_string(path))
+            && content.contains(&exe.to_string_lossy().to_string())
+        {
+            return false; // Unit is up-to-date
         }
     }
     true // Update needed
@@ -954,19 +1348,227 @@ fn check_unix_init_needs_update() -> bool {
     true
 }
 
-// Non-Unix stub implementations
-#[cfg(not(unix))]
+// ============================================================================
+// WINDOWS IMPLEMENTATION - Full Windows component fixer orchestration
+// ============================================================================
+
+/// Fix all components that need action on Windows
+///
+/// Checks each component and fixes only those that need it.
+/// Spawns PrivilegedExecutor ONCE if any operation needs Administrator.
+/// Emits progress events to the provided channel for GUI/CLI display.
+#[cfg(windows)]
 pub async fn fix_all_components(
-    _progress_tx: Option<mpsc::Sender<InstallProgress>>,
+    progress_tx: Option<mpsc::Sender<InstallProgress>>,
 ) -> Result<super::detection::InstallationFixReport> {
-    // Windows implementation would go here
-    // TODO: Implement full Windows support using the same pattern as Unix
-    Ok(super::detection::InstallationFixReport {
+    // Check all components first
+    send_progress(
+        &progress_tx,
+        InstallProgress::new("status".into(), 0.0, "Checking components...".into()),
+    );
+    let status = super::detection::check_all_components().await;
+
+    // If all OK, we're done
+    if status.all_ok() {
+        log::info!("All installation components verified OK");
+        send_progress(
+            &progress_tx,
+            InstallProgress::complete("complete".into(), "All components OK".into()),
+        );
+        return Ok(super::detection::InstallationFixReport {
+            toolchain: None,
+            hosts: None,
+            certificates: None,
+            kodegen_version: None,
+            service: None,
+            overall_success: true,
+        });
+    }
+
+    log::info!(
+        "Components needing action: {:?}",
+        status.components_needing_action()
+    );
+
+    let mut report = super::detection::InstallationFixReport {
         toolchain: None,
         hosts: None,
         certificates: None,
         kodegen_version: None,
         service: None,
         overall_success: true,
-    })
+    };
+
+    // Spawn PrivilegedExecutor ONCE if any operation needs elevation
+    let mut executor = if status.needs_sudo() {
+        log::info!("Privileged operations required, requesting UAC elevation...");
+        send_progress(
+            &progress_tx,
+            InstallProgress::new("privilege".into(), 0.0, "Requesting Administrator privileges...".into()),
+        );
+        Some(PrivilegedExecutor::spawn().await?)
+    } else {
+        None
+    };
+
+    // Fix toolchain if needed (no Admin required)
+    if status.toolchain != ComponentStatus::Ok {
+        send_progress(
+            &progress_tx,
+            InstallProgress::new("toolchain".into(), 0.5, "Checking Rust toolchain...".into()),
+        );
+        let result = fix_toolchain_windows().await;
+        let success = result.success;
+        if success {
+            send_progress(
+                &progress_tx,
+                InstallProgress::new("toolchain".into(), 1.0, "Toolchain OK".into()),
+            );
+        } else {
+            send_progress(
+                &progress_tx,
+                InstallProgress::error("toolchain".into(), format!("Toolchain failed: {}", result.error.as_deref().unwrap_or("unknown"))),
+            );
+        }
+        report.toolchain = Some(result);
+        if !success {
+            report.overall_success = false;
+            return Ok(report);
+        }
+    }
+
+    // Fix hosts file if needed
+    if status.hosts != ComponentStatus::Ok {
+        send_progress(
+            &progress_tx,
+            InstallProgress::new("hosts".into(), 0.5, "Fixing hosts entry...".into()),
+        );
+        let result = if let Some(ref mut exec) = executor {
+            fix_hosts_windows(exec).await
+        } else {
+            ComponentFixResult {
+                component: "hosts",
+                success: false,
+                error: Some("No privileged executor available".to_string()),
+                required_sudo: true,
+            }
+        };
+        let success = result.success;
+        if success {
+            send_progress(
+                &progress_tx,
+                InstallProgress::new("hosts".into(), 1.0, "Hosts fixed".into()),
+            );
+        } else {
+            send_progress(
+                &progress_tx,
+                InstallProgress::error("hosts".into(), format!("Hosts failed: {}", result.error.as_deref().unwrap_or("unknown"))),
+            );
+        }
+        report.hosts = Some(result);
+        if !success {
+            report.overall_success = false;
+            return Ok(report);
+        }
+    }
+
+    // Fix certificates if needed
+    if status.certificates != ComponentStatus::Ok {
+        send_progress(
+            &progress_tx,
+            InstallProgress::new("certificates".into(), 0.5, "Fixing certificates...".into()),
+        );
+        let result = if let Some(ref mut exec) = executor {
+            fix_certificates_windows(exec).await
+        } else {
+            ComponentFixResult {
+                component: "certificates",
+                success: false,
+                error: Some("No privileged executor available".to_string()),
+                required_sudo: true,
+            }
+        };
+        let success = result.success;
+        if success {
+            send_progress(
+                &progress_tx,
+                InstallProgress::new("certificates".into(), 1.0, "Certificates fixed".into()),
+            );
+        } else {
+            send_progress(
+                &progress_tx,
+                InstallProgress::error("certificates".into(), format!("Certificates failed: {}", result.error.as_deref().unwrap_or("unknown"))),
+            );
+        }
+        report.certificates = Some(result);
+        if !success {
+            report.overall_success = false;
+            return Ok(report);
+        }
+    }
+
+    // Fix kodegen version if needed
+    if status.kodegen_version != ComponentStatus::Ok {
+        send_progress(
+            &progress_tx,
+            InstallProgress::new("kodegen".into(), 0.1, "Updating kodegen...".into()),
+        );
+        let result = if let Some(ref mut exec) = executor {
+            fix_kodegen_version_windows(exec, progress_tx.clone()).await
+        } else {
+            ComponentFixResult {
+                component: "kodegen_version",
+                success: false,
+                error: Some("No privileged executor available".to_string()),
+                required_sudo: true,
+            }
+        };
+        let success = result.success;
+        if success {
+            send_progress(
+                &progress_tx,
+                InstallProgress::new("kodegen".into(), 1.0, "Kodegen updated".into()),
+            );
+        } else {
+            send_progress(
+                &progress_tx,
+                InstallProgress::error("kodegen".into(), format!("Kodegen failed: {}", result.error.as_deref().unwrap_or("unknown"))),
+            );
+        }
+        report.kodegen_version = Some(result);
+        if !success {
+            report.overall_success = false;
+            return Ok(report);
+        }
+    }
+
+    // Service registration (uses existing fix_service_registration which is cross-platform)
+    send_progress(
+        &progress_tx,
+        InstallProgress::new("service".into(), 0.0, "Checking service registration...".into()),
+    );
+    let service_result = fix_service_registration(&progress_tx).await;
+    report.service = Some(service_result.clone());
+
+    if service_result.success {
+        send_progress(
+            &progress_tx,
+            InstallProgress::new("service".into(), 1.0, "Service registered".into()),
+        );
+    } else {
+        send_progress(
+            &progress_tx,
+            InstallProgress::warning(
+                "service".into(),
+                format!("Service registration failed: {}", service_result.error.as_deref().unwrap_or("unknown")),
+            ),
+        );
+    }
+
+    log::info!("All Windows component fixes completed");
+    send_progress(
+        &progress_tx,
+        InstallProgress::complete("complete".into(), "Installation complete".into()),
+    );
+    Ok(report)
 }

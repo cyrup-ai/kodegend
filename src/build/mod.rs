@@ -1,18 +1,9 @@
 //! Build module for cross-platform build tasks
 //!
-//! This module provides comprehensive build functionality including macOS
-//! helper app creation, code signing, and packaging with zero allocation
-//! patterns and blazing-fast performance.
-//!
-//! Uses proven kodegen_bundler_sign for reliable code signing.
-
-pub mod packaging;
-
-#[cfg(target_os = "linux")]
-pub mod windows_helper;
-
-#[cfg(target_os = "linux")]
-pub mod linux_helper;
+//! This module provides build configuration including:
+//! - Platform-specific optimization flags
+//! - Build metadata (timestamp, target, profile)
+//! - Systemd feature detection (Linux)
 
 /// Main build function orchestrating platform-specific tasks
 pub async fn main() {
@@ -28,40 +19,31 @@ pub async fn main() {
         if pkg_config::probe_library("libsystemd").is_ok() {
             println!("cargo:rustc-cfg=feature=\"systemd_available\"");
         }
-    }
 
-    // Build and sign macOS helper app
-    #[cfg(target_os = "macos")]
-    {
-        // Use atomic build with rollback
-        let out_dir = match std::env::var("OUT_DIR").map(std::path::PathBuf::from) {
-            Ok(dir) => dir,
-            Err(e) => {
-                eprintln!("Build error: OUT_DIR not set: {e}");
-                std::process::exit(1);
+        // Create empty dummy helper for Linux (extracted but never invoked)
+        if let Ok(out_dir) = std::env::var("OUT_DIR") {
+            let helper_path = std::path::PathBuf::from(&out_dir).join("kodegen-helper");
+            if let Err(e) = std::fs::write(&helper_path, b"") {
+                eprintln!("Warning: Failed to create dummy helper: {}", e);
+            } else {
+                // Make executable
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Ok(metadata) = std::fs::metadata(&helper_path) {
+                        let mut perms = metadata.permissions();
+                        perms.set_mode(0o755);
+                        let _ = std::fs::set_permissions(&helper_path, perms);
+                    }
+                }
             }
-        };
-        let zip_path = out_dir.join("KodegenHelper.app.zip");
-
-        if let Err(e) = packaging::create_functional_zip(&zip_path).await {
-            eprintln!("Build error: macOS helper failed: {e}");
-            std::process::exit(1);
         }
     }
 
-    // Build Linux and Windows helper executables
-    #[cfg(target_os = "linux")]
-    {
-        if let Err(e) = linux_helper::build_and_sign_helper() {
-            eprintln!("Build error: Linux helper failed: {e}");
-            std::process::exit(1);
-        }
-
-        // Build Windows helper via MinGW cross-compilation
-        if let Err(e) = windows_helper::build_and_sign_helper() {
-            eprintln!("Build error: Windows helper failed: {e}");
-            std::process::exit(1);
-        }
+    // Build Windows helper executable
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if target_os == "windows" {
+        build_windows_helper();
     }
 
     // Platform-specific build optimizations
@@ -193,9 +175,9 @@ fn install_build_dependencies() -> Result<(), Box<dyn std::error::Error>> {
         // Detect and use available package manager
         if Command::new("apt-get").arg("--version").output().is_ok() {
             eprintln!("Build: Installing build dependencies via apt-get...");
-            Command::new("sudo").args(&["apt-get", "update"]).status()?;
+            Command::new("sudo").args(["apt-get", "update"]).status()?;
             Command::new("sudo")
-                .args(&[
+                .args([
                     "apt-get",
                     "install",
                     "-y",
@@ -207,7 +189,7 @@ fn install_build_dependencies() -> Result<(), Box<dyn std::error::Error>> {
         } else if Command::new("dnf").arg("--version").output().is_ok() {
             eprintln!("Build: Installing build dependencies via dnf...");
             Command::new("sudo")
-                .args(&[
+                .args([
                     "dnf",
                     "install",
                     "-y",
@@ -221,12 +203,12 @@ fn install_build_dependencies() -> Result<(), Box<dyn std::error::Error>> {
         } else if Command::new("pacman").arg("--version").output().is_ok() {
             eprintln!("Build: Installing build dependencies via pacman...");
             Command::new("sudo")
-                .args(&["pacman", "-S", "--noconfirm", "base-devel", "mingw-w64-gcc"])
+                .args(["pacman", "-S", "--noconfirm", "base-devel", "mingw-w64-gcc"])
                 .status()?;
         } else if Command::new("apk").arg("--version").output().is_ok() {
             eprintln!("Build: Installing build dependencies via apk...");
             Command::new("sudo")
-                .args(&["apk", "add", "build-base"])
+                .args(["apk", "add", "build-base"])
                 .status()?;
         } else {
             return Err(
@@ -285,3 +267,117 @@ fn get_enabled_features() -> Vec<String> {
 }
 
 // Function removed - no more placeholders, fail builds instead
+
+/// Build Windows helper executable with UAC manifest
+fn build_windows_helper() {
+    use std::env;
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    eprintln!("Build: Compiling Windows helper executable...");
+
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
+    let target = env::var("TARGET").unwrap_or_default();
+
+    // Compile helper.c to object file
+    let mut cc_build = cc::Build::new();
+    cc_build
+        .file("src/install/installer/windows/helper/helper.c")
+        .warnings(true);
+
+    // Add Windows-specific flags
+    if target.contains("gnu") {
+        cc_build
+            .flag("-municode")
+            .flag("-mconsole")
+            .flag("-static");
+    }
+
+    cc_build.compile("kodegen_helper");
+
+    // Create resource file for manifest embedding
+    let manifest_path = "src/install/installer/windows/helper/helper.manifest";
+    let rc_file = out_dir.join("helper.rc");
+    let res_file = out_dir.join("helper.res");
+
+    // Write .rc file that references the manifest
+    std::fs::write(&rc_file, format!("1 24 \"{}\"", manifest_path))
+        .expect("Failed to write RC file");
+
+    // Determine windres executable name
+    let windres = if cfg!(target_os = "windows") {
+        "windres.exe".to_string()
+    } else {
+        // Cross-compiling: use target-prefixed windres
+        format!("{}-w64-mingw32-windres", target.split('-').next().unwrap_or("x86_64"))
+    };
+
+    // Compile resource file
+    let windres_status = Command::new(&windres)
+        .arg(&rc_file)
+        .arg("-O")
+        .arg("coff")
+        .arg("-o")
+        .arg(&res_file)
+        .status();
+
+    match windres_status {
+        Ok(status) if status.success() => {
+            eprintln!("Build: Successfully compiled resource file");
+        }
+        Ok(status) => {
+            eprintln!("Warning: windres failed with status: {}", status);
+            eprintln!("Continuing without manifest embedding...");
+            // Create empty resource file to prevent linker errors
+            std::fs::write(&res_file, b"").ok();
+        }
+        Err(e) => {
+            eprintln!("Warning: Failed to run windres ({}): {}", windres, e);
+            eprintln!("Continuing without manifest embedding...");
+            std::fs::write(&res_file, b"").ok();
+        }
+    }
+
+    // Link to create final executable
+    let helper_exe = out_dir.join("KodegenHelper.exe");
+    let obj_file = out_dir.join("libkodegen_helper.a");
+
+    let linker = if cfg!(target_os = "windows") {
+        "gcc.exe".to_string()
+    } else {
+        format!("{}-w64-mingw32-gcc", target.split('-').next().unwrap_or("x86_64"))
+    };
+
+    let link_status = Command::new(&linker)
+        .arg(&obj_file)
+        .arg(&res_file)
+        .arg("-o")
+        .arg(&helper_exe)
+        .arg("-static")
+        .arg("-ladvapi32")
+        .arg("-lshell32")
+        .arg("-municode")
+        .arg("-mconsole")
+        .status();
+
+    match link_status {
+        Ok(status) if status.success() => {
+            eprintln!("Build: Successfully built KodegenHelper.exe at {:?}", helper_exe);
+        }
+        Ok(status) => {
+            panic!("Linking KodegenHelper.exe failed with status: {}", status);
+        }
+        Err(e) => {
+            panic!("Failed to run linker ({}): {}", linker, e);
+        }
+    }
+
+    // Verify the helper was created
+    if !helper_exe.exists() {
+        panic!("KodegenHelper.exe was not created at {:?}", helper_exe);
+    }
+
+    // Tell Cargo to rerun if these files change
+    println!("cargo:rerun-if-changed=src/install/installer/windows/helper/helper.c");
+    println!("cargo:rerun-if-changed=src/install/installer/windows/helper/helper.manifest");
+}

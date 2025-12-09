@@ -110,6 +110,7 @@ pub(super) fn disable_systemd_service(service_name: &str) -> Result<(), Installe
 }
 
 /// Enable user-level systemd service
+#[allow(dead_code)]
 pub(super) fn enable_user_systemd_service(service_name: &str) -> Result<(), InstallerError> {
     let output = Command::new("systemctl")
         .args(["--user", "enable", &format!("{}.service", service_name)])
@@ -129,6 +130,7 @@ pub(super) fn enable_user_systemd_service(service_name: &str) -> Result<(), Inst
 }
 
 /// Start user-level systemd service
+#[allow(dead_code)]
 pub(super) fn start_user_systemd_service(service_name: &str) -> Result<(), InstallerError> {
     let output = Command::new("systemctl")
         .args(["--user", "start", &format!("{}.service", service_name)])

@@ -16,18 +16,12 @@ use x509_parser;
 
 use super::super::core::InstallContext;
 
-#[cfg(windows)]
-use windows::Win32::Foundation::LocalFree;
-#[cfg(windows)]
-use windows::Win32::Security::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, SECURITY_DESCRIPTOR,
-};
+// Note: Windows-specific imports are defined inline in set_windows_certificate_permissions()
+// to avoid unused import warnings while keeping them scoped to where they're used
 #[cfg(windows)]
 use windows::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_HIDDEN, FILE_FLAGS_AND_ATTRIBUTES, SetFileAttributesW,
 };
-#[cfg(windows)]
-use windows::core::PCWSTR;
 
 /// Set Windows ACL permissions on certificate file
 ///
@@ -40,12 +34,14 @@ use windows::core::PCWSTR;
 /// Uses SDDL (Security Descriptor Definition Language) for clarity and maintainability.
 #[cfg(windows)]
 fn set_windows_certificate_permissions(path: &Path) -> Result<()> {
-    use windows::Win32::Foundation::{HLOCAL, LocalFree};
+    use windows::Win32::Foundation::{HLOCAL, LocalFree, WIN32_ERROR};
     use windows::Win32::Security::{
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, PSECURITY_DESCRIPTOR,
-        SECURITY_DESCRIPTOR_REVISION,
+        Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW, PSECURITY_DESCRIPTOR,
     };
     use windows::core::PCWSTR;
+
+    // SECURITY_DESCRIPTOR_REVISION is a constant = 1
+    const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
 
     // SDDL string breakdown:
     // D:           - DACL (Discretionary Access Control List)
@@ -79,7 +75,7 @@ fn set_windows_certificate_permissions(path: &Path) -> Result<()> {
     // Ensure we free the allocated security descriptor
     let _guard = scopeguard::guard(sd_ptr, |sd| {
         if !sd.0.is_null() {
-            unsafe { LocalFree(HLOCAL(sd.0 as _)) };
+            unsafe { let _ = LocalFree(Some(HLOCAL(sd.0 as _))); };
         }
     });
 
@@ -91,27 +87,29 @@ fn set_windows_certificate_permissions(path: &Path) -> Result<()> {
 
     use windows::Win32::Security::Authorization::SetNamedSecurityInfoW;
     use windows::Win32::Security::{
-        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, Authorization::SE_FILE_OBJECT,
     };
 
     unsafe {
-        SetNamedSecurityInfoW(
-            PCWSTR(path_wide.as_ptr()),
+        let result = SetNamedSecurityInfoW(
+            PCWSTR::from_raw(path_wide.as_ptr()),
             SE_FILE_OBJECT,
             DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
             None,                              // Don't change owner
             None,                              // Don't change group
             Some(std::mem::transmute(sd_ptr)), // Set DACL from security descriptor
             None,                              // Don't change SACL
-        )
-        .context("Failed to apply ACL to certificate file")?;
+        );
+        if result != WIN32_ERROR(0) {
+            anyhow::bail!("Failed to apply ACL to certificate file: error code {}", result.0);
+        }
     }
 
     // Defense-in-depth: Mark file as hidden
     // This makes it less likely to be accidentally accessed
     let attributes = FILE_FLAGS_AND_ATTRIBUTES(FILE_ATTRIBUTE_HIDDEN.0);
     unsafe {
-        SetFileAttributesW(PCWSTR(path_wide.as_ptr()), attributes)
+        SetFileAttributesW(PCWSTR::from_raw(path_wide.as_ptr()), attributes)
             .context("Failed to set hidden attribute on certificate file")?;
     }
 
@@ -507,11 +505,12 @@ async fn detect_linux_ca_tool() -> Result<(PathBuf, &'static str, Vec<&'static s
 #[cfg(target_os = "windows")]
 async fn import_certificate_windows(cert_path: &Path) -> Result<()> {
     use windows::Win32::Security::Cryptography::{
+        CERT_OPEN_STORE_FLAGS, CERT_QUERY_ENCODING_TYPE,
         CERT_STORE_ADD_REPLACE_EXISTING, CERT_STORE_PROV_SYSTEM_W, CERT_SYSTEM_STORE_LOCAL_MACHINE,
-        CertAddEncodedCertificateToStore, CertCloseStore, CertOpenStore, HCERTSTORE,
+        CertAddEncodedCertificateToStore, CertCloseStore, CertOpenStore,
         PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
     };
-    use windows::core::{HSTRING, PCWSTR};
+    use windows::core::HSTRING;
 
     info!("Importing certificate to Windows Root certificate store via CryptoAPI...");
 
@@ -556,10 +555,10 @@ async fn import_certificate_windows(cert_path: &Path) -> Result<()> {
 
             let store_handle = CertOpenStore(
                 CERT_STORE_PROV_SYSTEM_W,
-                0,  // No encoding flags
+                CERT_QUERY_ENCODING_TYPE(0),  // No encoding flags
                 None,  // No cryptographic provider
-                CERT_SYSTEM_STORE_LOCAL_MACHINE,
-                Some(PCWSTR(store_name.as_ptr())),
+                CERT_OPEN_STORE_FLAGS(CERT_SYSTEM_STORE_LOCAL_MACHINE),
+                Some(&store_name as *const _ as *const _),
             )
             .map_err(|e| anyhow::anyhow!(
                 "Failed to open Root certificate store (error: {}). Ensure running with Administrator privileges.",
@@ -568,14 +567,14 @@ async fn import_certificate_windows(cert_path: &Path) -> Result<()> {
 
             // Ensure store is always closed (using existing scopeguard crate)
             let _store_guard = scopeguard::guard(store_handle, |handle| {
-                let _ = CertCloseStore(handle, 0);
+                let _ = CertCloseStore(Some(handle), 0);
             });
 
             // Add certificate to Root store
             // Verified from Microsoft docs: CERT_STORE_ADD_REPLACE_EXISTING
             // "If a matching certificate exists, it is deleted and a new certificate is created"
             let result = CertAddEncodedCertificateToStore(
-                store_handle,
+                Some(store_handle),
                 X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,  // Standard encoding
                 &cert_der,
                 CERT_STORE_ADD_REPLACE_EXISTING,  // Replace if exists

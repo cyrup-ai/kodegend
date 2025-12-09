@@ -81,8 +81,6 @@ use anyhow::{Context, Result, anyhow};
 use log::{error, info, warn};
 
 use crate::constants::*;
-#[cfg(all(feature = "systemd-notify", target_os = "linux"))]
-use systemd::daemon;
 
 #[cfg(unix)]
 use nix::fcntl::{Flock, FlockArg};
@@ -112,9 +110,9 @@ use crate::platform;
 /// No-op on non-systemd systems (checks NOTIFY_SOCKET environment variable).
 #[cfg(all(feature = "systemd-notify", target_os = "linux"))]
 pub fn systemd_notify_ready() {
-    use systemd::daemon::{notify, NotifyState};
-    
-    match notify(false, &[NotifyState::Ready]) {
+    use systemd::daemon::notify;
+
+    match notify(false, [("READY", "1")].iter()) {
         Ok(true) => {
             info!("systemd notification: READY=1 (service fully operational)");
         }
@@ -142,9 +140,9 @@ pub fn systemd_notify_ready() {
 /// Example: `systemd_notify_status("Starting HTTP servers...")`
 #[cfg(all(feature = "systemd-notify", target_os = "linux"))]
 pub fn systemd_notify_status(status: &str) {
-    use systemd::daemon::{notify, NotifyState};
-    
-    match notify(false, &[NotifyState::Status(status.to_string())]) {
+    use systemd::daemon::notify;
+
+    match notify(false, [("STATUS", status)].iter()) {
         Ok(true) => {
             log::debug!("systemd notification: STATUS={}", status);
         }
@@ -168,9 +166,9 @@ pub fn systemd_notify_status(_status: &str) {
 /// This prevents systemd from treating shutdown as a crash/failure.
 #[cfg(all(feature = "systemd-notify", target_os = "linux"))]
 pub fn systemd_notify_stopping() {
-    use systemd::daemon::{notify, NotifyState};
-    
-    match notify(false, &[NotifyState::Stopping]) {
+    use systemd::daemon::notify;
+
+    match notify(false, [("STOPPING", "1")].iter()) {
         Ok(true) => {
             info!("systemd notification: STOPPING=1 (graceful shutdown)");
         }
@@ -196,9 +194,9 @@ pub fn systemd_notify_stopping() {
 /// Only relevant when unit file contains `WatchdogSec=` directive.
 #[cfg(all(feature = "systemd-notify", target_os = "linux"))]
 pub fn systemd_notify_watchdog() {
-    use systemd::daemon::{notify, NotifyState};
-    
-    match notify(false, &[NotifyState::Watchdog]) {
+    use systemd::daemon::notify;
+
+    match notify(false, [("WATCHDOG", "1")].iter()) {
         Ok(true) => {
             log::debug!("systemd notification: WATCHDOG=1");
         }
@@ -643,6 +641,7 @@ fn validate_existing_pid_file(_path: &Path) -> Result<()> {
 ///
 /// # Returns
 /// `anyhow::Error` with specific context based on error type
+#[cfg(unix)]
 fn handle_write_error(e: std::io::Error, path: &Path) -> anyhow::Error {
     // Check if this is a "disk full" error
     if let Some(os_error) = e.raw_os_error() {
@@ -998,6 +997,7 @@ impl ServiceStatus {
     }
     
     /// Returns true if cleanup is needed (stale/invalid files, zombies)
+    #[cfg(unix)]
     pub fn needs_cleanup(&self) -> bool {
         matches!(
             self,
@@ -1421,10 +1421,10 @@ pub fn get_service_status(pid_file: &Path) -> Result<ServiceStatus> {
 /// - [`systemd_notify_ready()`] - Signal readiness to systemd
 /// - [daemon(3)](https://man7.org/linux/man-pages/man3/daemon.3.html)
 #[allow(dead_code)]
-pub fn daemonise(config: &crate::config::ServiceConfig) -> Result<()> {
+pub fn daemonise(_config: &crate::config::ServiceConfig) -> Result<()> {
     #[cfg(unix)]
     {
-        unix_daemonise(config)
+        unix_daemonise(_config)
     }
 
     #[cfg(windows)]
