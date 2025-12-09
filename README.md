@@ -84,7 +84,7 @@ Start the daemon:
 sudo systemctl start kodegend
 ```
 
-## Architecture
+## Architecture 
 
 - **ServiceManager**: Central event loop using crossbeam channels
 - **ServiceWorker**: Individual service supervisor threads  
