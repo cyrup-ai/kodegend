@@ -21,7 +21,7 @@ impl Drop for ScManagerHandle {
     fn drop(&mut self) {
         if !self.0.is_invalid() {
             unsafe {
-                CloseServiceHandle(self.0);
+                let _ = CloseServiceHandle(self.0);
             }
         }
     }
@@ -42,7 +42,7 @@ impl Drop for ServiceHandle {
     fn drop(&mut self) {
         if !self.0.is_invalid() {
             unsafe {
-                CloseServiceHandle(self.0);
+                let _ = CloseServiceHandle(self.0);
             }
         }
     }
@@ -63,7 +63,7 @@ impl Drop for RegistryHandle {
     fn drop(&mut self) {
         if !self.0.is_invalid() {
             unsafe {
-                RegCloseKey(self.0);
+                let _ = RegCloseKey(self.0);
             }
         }
     }

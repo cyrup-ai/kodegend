@@ -7,14 +7,9 @@ pub mod certificates;
 mod hosts;
 mod installer;
 pub(crate) mod services;
-pub mod toolchain;
 
 // Re-export public API
 pub use hosts::{add_kodegen_host_entries, remove_kodegen_host_entries};
-
-// Re-export toolchain verification for component fixers
-#[allow(unused_imports)]
-pub use toolchain::{ensure_rust_toolchain, verify_rust_toolchain_file};
 
 // Internal re-exports (kept for potential future use)
 #[allow(unused_imports)]

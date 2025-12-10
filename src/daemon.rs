@@ -80,6 +80,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use log::{error, info, warn};
 
+#[cfg(unix)]
 use crate::constants::*;
 
 #[cfg(unix)]
@@ -341,10 +342,247 @@ fn validate_pid_file_security(path: &Path) -> Result<()> {
     Ok(())
 }
 
+// ============================================================================
+// Windows Security Helpers
+// ============================================================================
+
+/// Check if a path is a reparse point (junction or symlink)
+///
+/// Windows reparse points include:
+/// - IO_REPARSE_TAG_SYMLINK (0xA000000C) - symbolic links
+/// - IO_REPARSE_TAG_MOUNT_POINT (0xA0000003) - junctions and volume mounts
+///
+/// This is the Windows equivalent of checking `is_symlink()` on Unix,
+/// but also catches junction points which are a Windows-specific attack vector.
 #[cfg(windows)]
-fn validate_pid_file_security(_path: &Path) -> Result<()> {
-    // Windows Service Control Manager (SCM) handles instance management
-    // This function is a no-op on Windows, but kept for API consistency
+fn is_reparse_point(path: &Path) -> Result<bool> {
+    use std::os::windows::fs::MetadataExt;
+
+    // Use symlink_metadata to avoid following the reparse point
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(false); // Path doesn't exist - not a reparse point
+        }
+        Err(e) => {
+            return Err(anyhow!(
+                "Failed to get file attributes for {}: {}",
+                path.display(),
+                e
+            ));
+        }
+    };
+
+    // FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+
+    Ok((metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+}
+
+/// Check if file has multiple hard links
+///
+/// Returns the number of hard links to the file.
+/// A value > 1 indicates the file has hard links, which could be
+/// used in certain attack scenarios.
+#[cfg(windows)]
+fn get_hardlink_count(path: &Path) -> Result<u32> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, OPEN_EXISTING,
+    };
+    use windows::Win32::Foundation::{CloseHandle, GENERIC_READ};
+    use windows::core::PCWSTR;
+
+    let wide_path: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(wide_path.as_ptr()),
+            GENERIC_READ.0,
+            FILE_SHARE_READ,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+    };
+
+    let handle = match handle {
+        Ok(h) => h,
+        Err(e) => {
+            return Err(anyhow!(
+                "Failed to open file for hardlink check {}: {}",
+                path.display(),
+                e
+            ));
+        }
+    };
+
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    let result = unsafe { GetFileInformationByHandle(handle, &mut info) };
+
+    // Always close the handle
+    let _ = unsafe { CloseHandle(handle) };
+
+    match result {
+        Ok(()) => Ok(info.nNumberOfLinks),
+        Err(e) => Err(anyhow!(
+            "Failed to get file information for {}: {}",
+            path.display(),
+            e
+        )),
+    }
+}
+
+/// Test directory writability by creating temp file
+///
+/// More reliable than checking permission bits, as this tests
+/// actual write access including ACL checks.
+#[cfg(windows)]
+fn test_directory_writable(dir: &Path) -> Result<()> {
+    tempfile::NamedTempFile::new_in(dir).with_context(|| {
+        format!(
+            "PID file directory is not writable: {}\n\
+             Ensure the service account has write access to this directory.",
+            dir.display()
+        )
+    })?;
+
+    Ok(())
+}
+
+/// Check if file/directory has overly permissive ACLs (simplified check)
+///
+/// For security, we perform a basic check that the file is not
+/// obviously world-accessible. Full ACL parsing would require
+/// the windows-acl crate or extensive Win32 API usage.
+///
+/// This simplified approach:
+/// - Checks if the file is marked readonly (definitely not world-writable)
+/// - Logs a debug message if we can't determine full ACL status
+#[cfg(windows)]
+fn validate_acl_not_world_writable(path: &Path) -> Result<()> {
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("Failed to read metadata for: {}", path.display()))?;
+
+    // On Windows, if readonly is true, the file is definitely not world-writable
+    if metadata.permissions().readonly() {
+        return Ok(());
+    }
+
+    // For full ACL validation, would need:
+    // 1. GetNamedSecurityInfoW to get security descriptor
+    // 2. GetSecurityDescriptorDacl to get DACL
+    // 3. Iterate ACEs with GetAce
+    // 4. Check each ACE for "Everyone" SID with WRITE access
+    //
+    // For now, we rely on proper directory ACLs being set during installation
+    // and the fact that ProgramData typically has restrictive default ACLs
+
+    log::debug!(
+        "ACL validation: {} is not readonly (full ACL check not implemented)",
+        path.display()
+    );
+
+    Ok(())
+}
+
+// ============================================================================
+// Windows PID File Security Validation
+// ============================================================================
+
+/// Validate PID file path security (Windows implementation)
+///
+/// Performs multi-layer validation to prevent junction/symlink attacks (CWE-59):
+/// 1. Validates parent directory is not a reparse point (junction/symlink)
+/// 2. Validates parent directory is actually a directory
+/// 3. Validates ACLs are not overly permissive
+/// 4. Validates existing PID file is not a reparse point (if exists)
+/// 5. Checks for suspicious hardlink counts
+#[cfg(windows)]
+fn validate_pid_file_security(path: &Path) -> Result<()> {
+    // Layer 1: Validate parent directory security
+    if let Some(parent) = path.parent() {
+        if !parent.exists() {
+            // Parent will be created - this is OK
+            return Ok(());
+        }
+
+        // Check for reparse points (junctions/symlinks)
+        if is_reparse_point(parent)? {
+            anyhow::bail!(
+                "SECURITY: PID file parent directory is a reparse point (junction/symlink): {}\n\
+                 This could be a symlink attack (CWE-59).\n\
+                 Parent directory must be a real directory, not a junction or symbolic link.",
+                parent.display()
+            );
+        }
+
+        // Verify it's actually a directory
+        let metadata = fs::metadata(parent)
+            .with_context(|| format!("Failed to read metadata for: {}", parent.display()))?;
+
+        if !metadata.is_dir() {
+            anyhow::bail!(
+                "SECURITY: PID file parent path exists but is not a directory: {}",
+                parent.display()
+            );
+        }
+
+        // Validate ACLs are not overly permissive
+        validate_acl_not_world_writable(parent)?;
+    }
+
+    // Layer 2: Validate existing PID file (if exists)
+    if path.exists() {
+        // Check for reparse points
+        if is_reparse_point(path)? {
+            anyhow::bail!(
+                "SECURITY: PID file is a reparse point (junction/symlink): {}\n\
+                 This could be a symlink attack (CWE-59).\n\
+                 PID files must be regular files, not symbolic links or junctions.\n\n\
+                 Action: Remove the reparse point and restart the daemon.",
+                path.display()
+            );
+        }
+
+        // Check for hard links (suspicious if > 1)
+        match get_hardlink_count(path) {
+            Ok(count) if count > 1 => {
+                warn!(
+                    "PID file has {} hard links: {}\n\
+                     This is unusual and could indicate tampering.",
+                    count,
+                    path.display()
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                // Non-fatal - log and continue
+                log::debug!("Could not check hardlink count for {}: {}", path.display(), e);
+            }
+        }
+
+        // Verify it's a regular file
+        let metadata = fs::metadata(path)
+            .with_context(|| format!("Failed to read metadata for: {}", path.display()))?;
+
+        if !metadata.is_file() {
+            anyhow::bail!(
+                "SECURITY: PID file path exists but is not a regular file: {}",
+                path.display()
+            );
+        }
+
+        // Validate ACLs
+        validate_acl_not_world_writable(path)?;
+    }
+
     Ok(())
 }
 
@@ -514,10 +752,49 @@ fn validate_pid_file_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Validate PID file parent directory is writable and secure (Windows implementation)
+///
+/// Performs comprehensive pre-flight validation:
+/// 1. Verifies parent directory exists
+/// 2. Validates parent is a directory, not a reparse point
+/// 3. Tests writability by creating a temporary file
 #[cfg(windows)]
-fn validate_pid_file_directory(_path: &Path) -> Result<()> {
-    // Windows Service Control Manager (SCM) handles directory management
-    // This function is a no-op on Windows, but kept for API consistency
+fn validate_pid_file_directory(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("Invalid PID file path: no parent directory"))?;
+
+    if !parent.exists() {
+        return Err(anyhow!(
+            "PID file directory does not exist: {}\n\
+             Create it first or check your configuration.",
+            parent.display()
+        ));
+    }
+
+    // Check for reparse points (junctions/symlinks)
+    if is_reparse_point(parent)? {
+        return Err(anyhow!(
+            "SECURITY: PID directory is a junction/symlink: {}\n\
+             This could be a CWE-59 symlink attack.",
+            parent.display()
+        ));
+    }
+
+    // Verify it's a directory
+    let metadata = fs::metadata(parent)
+        .with_context(|| format!("Failed to read metadata for: {}", parent.display()))?;
+
+    if !metadata.is_dir() {
+        return Err(anyhow!(
+            "PID file parent path is not a directory: {}",
+            parent.display()
+        ));
+    }
+
+    // Test writability
+    test_directory_writable(parent)?;
+
     Ok(())
 }
 
@@ -623,10 +900,49 @@ fn validate_existing_pid_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Validate existing PID file for security issues (Windows implementation)
+///
+/// Performs multi-layer security validation:
+/// 1. Rejects reparse points (junctions/symlinks) - CWE-59 prevention
+/// 2. Warns about suspicious hardlink counts
+/// 3. Validates ACLs are not overly permissive
 #[cfg(windows)]
-fn validate_existing_pid_file(_path: &Path) -> Result<()> {
-    // Windows Service Control Manager (SCM) handles file permissions
-    // This function is a no-op on Windows, but kept for API consistency
+fn validate_existing_pid_file(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(()); // File doesn't exist yet - nothing to validate
+    }
+
+    // Step 1: Reject reparse points (CWE-59 prevention)
+    if is_reparse_point(path)? {
+        return Err(anyhow!(
+            "SECURITY: PID file is a symlink/junction: {}\n\
+             This could be a symlink attack (CWE-59).\n\
+             PID files must be regular files.\n\n\
+             Action: Remove the symlink: del {}",
+            path.display(),
+            path.display()
+        ));
+    }
+
+    // Step 2: Check hard link count (warn if suspicious)
+    match get_hardlink_count(path) {
+        Ok(count) if count > 1 => {
+            warn!(
+                "PID file has {} hard links (expected 1): {}",
+                count,
+                path.display()
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            // Non-fatal - log and continue
+            log::debug!("Could not check hardlink count for {}: {}", path.display(), e);
+        }
+    }
+
+    // Step 3: Validate ACLs
+    validate_acl_not_world_writable(path)?;
+
     Ok(())
 }
 
@@ -871,16 +1187,32 @@ impl PidFile {
         // SCM ensures only one instance runs, so no locking needed
         // This code path is rarely used (kodegend runs as Windows service)
 
-        // Validate path security (no-op on Windows, but provides API consistency)
-        validate_pid_file_security(&path)?;
+        // ========================================
+        // PRE-FLIGHT VALIDATION
+        // ========================================
+
+        // Validate existing PID file if present (checks for reparse points, hardlinks)
+        validate_existing_pid_file(&path)?;
 
         // Create parent directory if needed
-        if let Some(parent) = path.parent() {
+        if let Some(parent) = path.parent().filter(|p| !p.exists()) {
             fs::create_dir_all(parent)
                 .with_context(|| format!("Creating PID file directory: {}", parent.display()))?;
+
+            info!("Created PID directory: {}", parent.display());
         }
 
-        // Simple write without locking
+        // Validate parent directory is writable and secure
+        validate_pid_file_directory(&path)?;
+
+        // Validate path security (checks for junctions/symlinks, ACLs)
+        validate_pid_file_security(&path)?;
+
+        // ========================================
+        // WRITE PID FILE
+        // ========================================
+
+        // Simple write without locking (SCM handles instance uniqueness)
         let pid = std::process::id();
         fs::write(&path, pid.to_string())
             .with_context(|| format!("Writing PID file: {}", path.display()))?;
@@ -995,7 +1327,7 @@ impl ServiceStatus {
             _ => None,
         }
     }
-    
+
     /// Returns true if cleanup is needed (stale/invalid files, zombies)
     #[cfg(unix)]
     pub fn needs_cleanup(&self) -> bool {
@@ -1006,7 +1338,7 @@ impl ServiceStatus {
             | ServiceStatus::Zombie { .. }
         )
     }
-    
+
     /// Get human-readable description
     pub fn description(&self) -> &'static str {
         match self {

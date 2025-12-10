@@ -1,6 +1,6 @@
 [package]
 name = "kodegend"
-version = "0.10.2"
+version = "0.10.3"
 edition = "2024"
 description = "KODEGEN.ᴀɪ: Memory-efficient, Blazing-Fast, MCP tools for code generation agents."
 authors = ["KODEGEN.ᴀɪ"]
@@ -113,7 +113,7 @@ regex = { version = "1" }
 semver = "1.0"
 url = { version = "2" }
 uuid = { version = "1", features = ["v4"] }
-rmcp = { version = "0.10", features = [
+rmcp = { version = "0.11", features = [
   "server",
   "transport-streamable-http-server",
 ] }
@@ -170,6 +170,7 @@ nix = { version = "0.30", default-features = false, features = [
 ] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+runas = "1.2"  # Self-elevation via ShellExecuteEx
 windows-service = "0.8"
 widestring = "1"
 eventlog = "0.3"  # Windows Event Log API wrapper

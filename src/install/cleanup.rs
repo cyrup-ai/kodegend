@@ -38,8 +38,7 @@ use log::warn;
 /// ```rust
 /// let mut ctx = InstallationCleanupContext::new();
 /// ctx.downloaded_binaries_dir = Some(download_dir);
-/// ctx.staging_dir = Some(staging_dir);
-/// 
+///
 /// // ... perform installation ...
 /// 
 /// // On success:
@@ -50,11 +49,7 @@ pub struct InstallationCleanupContext {
     /// Downloaded binaries directory (from download_all_binaries)
     /// Typically: /tmp/tmp.XXXXXX (~50-100MB)
     pub downloaded_binaries_dir: Option<PathBuf>,
-    
-    /// Staging directory (from stage_binaries_for_install)
-    /// Typically: /tmp/kodegen_install_YYYYY (~50-100MB)
-    pub staging_dir: Option<PathBuf>,
-    
+
     /// Temporary certificate file (from privilege.rs)
     /// Typically: /tmp/kodegen_cert_ZZZZZ.crt (contains private key!)
     pub temp_cert_file: Option<PathBuf>,
@@ -83,7 +78,6 @@ impl InstallationCleanupContext {
     /// ```
     pub fn defuse(mut self) {
         self.downloaded_binaries_dir = None;
-        self.staging_dir = None;
         self.temp_cert_file = None;
         self.service_partially_installed = false;
         // Drop runs after this, but all fields are None so it's a no-op
@@ -102,16 +96,7 @@ impl InstallationCleanupContext {
                 log::info!("Cleaned up download directory: {}", dir.display());
             }
         }
-        
-        // Clean up staging directory
-        if let Some(dir) = self.staging_dir.take() {
-            if let Err(e) = std::fs::remove_dir_all(&dir) {
-                warn!("Failed to cleanup staging directory {}: {}", dir.display(), e);
-            } else {
-                log::info!("Cleaned up staging directory: {}", dir.display());
-            }
-        }
-        
+
         // Clean up temp certificate file
         if let Some(file) = self.temp_cert_file.take() {
             if let Err(e) = std::fs::remove_file(&file) {
@@ -152,7 +137,6 @@ impl Drop for InstallationCleanupContext {
     fn drop(&mut self) {
         // Check if any cleanup is needed
         let has_resources = self.downloaded_binaries_dir.is_some()
-            || self.staging_dir.is_some()
             || self.temp_cert_file.is_some()
             || self.service_partially_installed;
         

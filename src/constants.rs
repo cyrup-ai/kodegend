@@ -146,17 +146,6 @@ pub const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg_attr(target_os = "linux", allow(dead_code))]
 pub const STARTUP_VERIFICATION_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Post-graceful-shutdown wait before bootout/unload
-///
-/// After sending SIGTERM to launchd/SCM managed service, wait this
-/// duration before issuing bootout/unload command. This allows the
-/// service to flush logs and close file descriptors cleanly.
-///
-/// 500ms is empirically sufficient for typical cleanup operations
-/// without adding noticeable delay to restart operations.
-#[cfg(unix)]
-pub const POST_SIGTERM_DELAY: Duration = Duration::from_millis(500);
-
 /// Port release delay before restart
 ///
 /// After stopping a service, wait for the OS to release bound ports.

@@ -6,12 +6,12 @@
 //! This is THE logic layer - GUI and CLI are presentation only.
 
 use anyhow::Result;
-use std::path::PathBuf;
 use tokio::sync::mpsc;
 
 use super::cleanup::InstallationCleanupContext;
 use super::core::InstallProgress;
 use super::detection::{ComponentFixResult, ComponentStatus};
+use super::platform_installer;
 #[cfg(unix)]
 use super::privilege::PrivilegedExecutor;
 #[cfg(windows)]
@@ -142,8 +142,18 @@ pub async fn fix_certificates(executor: &mut PrivilegedExecutor) -> ComponentFix
         }
     };
 
-    // Step 2: Get the certificate path (system location)
-    let cert_dir = PathBuf::from("/usr/local/var/kodegen/certs");
+    // Step 2: Get the certificate path (single-root approach)
+    let cert_dir = match kodegen_config::KodegenConfig::data_dir() {
+        Ok(dir) => dir.join("certs"),
+        Err(e) => {
+            return ComponentFixResult {
+                component: "certificates",
+                success: false,
+                error: Some(format!("Failed to determine certificate directory: {}", e)),
+                required_sudo: false,
+            };
+        }
+    };
     let cert_path = cert_dir.join("wildcard.pem");
 
     // Step 3: Write certificate using privileged executor
@@ -334,7 +344,6 @@ pub async fn fix_kodegen_version(
     executor: &mut PrivilegedExecutor,
     progress_tx: Option<mpsc::Sender<InstallProgress>>,
 ) -> ComponentFixResult {
-    use super::binary_staging;
     use super::download;
 
     log::info!("Fixing kodegen version...");
@@ -368,7 +377,7 @@ pub async fn fix_kodegen_version(
     // Create cleanup context for RAII cleanup on failure
     let mut cleanup_ctx = InstallationCleanupContext::new();
 
-    // Step 1: Download binary (unprivileged)
+    // Step 1: Download packages (unprivileged)
     // Use provided channel or create a dummy one that discards progress
     let (tx, rx) = if let Some(ref sender) = progress_tx {
         (sender.clone(), None)
@@ -382,7 +391,7 @@ pub async fn fix_kodegen_version(
     };
     let _ = rx; // Silence unused warning
 
-    let binary_paths = match download::download_all_binaries(tx).await {
+    let package_paths = match download::download_all_binaries(tx.clone()).await {
         Ok((paths, download_dir)) => {
             cleanup_ctx.downloaded_binaries_dir = Some(download_dir);
             paths
@@ -392,13 +401,13 @@ pub async fn fix_kodegen_version(
             return ComponentFixResult {
                 component: "kodegen_version",
                 success: false,
-                error: Some(format!("Failed to download kodegen: {}", e)),
+                error: Some(format!("Failed to download kodegen packages: {}", e)),
                 required_sudo: false,
             };
         }
     };
 
-    if binary_paths.is_empty() {
+    if package_paths.is_empty() {
         return ComponentFixResult {
             component: "kodegen_version",
             success: true,
@@ -407,68 +416,20 @@ pub async fn fix_kodegen_version(
         };
     }
 
-    // Step 2: Stage binaries (unprivileged)
-    let staging_dir = match binary_staging::stage_binaries_for_install(&binary_paths).await {
-        Ok(dir) => {
-            cleanup_ctx.staging_dir = Some(dir.clone());
-            dir
-        }
-        Err(e) => {
-            // Drop will automatically clean up download_dir
-            return ComponentFixResult {
-                component: "kodegen_version",
-                success: false,
-                error: Some(format!("Failed to stage binaries: {}", e)),
-                required_sudo: false,
-            };
-        }
-    };
-
-    // Step 3: Copy to /usr/local/bin using privileged executor
-    if let Err(e) = executor.exec(&["mkdir", "-p", "/usr/local/bin"]).await {
+    // Step 2: Install packages using platform-specific installer (requires sudo)
+    // This replaces the old extract-and-copy approach with proper package installation:
+    // - macOS: Mount DMG → Copy .app to /Applications/ → Create symlinks
+    // - Linux DEB: dpkg -i (installs to /usr/bin/)
+    // - Linux RPM: rpm -i (installs to /usr/bin/)
+    // - Windows: Run NSIS installer → Add to PATH
+    if let Err(e) = platform_installer::install_packages(&package_paths, executor, Some(tx.clone())).await {
         return ComponentFixResult {
             component: "kodegen_version",
             success: false,
-            error: Some(format!("Failed to create /usr/local/bin: {}", e)),
+            error: Some(format!("Failed to install kodegen packages: {}", e)),
             required_sudo: true,
         };
     }
-
-    // Copy each staged binary
-    for entry in std::fs::read_dir(&staging_dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-    {
-        let src = entry.path();
-        let filename = src.file_name().unwrap();
-        let dst = PathBuf::from("/usr/local/bin").join(filename);
-
-        if let Err(e) = executor.copy_file(&src, &dst).await {
-            return ComponentFixResult {
-                component: "kodegen_version",
-                success: false,
-                error: Some(format!("Failed to copy {}: {}", src.display(), e)),
-                required_sudo: true,
-            };
-        }
-
-        // Set permissions
-        if let Err(e) = executor.chmod(&dst, "755").await {
-            log::warn!("Failed to set permissions on {}: {}", dst.display(), e);
-        }
-    }
-
-    // Set ownership (use sh -c for shell logic with fallback)
-    let _ = executor
-        .exec(&["sh", "-c", "chown root:wheel /usr/local/bin/kodegend 2>/dev/null || chown root:root /usr/local/bin/kodegend"])
-        .await;
-    let _ = executor
-        .exec(&["sh", "-c", "chown root:wheel /usr/local/bin/kodegen 2>/dev/null || chown root:root /usr/local/bin/kodegen 2>/dev/null || true"])
-        .await;
-
-    // Cleanup staging directory
-    let _ = std::fs::remove_dir_all(&staging_dir);
 
     log::info!("Kodegen binary installed to /usr/local/bin");
     
@@ -485,16 +446,12 @@ pub async fn fix_kodegen_version(
 
 /// Fix kodegen binary version on Windows
 ///
-/// 1. Download binaries (same as Unix - uses download::download_all_binaries())
-/// 2. Stage binaries (same as Unix - uses binary_staging::stage_binaries_for_install())
-/// 3. Install to %PROGRAMFILES%\kodegen\bin\
-/// 4. Add to system PATH via registry
+/// Downloads Windows NSIS installer and installs using platform_installer
 #[cfg(windows)]
 pub async fn fix_kodegen_version_windows(
     executor: &mut PrivilegedExecutor,
     progress_tx: Option<mpsc::Sender<InstallProgress>>,
 ) -> ComponentFixResult {
-    use super::binary_staging;
     use super::download;
 
     log::info!("Fixing kodegen version on Windows...");
@@ -528,16 +485,19 @@ pub async fn fix_kodegen_version_windows(
     // Create cleanup context
     let mut cleanup_ctx = InstallationCleanupContext::new();
 
-    // Step 1: Download binaries (reuse existing)
-    let (tx, _rx) = if let Some(ref sender) = progress_tx {
+    // Step 1: Download packages (unprivileged)
+    let (tx, rx) = if let Some(ref sender) = progress_tx {
         (sender.clone(), None)
     } else {
         let (tx, mut rx) = mpsc::channel(100);
-        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        tokio::spawn(async move {
+            while rx.recv().await.is_some() {}
+        });
         (tx, None::<mpsc::Receiver<InstallProgress>>)
     };
+    let _ = rx;
 
-    let binary_paths = match download::download_all_binaries(tx).await {
+    let package_paths = match download::download_all_binaries(tx.clone()).await {
         Ok((paths, download_dir)) => {
             cleanup_ctx.downloaded_binaries_dir = Some(download_dir);
             paths
@@ -546,13 +506,13 @@ pub async fn fix_kodegen_version_windows(
             return ComponentFixResult {
                 component: "kodegen_version",
                 success: false,
-                error: Some(format!("Failed to download kodegen: {}", e)),
+                error: Some(format!("Failed to download kodegen packages: {}", e)),
                 required_sudo: false,
             };
         }
     };
 
-    if binary_paths.is_empty() {
+    if package_paths.is_empty() {
         return ComponentFixResult {
             component: "kodegen_version",
             success: true,
@@ -561,66 +521,18 @@ pub async fn fix_kodegen_version_windows(
         };
     }
 
-    // Step 2: Stage binaries (reuse existing)
-    let staging_dir = match binary_staging::stage_binaries_for_install(&binary_paths).await {
-        Ok(dir) => {
-            cleanup_ctx.staging_dir = Some(dir.clone());
-            dir
-        }
-        Err(e) => {
-            return ComponentFixResult {
-                component: "kodegen_version",
-                success: false,
-                error: Some(format!("Failed to stage binaries: {}", e)),
-                required_sudo: false,
-            };
-        }
-    };
-
-    // Step 3: Windows installation path: %PROGRAMFILES%\kodegen\bin\
-    let install_dir = std::env::var("PROGRAMFILES")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(r"C:\Program Files"))
-        .join("kodegen")
-        .join("bin");
-
-    // Create installation directory
-    if let Err(e) = executor
-        .exec(&["cmd", "/c", "mkdir", &install_dir.to_string_lossy()])
-        .await
-    {
-        log::warn!("Directory creation warning (may exist): {}", e);
+    // Step 2: Install packages using platform-specific installer (requires admin)
+    // Windows: Run NSIS installer → Add to PATH
+    if let Err(e) = platform_installer::install_packages(&package_paths, executor, Some(tx.clone())).await {
+        return ComponentFixResult {
+            component: "kodegen_version",
+            success: false,
+            error: Some(format!("Failed to install kodegen packages: {}", e)),
+            required_sudo: true,
+        };
     }
 
-    // Copy each staged binary
-    for entry in std::fs::read_dir(&staging_dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-    {
-        let src = entry.path();
-        let filename = src.file_name().unwrap();
-        let dst = install_dir.join(filename);
-
-        if let Err(e) = executor.copy_file(&src, &dst).await {
-            return ComponentFixResult {
-                component: "kodegen_version",
-                success: false,
-                error: Some(format!("Failed to copy {}: {}", src.display(), e)),
-                required_sudo: true,
-            };
-        }
-    }
-
-    // Step 4: Add to system PATH via registry
-    if let Err(e) = add_to_system_path_windows(executor, &install_dir).await {
-        log::warn!("Failed to add to PATH (may already be present): {}", e);
-    }
-
-    // Cleanup staging directory
-    let _ = std::fs::remove_dir_all(&staging_dir);
-
-    log::info!("Kodegen binaries installed to {}", install_dir.display());
+    log::info!("Kodegen installed successfully");
     cleanup_ctx.defuse();
 
     ComponentFixResult {
@@ -706,83 +618,8 @@ async fn add_to_system_path_windows(
     Ok(())
 }
 
-/// Fix Rust toolchain using shared privileged executor
-///
-/// Ensures Rust nightly toolchain is installed without changing user's default.
-/// This is required for building kodegen from source.
-#[cfg(unix)]
-pub async fn fix_toolchain(_executor: &mut PrivilegedExecutor) -> ComponentFixResult {
-    use super::installer::config::toolchain::{ensure_rust_toolchain, verify_rust_toolchain_file};
-
-    log::info!("Checking Rust toolchain...");
-
-    // First verify rust-toolchain.toml exists
-    if let Err(e) = verify_rust_toolchain_file() {
-        log::warn!("rust-toolchain.toml verification failed: {}", e);
-        // This is non-fatal - the file should exist in the repo
-        // but we can still install the toolchain
-    }
-
-    // Ensure nightly toolchain is available
-    match ensure_rust_toolchain().await {
-        Ok(()) => {
-            log::info!("Rust toolchain: verified");
-            ComponentFixResult {
-                component: "toolchain",
-                success: true,
-                error: None,
-                required_sudo: false, // rustup doesn't require sudo
-            }
-        }
-        Err(e) => {
-            log::error!("Failed to ensure Rust toolchain: {}", e);
-            ComponentFixResult {
-                component: "toolchain",
-                success: false,
-                error: Some(e.to_string()),
-                required_sudo: false,
-            }
-        }
-    }
-}
-
-/// Fix Rust toolchain on Windows
-///
-/// Ensures Rust nightly toolchain is installed via rustup.
-/// Does NOT require Administrator privileges.
-#[cfg(windows)]
-pub async fn fix_toolchain_windows() -> ComponentFixResult {
-    use super::installer::config::toolchain::{ensure_rust_toolchain, verify_rust_toolchain_file};
-
-    log::info!("Checking Rust toolchain on Windows...");
-
-    // Verify rust-toolchain.toml exists
-    if let Err(e) = verify_rust_toolchain_file() {
-        log::warn!("rust-toolchain.toml verification failed: {}", e);
-    }
-
-    // Ensure nightly toolchain is available (uses existing function)
-    match ensure_rust_toolchain().await {
-        Ok(()) => {
-            log::info!("Rust toolchain: verified");
-            ComponentFixResult {
-                component: "toolchain",
-                success: true,
-                error: None,
-                required_sudo: false,
-            }
-        }
-        Err(e) => {
-            log::error!("Failed to ensure Rust toolchain: {}", e);
-            ComponentFixResult {
-                component: "toolchain",
-                success: false,
-                error: Some(e.to_string()),
-                required_sudo: false,
-            }
-        }
-    }
-}
+// Rust toolchain checking removed for bundled apps
+// Native binaries don't need Rust installed on user machines
 
 /// Fix all components that need action
 ///
@@ -795,19 +632,8 @@ pub async fn fix_toolchain_windows() -> ComponentFixResult {
 pub async fn fix_all_components(
     progress_tx: Option<mpsc::Sender<InstallProgress>>,
 ) -> Result<super::detection::InstallationFixReport> {
-    // === TOOLCHAIN ===
-    send_progress(
-        &progress_tx,
-        InstallProgress::new("toolchain".into(), 0.0, "Checking toolchain...".into()),
-    );
+    // Check all components first
     let status = super::detection::check_all_components().await;
-
-    if status.toolchain == ComponentStatus::Ok {
-        send_progress(
-            &progress_tx,
-            InstallProgress::new("toolchain".into(), 1.0, "✓ Toolchain OK".into()),
-        );
-    }
 
     // === HOSTS ===
     send_progress(
@@ -856,7 +682,6 @@ pub async fn fix_all_components(
             InstallProgress::complete("complete".into(), "All components OK".into()),
         );
         return Ok(super::detection::InstallationFixReport {
-            toolchain: None,
             hosts: None,
             certificates: None,
             kodegen_version: None,
@@ -871,7 +696,6 @@ pub async fn fix_all_components(
     );
 
     let mut report = super::detection::InstallationFixReport {
-        toolchain: None,
         hosts: None,
         certificates: None,
         kodegen_version: None,
@@ -890,38 +714,6 @@ pub async fn fix_all_components(
     } else {
         None
     };
-
-    // Fix toolchain FIRST if needed (FAIL-FAST) - required for building
-    if status.toolchain != ComponentStatus::Ok {
-        send_progress(
-            &progress_tx,
-            InstallProgress::new("toolchain".into(), 0.5, "Fixing toolchain...".into()),
-        );
-        log::info!("Fixing toolchain (status: {:?})...", status.toolchain);
-        let result = if let Some(ref mut exec) = executor {
-            fix_toolchain(exec).await
-        } else {
-            let mut temp_exec = PrivilegedExecutor::spawn().await?;
-            fix_toolchain(&mut temp_exec).await
-        };
-        let success = result.success;
-        if success {
-            send_progress(
-                &progress_tx,
-                InstallProgress::new("toolchain".into(), 1.0, "✓ Toolchain fixed".into()),
-            );
-        } else {
-            send_progress(
-                &progress_tx,
-                InstallProgress::error("toolchain".into(), format!("✗ Toolchain failed: {}", result.error.as_deref().unwrap_or("unknown"))),
-            );
-        }
-        report.toolchain = Some(result);
-        if !success {
-            report.overall_success = false;
-            return Ok(report);
-        }
-    }
 
     // Fix hosts if needed (FAIL-FAST)
     if status.hosts != ComponentStatus::Ok {
@@ -1376,7 +1168,6 @@ pub async fn fix_all_components(
             InstallProgress::complete("complete".into(), "All components OK".into()),
         );
         return Ok(super::detection::InstallationFixReport {
-            toolchain: None,
             hosts: None,
             certificates: None,
             kodegen_version: None,
@@ -1391,7 +1182,6 @@ pub async fn fix_all_components(
     );
 
     let mut report = super::detection::InstallationFixReport {
-        toolchain: None,
         hosts: None,
         certificates: None,
         kodegen_version: None,
@@ -1410,32 +1200,6 @@ pub async fn fix_all_components(
     } else {
         None
     };
-
-    // Fix toolchain if needed (no Admin required)
-    if status.toolchain != ComponentStatus::Ok {
-        send_progress(
-            &progress_tx,
-            InstallProgress::new("toolchain".into(), 0.5, "Checking Rust toolchain...".into()),
-        );
-        let result = fix_toolchain_windows().await;
-        let success = result.success;
-        if success {
-            send_progress(
-                &progress_tx,
-                InstallProgress::new("toolchain".into(), 1.0, "Toolchain OK".into()),
-            );
-        } else {
-            send_progress(
-                &progress_tx,
-                InstallProgress::error("toolchain".into(), format!("Toolchain failed: {}", result.error.as_deref().unwrap_or("unknown"))),
-            );
-        }
-        report.toolchain = Some(result);
-        if !success {
-            report.overall_success = false;
-            return Ok(report);
-        }
-    }
 
     // Fix hosts file if needed
     if status.hosts != ComponentStatus::Ok {
@@ -1539,6 +1303,43 @@ pub async fn fix_all_components(
         if !success {
             report.overall_success = false;
             return Ok(report);
+        }
+    }
+
+    // === CHROMIUM ===
+    send_progress(
+        &progress_tx,
+        InstallProgress::new("chromium".into(), 0.0, "Checking Chromium...".into()),
+    );
+
+    // Check if chromium is installed
+    let chromium_installed = kodegen_tools_browser::find_browser_executable().await.is_ok();
+
+    if chromium_installed {
+        send_progress(
+            &progress_tx,
+            InstallProgress::new("chromium".into(), 1.0, "✓ Chromium OK".into()),
+        );
+    } else {
+        send_progress(
+            &progress_tx,
+            InstallProgress::new("chromium".into(), 0.1, "Installing Chromium (~100MB)...".into()),
+        );
+        match super::chromium::install_chromium().await {
+            Ok(_) => {
+                send_progress(
+                    &progress_tx,
+                    InstallProgress::new("chromium".into(), 1.0, "✓ Chromium installed".into()),
+                );
+            }
+            Err(e) => {
+                send_progress(
+                    &progress_tx,
+                    InstallProgress::error("chromium".into(), format!("✗ Chromium failed: {}", e)),
+                );
+                report.overall_success = false;
+                return Ok(report);
+            }
         }
     }
 

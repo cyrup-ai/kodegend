@@ -293,26 +293,15 @@ pub struct CategoryServerConfig {
 /// Discover certificate paths from standard installation locations
 /// Checks system-wide and user-level install directories
 pub fn discover_certificate_paths() -> (Option<std::path::PathBuf>, Option<std::path::PathBuf>) {
-    use std::path::PathBuf;
-
     // Standard certificate file names
     const CERT_FILE: &str = "server.crt";
     const KEY_FILE: &str = "server.key";
 
-    // Build search paths using conditional compilation
-    #[cfg(target_os = "macos")]
+    // Build search paths using single-root approach
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     let search_paths = vec![
-        PathBuf::from("/usr/local/var/kodegen/certs"),
         kodegen_config::KodegenConfig::data_dir()
-            .unwrap_or_else(|_| PathBuf::from("/tmp"))
-            .join("certs"),
-    ];
-
-    #[cfg(target_os = "linux")]
-    let search_paths = vec![
-        PathBuf::from("/var/lib/kodegen/certs"),
-        kodegen_config::KodegenConfig::data_dir()
-            .unwrap_or_else(|_| PathBuf::from("/tmp"))
+            .unwrap_or_else(|_| std::env::temp_dir())
             .join("certs"),
     ];
 

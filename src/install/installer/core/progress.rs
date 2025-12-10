@@ -5,8 +5,8 @@
 pub enum DownloadPhase {
     Discovering, // Fetching latest release from GitHub API
     Downloading, // Downloading package bytes
-    Extracting,  // Extracting binary from package
-    Complete,    // Binary extracted and ready
+    Extracting,  // Extracting downloaded archive
+    Complete,    // Package downloaded and ready for installation
 }
 
 /// Metadata for tracking individual binary downloads

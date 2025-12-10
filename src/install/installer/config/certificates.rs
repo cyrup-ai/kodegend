@@ -138,9 +138,6 @@ fn set_windows_certificate_permissions(path: &Path) -> Result<()> {
 /// - Microsoft PKI Guidance: Regular automated renewal
 /// - CA/Browser Forum: Trend toward shorter validity periods
 ///
-/// Certificate import to system trust store is deferred to install_with_elevated_privileges()
-/// in main.rs, which executes privileged operations at the end of installation.
-///
 /// # Security
 ///
 /// Certificate private key files are protected with restrictive permissions:

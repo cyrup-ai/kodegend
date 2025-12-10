@@ -222,7 +222,7 @@ pub(super) fn platform_runtime_dir(is_elevated: bool) -> PathBuf {
             .ok()
             .map(PathBuf::from)
             // Fall back to dirs crate
-            .or_else(|| dirs::data_local_dir())
+            .or_else(dirs::data_local_dir)
             // Last resort: use system-wide directory with warning
             .unwrap_or_else(|| {
                 log::warn!(
@@ -260,7 +260,7 @@ pub(super) fn platform_log_dir(is_elevated: bool) -> PathBuf {
             .ok()
             .map(PathBuf::from)
             // Fall back to dirs crate
-            .or_else(|| dirs::data_local_dir())
+            .or_else(dirs::data_local_dir)
             // Last resort: use system-wide directory with warning
             .unwrap_or_else(|| {
                 log::warn!(

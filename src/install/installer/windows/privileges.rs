@@ -1,22 +1,9 @@
-//! Privilege management and helper executable handling.
+//! Privilege management for Windows installations.
 
 use std::mem;
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-
-use once_cell::sync::{Lazy, OnceCell};
 use windows::Win32::Security::TOKEN_ELEVATION;
 
 use super::InstallerError;
-
-// Global helper path - initialized once, used everywhere (like macOS implementation)
-pub(crate) static HELPER_PATH: OnceCell<PathBuf> = OnceCell::new();
-
-// Process-wide lock for helper extraction
-pub(crate) static HELPER_EXTRACTION_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
-
-// Embedded helper executable data (like macOS APP_ZIP_DATA)
-const HELPER_EXE_DATA: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/KodegenHelper.exe"));
 
 /// Check if we have sufficient privileges for service operations
 pub(crate) fn check_privileges() -> Result<(), InstallerError> {
@@ -45,61 +32,5 @@ pub(crate) fn check_privileges() -> Result<(), InstallerError> {
     }
     // Token handle automatically closed here
 
-    Ok(())
-}
-
-/// Ensure helper executable is extracted and available
-pub(crate) fn ensure_helper_path() -> Result<(), InstallerError> {
-    // Acquire lock FIRST (released automatically when _guard drops)
-    let _guard = HELPER_EXTRACTION_LOCK
-        .lock()
-        .map_err(|e| InstallerError::System(format!("Failed to acquire extraction lock: {}", e)))?;
-
-    // Double-check pattern: check again after acquiring lock
-    if HELPER_PATH.get().is_some() {
-        return Ok(());
-    }
-
-    // Create unique helper path in temp directory using tempfile for security
-    use std::io::Write;
-    use tempfile::Builder;
-
-    let mut helper_file = Builder::new()
-        .prefix("KodegenHelper_")
-        .suffix(".exe")
-        .tempfile()
-        .map_err(|e| InstallerError::System(format!("Failed to create temp helper file: {}", e)))?;
-
-    // Extract embedded helper executable
-    helper_file
-        .write_all(HELPER_EXE_DATA)
-        .map_err(|e| InstallerError::System(format!("Failed to write helper executable: {}", e)))?;
-    helper_file
-        .flush()
-        .map_err(|e| InstallerError::System(format!("Failed to flush helper data: {}", e)))?;
-
-    // Persist the temp file and get the path
-    let (_file, helper_path) = helper_file.keep().map_err(|e| {
-        InstallerError::System(format!("Failed to persist helper executable: {}", e))
-    })?;
-
-    // Verify the helper is properly signed
-    verify_helper_signature(&helper_path)?;
-
-    // Store the path globally
-    HELPER_PATH
-        .set(helper_path)
-        .map_err(|_| InstallerError::System("Helper path already initialized".to_string()))?;
-
-    // Lock released here automatically
-    Ok(())
-}
-
-/// Verify helper executable signature
-fn verify_helper_signature(helper_path: &Path) -> Result<(), InstallerError> {
-    // Use the signing module to verify the helper
-    crate::signing::verify_signature(helper_path).map_err(|e| {
-        InstallerError::System(format!("Helper signature verification failed: {}", e))
-    })?;
     Ok(())
 }

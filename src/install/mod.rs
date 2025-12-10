@@ -30,7 +30,6 @@
 //! ```
 
 mod binaries;
-pub(crate) mod binary_staging;
 pub(crate) mod chromium;
 pub(crate) mod cleanup;
 mod component_fixers;
@@ -40,6 +39,7 @@ mod gui;
 mod hosts;
 pub(crate) mod installer;
 mod orchestration;
+mod platform_installer;
 mod privilege;
 pub mod runners;
 mod wizard;
@@ -138,12 +138,7 @@ pub async fn ensure_installed() -> Result<()> {
 
 /// Log errors from failed component fixes
 fn log_component_errors(report: &InstallationFixReport) {
-    if let Some(ref result) = report.toolchain
-        && !result.success
-        && let Some(ref error) = result.error
-    {
-        log::error!("Toolchain fix failed: {}", error);
-    }
+    // Rust toolchain checking removed - bundled apps don't need Rust on user machines
 
     if let Some(ref result) = report.hosts
         && !result.success
@@ -165,4 +160,77 @@ fn log_component_errors(report: &InstallationFixReport) {
     {
         log::error!("Kodegen version fix failed: {}", error);
     }
+}
+
+/// Run privileged installation operations (Windows only, must be elevated)
+///
+/// This function is called when kodegend.exe is re-executed with the
+/// `--run-privileged-install-ops` CLI argument. It performs all operations
+/// that require administrator privileges:
+///
+/// 1. Create installation directory
+/// 2. Copy staged files to install directory
+/// 3. Add hosts entry (idempotent)
+/// 4. Flush DNS cache
+///
+/// # Requirements
+///
+/// - Must be running with elevated privileges (checked via check_privileges())
+/// - staged_files must contain absolute paths to files to install
+///
+/// # Errors
+///
+/// Returns error if:
+/// - Not running with elevated privileges
+/// - File copy operations fail
+/// - Hosts modification fails
+#[cfg(windows)]
+pub fn run_privileged_install_ops(staged_files: Vec<String>) -> Result<()> {
+    use crate::install::installer::windows::paths::{self, InstallScope};
+    use anyhow::Context;
+    use std::fs;
+
+    log::info!("Running privileged installation operations");
+
+    // Verify we're elevated
+    installer::windows::privileges::check_privileges()
+        .context("Not running with elevated privileges")?;
+
+    // 1. Create installation directory
+    let install_dir = paths::install_dir(InstallScope::System);
+    fs::create_dir_all(&install_dir)
+        .context("Failed to create install directory")?;
+
+    // 2. Copy all staged files
+    for file in &staged_files {
+        let file_path = std::path::Path::new(file);
+        let file_name = file_path
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("Invalid file path: {}", file))?;
+        let dest_path = install_dir.join(file_name);
+
+        fs::copy(file_path, &dest_path)
+            .with_context(|| format!("Failed to copy {} to {}", file, dest_path.display()))?;
+
+        log::info!("Copied {} to {}", file, dest_path.display());
+    }
+
+    // 3. Update hosts file (idempotent)
+    if !hosts::hosts_entry_exists() {
+        installer::config::hosts::add_kodegen_host_entries()
+            .context("Failed to add hosts entry")?;
+
+        // 4. Flush DNS cache
+        std::process::Command::new("ipconfig")
+            .arg("/flushdns")
+            .status()
+            .context("Failed to flush DNS cache")?;
+
+        log::info!("Added hosts entry and flushed DNS");
+    } else {
+        log::info!("Hosts entry already exists, skipping");
+    }
+
+    log::info!("Privileged installation operations completed");
+    Ok(())
 }

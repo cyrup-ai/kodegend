@@ -57,9 +57,6 @@ impl ScManagerHandle {
 impl PlatformExecutor {
     /// Install the daemon as a Windows service with comprehensive configuration
     pub fn install(b: InstallerBuilder) -> Result<(), InstallerError> {
-        // Ensure helper path is initialized
-        ensure_helper_path()?;
-
         // Check if we have sufficient privileges
         check_privileges()?;
 

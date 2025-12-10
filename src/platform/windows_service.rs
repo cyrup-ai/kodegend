@@ -125,7 +125,7 @@ fn run_service() -> Result<()> {
                 Duration::from_secs(0),
                 1,  // exit_code: 1 = initialization failed
             )?;
-            return Err(e.into());
+            return Err(e);
         }
     };
 

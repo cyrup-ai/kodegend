@@ -223,25 +223,31 @@ pub async fn stop_daemon() -> Result<()> {
     }
     
     // Service is running, continue to stop the service
-    
+
     // Layer 2: Stop the service
     // Try to kill the service first (graceful shutdown with SIGTERM)
     let kill_cmd = format!("launchctl kill SIGTERM {}", SERVICE_LABEL);
     debug!("Executing: {}", kill_cmd);
-    
+
     let kill_result = Command::new("launchctl")
         .args(["kill", "SIGTERM", SERVICE_LABEL])
         .output()
         .await;
-    
+
     if let Ok(output) = kill_result
         && output.status.success()
     {
         debug!("Sent SIGTERM to service");
-    }
 
-    // Give it a moment to shutdown gracefully
-    sleep(POST_SIGTERM_DELAY).await;
+        // Wait for the process to actually stop (with timeout)
+        // This polls check_status() with exponential backoff instead of blind delay
+        if let Err(e) = wait_for_stopped(GRACEFUL_SHUTDOWN_TIMEOUT).await {
+            warn!("Process did not stop after SIGTERM within timeout: {}", e);
+            // Continue to bootout anyway - it will force stop
+        } else {
+            debug!("Process stopped gracefully after SIGTERM");
+        }
+    }
 
     // Then bootout to unload it
     let bootout_cmd = format!("launchctl bootout system {}", PLIST_PATH);

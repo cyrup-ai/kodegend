@@ -27,10 +27,29 @@ use log::{error, info};
 use manager::ServiceManager;
 
 fn main() {
-    // Windows service mode detection
-    // When SCM starts the service, it passes --service argument
+    // Windows: Check for privileged operations mode (BEFORE service check)
+    // When re-executed with elevation, kodegend.exe runs privileged ops then exits
     #[cfg(target_os = "windows")]
     {
+        if std::env::args().any(|arg| arg == "--run-privileged-install-ops") {
+            // Initialize logging first
+            env_logger::init();
+
+            // Parse staged files from remaining args
+            let staged_files: Vec<String> = std::env::args()
+                .skip_while(|arg| arg != "--run-privileged-install-ops")
+                .skip(1)  // Skip the flag itself
+                .collect();
+
+            if let Err(e) = install::run_privileged_install_ops(staged_files) {
+                eprintln!("Privileged installation failed: {}", e);
+                std::process::exit(1);
+            }
+            std::process::exit(0);
+        }
+
+        // Windows service mode detection
+        // When SCM starts the service, it passes --service argument
         if std::env::args().any(|arg| arg == "--service" || arg == "--windows-service") {
             // Running as Windows service - invoke service dispatcher
             if let Err(e) = platform::start_windows_service() {
@@ -105,7 +124,7 @@ async fn run_daemon(
         PathBuf::from(path)
     } else if use_system {
         // User wants system-wide config
-        PathBuf::from("/etc/kodegend/kodegend.toml")
+        KodegenConfig::config_dir()?.join("kodegend.toml")
     } else {
         // Default to user config directory
         let config_dir = KodegenConfig::user_config_dir()?.join("kodegend");

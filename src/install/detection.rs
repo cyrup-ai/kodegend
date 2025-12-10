@@ -60,8 +60,7 @@ pub struct ComponentStatusReport {
     pub certificates: ComponentStatus,
     /// Kodegen binary version status (installed vs crates.io version)
     pub kodegen_version: ComponentStatus,
-    /// Rust toolchain status (nightly installed for building)
-    pub toolchain: ComponentStatus,
+    // Rust toolchain checking removed - bundled apps don't need Rust on user machines
 }
 
 impl ComponentStatusReport {
@@ -70,15 +69,11 @@ impl ComponentStatusReport {
         self.hosts == ComponentStatus::Ok
             && self.certificates == ComponentStatus::Ok
             && self.kodegen_version == ComponentStatus::Ok
-            && self.toolchain == ComponentStatus::Ok
     }
 
     /// Get list of components needing action
     pub fn components_needing_action(&self) -> Vec<&'static str> {
         let mut needs_action = Vec::new();
-        if self.toolchain != ComponentStatus::Ok {
-            needs_action.push("toolchain");
-        }
         if self.hosts != ComponentStatus::Ok {
             needs_action.push("hosts");
         }
@@ -121,7 +116,7 @@ impl ComponentStatusReport {
 /// Result of fixing all components
 #[derive(Debug, Clone, Default)]
 pub struct InstallationFixReport {
-    pub toolchain: Option<ComponentFixResult>,
+    // Rust toolchain checking removed - bundled apps don't need Rust on user machines
     pub hosts: Option<ComponentFixResult>,
     pub certificates: Option<ComponentFixResult>,
     pub kodegen_version: Option<ComponentFixResult>,
@@ -458,13 +453,9 @@ pub fn check_hosts_status() -> ComponentStatus {
 /// - NeedsUpdate: Certificate exists but is invalid/expired
 /// - CheckFailed: Error during validation
 pub fn check_certificates_status() -> ComponentStatus {
-    // Use same path as component_fixers.rs writes to
-    #[cfg(unix)]
-    let cert_dir = std::path::PathBuf::from("/usr/local/var/kodegen/certs");
-
-    #[cfg(windows)]
-    let cert_dir = match kodegen_config::KodegenConfig::user_config_dir() {
-        Ok(dir) => dir.join("kodegend").join("certs"),
+    // Use single-root approach: all platforms use data_dir/certs
+    let cert_dir = match kodegen_config::KodegenConfig::data_dir() {
+        Ok(dir) => dir.join("certs"),
         Err(_) => return ComponentStatus::CheckFailed,
     };
 
@@ -538,68 +529,14 @@ pub async fn check_kodegen_version_status() -> ComponentStatus {
     }
 }
 
-/// Check if Rust nightly toolchain is installed and available
-///
-/// Returns:
-/// - Ok: Nightly toolchain is installed
-/// - Missing: Rust or nightly toolchain not installed
-/// - CheckFailed: Could not determine toolchain status
-pub async fn check_toolchain_status() -> ComponentStatus {
-    use tokio::process::Command;
-
-    // Check if rustc is available
-    let rustc_check = Command::new("rustc").arg("--version").output().await;
-
-    match rustc_check {
-        Ok(output) if output.status.success() => {
-            // Check if nightly is installed
-            let list_output = Command::new("rustup")
-                .args(["toolchain", "list"])
-                .output()
-                .await;
-
-            match list_output {
-                Ok(output) if output.status.success() => {
-                    let toolchains = String::from_utf8_lossy(&output.stdout);
-                    if toolchains.lines().any(|line| line.contains("nightly")) {
-                        log::info!("Rust nightly toolchain: installed");
-                        ComponentStatus::Ok
-                    } else {
-                        log::info!("Rust nightly toolchain: not installed");
-                        ComponentStatus::Missing
-                    }
-                }
-                Ok(_) => {
-                    log::warn!("rustup toolchain list failed");
-                    ComponentStatus::CheckFailed
-                }
-                Err(e) => {
-                    log::warn!("Failed to run rustup: {}", e);
-                    ComponentStatus::Missing
-                }
-            }
-        }
-        Ok(_) => {
-            log::info!("rustc not available");
-            ComponentStatus::Missing
-        }
-        Err(e) => {
-            log::warn!("Failed to run rustc: {}", e);
-            ComponentStatus::Missing
-        }
-    }
-}
-
 /// Get comprehensive component status report
 ///
-/// Checks all four core components individually:
-/// - Toolchain (Rust nightly)
+/// Checks core components individually:
 /// - Hosts entry
 /// - Certificates
 /// - Kodegen version
 pub async fn check_all_components() -> ComponentStatusReport {
     ComponentStatusReport {
-        toolchain: check_toolchain_status().await,
         hosts: check_hosts_status(),
         certificates: check_certificates_status(),
         kodegen_version: check_kodegen_version_status().await,

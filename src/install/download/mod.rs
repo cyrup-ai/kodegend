@@ -1,17 +1,15 @@
-//! GitHub release download and package extraction
+//! GitHub release download
 //!
 //! This module handles downloading platform-specific packages from GitHub releases
-//! and extracting binaries with comprehensive progress tracking.
+//! with comprehensive progress tracking and checksum verification.
 //!
 //! ## Module Organization
 //!
 //! - `platform` - Platform detection and package format selection
 //! - `github` - GitHub API interaction for release discovery
-//! - `extract` - Platform-specific package extraction (DEB, RPM, DMG, ZIP)
 //! - `core` - Download orchestration and progress tracking
 
 mod core;
-mod extract;
 mod github;
 mod platform;
 

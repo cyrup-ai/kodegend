@@ -71,44 +71,19 @@ impl InstallContext {
         }
     }
 
-    /// Get platform-specific data directory (always system-wide for system daemons)
+    /// Get data directory (single-root approach: all platforms use kodegen-config)
     pub(crate) fn get_data_dir() -> PathBuf {
-        #[cfg(target_os = "macos")]
-        {
-            PathBuf::from("/usr/local/var/kodegen")
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            PathBuf::from("/var/lib/kodegen")
-        }
-
-        #[cfg(target_os = "freebsd")]
-        {
-            PathBuf::from("/var/db/kodegen")
-        }
-
-        #[cfg(target_os = "openbsd")]
-        {
-            PathBuf::from("/var/db/kodegen")
-        }
-
-        #[cfg(target_os = "windows")]
-        {
-            use crate::install::installer::windows::paths;
-            paths::installer_data_dir()
-        }
-
-        #[cfg(not(any(
-            target_os = "macos",
-            target_os = "linux",
-            target_os = "freebsd",
-            target_os = "openbsd",
-            target_os = "windows"
-        )))]
-        {
-            std::env::temp_dir().join("kodegen")
-        }
+        kodegen_config::KodegenConfig::data_dir()
+            .unwrap_or_else(|_| {
+                #[cfg(not(target_os = "windows"))]
+                {
+                    PathBuf::from(".config/kodegen/data")
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    PathBuf::from("AppData\\Roaming\\kodegen\\data")
+                }
+            })
     }
 
     /// Add service to installation
@@ -579,7 +554,7 @@ impl InstallContext {
             let _ = GetExitCodeProcess(sei.hProcess, &mut exit_code);
 
             // Clean up process handle
-            CloseHandle(sei.hProcess);
+            let _ = CloseHandle(sei.hProcess);
 
             // Exit current (non-elevated) process with same exit code as elevated process
             std::process::exit(exit_code as i32);

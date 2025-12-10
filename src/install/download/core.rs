@@ -11,7 +11,6 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
-use super::extract::extract_binary_from_package;
 use super::github::get_latest_release;
 use super::platform::Platform;
 use crate::install::binaries::{BINARIES, BINARY_COUNT};
@@ -345,14 +344,17 @@ where
     Ok(())
 }
 
-/// Download a single binary from its GitHub repository with progress reporting
-async fn download_binary(
+/// Download a single package from its GitHub repository with progress reporting
+///
+/// Returns the path to the downloaded package (DMG/DEB/RPM/EXE), not extracted binaries.
+/// The package will be installed by the platform installer module.
+async fn download_package(
     repo: &str,
     binary_name: &str,
     binary_index: usize,
     platform: Platform,
     progress_tx: mpsc::Sender<InstallProgress>,
-    output_dir: &std::path::Path,
+    _output_dir: &std::path::Path,
 ) -> Result<PathBuf> {
     // Track if we've already warned about channel closure
     let progress_disabled = Arc::new(AtomicBool::new(false));
@@ -485,21 +487,7 @@ async fn download_binary(
             asset.name
         ))?;
 
-    // Phase 3: Extract binary
-    send_critical(InstallProgress::download(
-        binary_name.to_string(),
-        binary_index,
-        BINARY_COUNT,
-        total_bytes,
-        total_bytes,
-        DownloadPhase::Extracting,
-        version.clone(),
-    ))?;
-
-    let binary_path =
-        extract_binary_from_package(&package_path, binary_name, platform, output_dir).await?;
-
-    // Phase 4: Complete
+    // Phase 3: Package ready (no extraction - will be installed by platform installer)
     send_critical(InstallProgress::download(
         binary_name.to_string(),
         binary_index,
@@ -510,14 +498,17 @@ async fn download_binary(
         version.clone(),
     ))?;
 
-    Ok(binary_path)
+    // Return package path instead of extracted binary
+    // The platform installer will handle proper installation
+    Ok(package_path)
 }
 
-/// Download all binaries from their respective GitHub repositories
+/// Download all packages from their respective GitHub repositories
 ///
 /// The binary list is defined in `crate::binaries::BINARIES`.
 ///
-/// Returns a tuple of (downloaded binary paths, download directory path).
+/// Returns a tuple of (downloaded package paths, download directory path).
+/// The packages (DMG/DEB/RPM/EXE) will be installed by the platform installer.
 /// The download directory path is returned for cleanup tracking.
 pub async fn download_all_binaries(
     progress_tx: mpsc::Sender<InstallProgress>,
@@ -528,10 +519,10 @@ pub async fn download_all_binaries(
     let output_dir_guard = tempfile::tempdir()?;
     let output_dir = output_dir_guard.path();
 
-    let mut binaries = Vec::with_capacity(BINARY_COUNT);
+    let mut packages = Vec::with_capacity(BINARY_COUNT);
 
     for (i, &binary_name) in BINARIES.iter().enumerate() {
-        let binary_path = download_binary(
+        let package_path = download_package(
             binary_name, // repo name
             binary_name, // binary name (same as repo)
             i + 1,       // 1-based index
@@ -540,13 +531,13 @@ pub async fn download_all_binaries(
             output_dir,
         )
         .await
-        .with_context(|| format!("Failed to download {}", binary_name))?;
+        .with_context(|| format!("Failed to download {} package", binary_name))?;
 
-        binaries.push(binary_path);
+        packages.push(package_path);
     }
 
     // All downloads succeeded - persist directory and return path for cleanup tracking
     let download_dir = output_dir_guard.keep();
 
-    Ok((binaries, download_dir))
+    Ok((packages, download_dir))
 }

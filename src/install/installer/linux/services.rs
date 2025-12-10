@@ -6,6 +6,8 @@
 use std::fs;
 use std::path::PathBuf;
 
+use kodegen_config::KodegenConfig;
+
 use super::InstallerError;
 use super::file_ops::write_file_atomic;
 
@@ -18,7 +20,9 @@ pub(super) fn install_services(
             .map_err(|e| InstallerError::System(format!("Failed to serialize service: {}", e)))?;
 
         // Create services directory
-        let services_dir = PathBuf::from("/etc/kodegen/services");
+        let services_dir = KodegenConfig::config_dir()
+            .map_err(|e| InstallerError::System(format!("Failed to determine config directory: {}", e)))?
+            .join("services");
         fs::create_dir_all(&services_dir).map_err(|e| {
             InstallerError::System(format!("Failed to create services directory: {}", e))
         })?;

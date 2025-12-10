@@ -144,7 +144,7 @@ pub fn add_kodegen_host_entries() -> Result<()> {
     Ok(())
 }
 
-/// Windows implementation (unchanged - locking less critical on Windows)
+/// Windows implementation with atomic writes and idempotency
 #[cfg(windows)]
 pub fn add_kodegen_host_entries() -> Result<()> {
     // Keep existing Windows implementation as-is

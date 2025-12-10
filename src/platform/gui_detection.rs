@@ -204,13 +204,12 @@ fn is_running_as_service() -> bool {
     );
 
     let current_pid = std::process::id();
-    if let Some(current) = system.process(Pid::from_u32(current_pid)) {
-        if let Some(parent_pid) = current.parent() {
-            if let Some(parent) = system.process(parent_pid) {
-                let parent_name = parent.name().to_string_lossy().to_lowercase();
-                return parent_name == "services.exe";
-            }
-        }
+    if let Some(current) = system.process(Pid::from_u32(current_pid))
+        && let Some(parent_pid) = current.parent()
+        && let Some(parent) = system.process(parent_pid)
+    {
+        let parent_name = parent.name().to_string_lossy().to_lowercase();
+        return parent_name == "services.exe";
     }
 
     false

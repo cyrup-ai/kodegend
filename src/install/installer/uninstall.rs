@@ -234,27 +234,37 @@ fn cleanup_installation_directories() -> Result<()> {
 /// Get list of installation directories to clean up
 #[allow(dead_code)] // Function IS used at line 211, but compiler doesn't track call chain correctly
 fn get_installation_directories() -> Vec<PathBuf> {
-    vec![
-        #[cfg(target_os = "macos")]
-        PathBuf::from("/usr/local/var/kodegen"),
-        #[cfg(target_os = "linux")]
-        PathBuf::from("/var/lib/kodegen"),
-        #[cfg(target_os = "linux")]
-        PathBuf::from("/etc/kodegen"),
-        #[cfg(target_os = "windows")]
-        {
-            use crate::install::installer::windows::paths;
-            paths::installer_data_dir()
-        },
-        #[cfg(target_os = "windows")]
-        {
-            use crate::install::installer::windows::paths::{InstallScope, install_dir};
-            install_dir(InstallScope::System)
-        },
-        // Common directories
-        PathBuf::from("/opt/kodegen"),
-        std::env::temp_dir().join("kodegen"),
-    ]
+    let mut dirs = vec![];
+
+    // New single-root directory (primary location)
+    if let Ok(root) = kodegen_config::KodegenConfig::user_config_dir() {
+        dirs.push(root);
+    }
+
+    // Legacy system directories (for backwards compatibility - clean up old installations)
+    #[cfg(target_os = "macos")]
+    dirs.push(PathBuf::from("/usr/local/var/kodegen"));
+
+    #[cfg(target_os = "linux")]
+    {
+        dirs.push(PathBuf::from("/var/lib/kodegen"));
+        dirs.push(PathBuf::from("/etc/kodegen"));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use crate::install::installer::windows::paths;
+        dirs.push(paths::installer_data_dir());
+
+        use crate::install::installer::windows::paths::{InstallScope, install_dir};
+        dirs.push(install_dir(InstallScope::System));
+    }
+
+    // Common legacy directories
+    dirs.push(PathBuf::from("/opt/kodegen"));
+    dirs.push(std::env::temp_dir().join("kodegen"));
+
+    dirs
 }
 
 /// Add Kodegen host entries with optimized host file modification
@@ -398,59 +408,25 @@ pub fn backup_configuration() -> Result<PathBuf> {
     Ok(backup_path)
 }
 
-/// Get configuration directory path
+/// Get configuration directory path (single-root approach)
 fn get_config_directory() -> PathBuf {
-    #[cfg(target_os = "macos")]
-    {
-        PathBuf::from("/usr/local/var/kodegen")
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        PathBuf::from("/var/lib/kodegen")
-    }
-
-    #[cfg(target_os = "freebsd")]
-    {
-        PathBuf::from("/var/db/kodegen")
-    }
-
-    #[cfg(target_os = "openbsd")]
-    {
-        PathBuf::from("/var/db/kodegen")
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        use crate::install::installer::windows::paths;
-        paths::installer_data_dir()
-    }
-
-    #[cfg(not(any(
-        target_os = "macos",
-        target_os = "linux",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "windows"
-    )))]
-    {
-        std::env::temp_dir().join("kodegen")
-    }
+    kodegen_config::KodegenConfig::data_dir()
+        .unwrap_or_else(|_| {
+            #[cfg(not(target_os = "windows"))]
+            {
+                PathBuf::from(".config/kodegen/data")
+            }
+            #[cfg(target_os = "windows")]
+            {
+                PathBuf::from("AppData\\Roaming\\kodegen\\data")
+            }
+        })
 }
 
 /// Get backup directory path
 fn get_backup_directory() -> PathBuf {
-    #[cfg(target_os = "linux")]
-    {
-        // Linux uses /var/backups per FHS convention
-        PathBuf::from("/var/backups/kodegen")
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        // All other platforms: use subdirectory of data dir
-        get_config_directory().join("backups")
-    }
+    // All platforms: use subdirectory of data dir for consistency
+    get_config_directory().join("backups")
 }
 
 /// Create tar extraction arguments with proper path validation  
