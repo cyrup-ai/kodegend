@@ -35,7 +35,7 @@ pub fn validate_and_normalize_working_dir(
     let after_tilde = expand_tilde(raw_path)?;
     
     // Step 2: Expand environment variables ($VAR, ${VAR})
-    let after_env = expand_env_vars(&after_tilde)?;
+    let after_env = expand_env_vars_lenient(&after_tilde)?;
     
     // Step 3: Convert to absolute path (if relative, resolve against cwd)
     let absolute = if Path::new(&after_env).is_absolute() {
@@ -139,13 +139,18 @@ fn expand_tilde(path: &str) -> Result<String> {
     }
 }
 
-/// Expands environment variables in path
+/// Expands environment variables in path (strict mode)
 ///
 /// # Patterns supported
 /// - `$VAR` → value of VAR
 /// - `${VAR}` → value of VAR
+/// - `${VAR:-default}` → value of VAR, or default if not set
 /// - `$$` → literal `$` (escape sequence)
 /// - Mixed: `/home/$USER/app` → `/home/john/app`
+///
+/// # Error Handling
+/// Returns error if variable is not set and no default is provided.
+/// Use `expand_env_vars_lenient()` for backward-compatible warning behavior.
 ///
 /// # Implementation
 /// Simple string replacement without shell parsing (no quotes, escapes, etc.)
@@ -157,9 +162,36 @@ fn expand_tilde(path: &str) -> Result<String> {
 /// env::set_var("HOME", "/home/john");
 /// assert_eq!(expand_env_vars("$HOME/$USER/app")?, "/home/john/john/app");
 /// assert_eq!(expand_env_vars("${HOME}/data")?, "/home/john/data");
+/// assert_eq!(expand_env_vars("${MISSING:-/tmp}")?, "/tmp");
 /// assert_eq!(expand_env_vars("$$LITERAL")?, "$LITERAL");
 /// ```
-fn expand_env_vars(path: &str) -> Result<String> {
+pub fn expand_env_vars(path: &str) -> Result<String> {
+    expand_env_vars_impl(path, false)
+}
+
+/// Expands environment variables in path (lenient mode)
+///
+/// Same as `expand_env_vars()` but warns instead of erroring on missing variables.
+/// Missing variables are kept as literal strings (e.g., "$MISSING" stays as-is).
+///
+/// Used for backward compatibility with existing working_dir validation.
+pub fn expand_env_vars_lenient(path: &str) -> Result<String> {
+    expand_env_vars_impl(path, true)
+}
+
+/// Internal implementation of environment variable expansion
+///
+/// # Arguments
+/// * `path` - Path string with potential environment variables
+/// * `lenient` - If true, warn on missing vars; if false, error on missing vars
+///
+/// # Patterns supported
+/// - `$VAR` → value of VAR
+/// - `${VAR}` → value of VAR
+/// - `${VAR:-default}` → value of VAR, or default if not set
+/// - `$$` → literal `$` (escape sequence)
+/// - `%VAR%` → value of VAR (Windows only)
+fn expand_env_vars_impl(path: &str, lenient: bool) -> Result<String> {
     let mut result = String::new();
     let mut chars = path.chars().peekable();
     
@@ -172,13 +204,43 @@ fn expand_env_vars(path: &str) -> Result<String> {
                 continue;
             }
             
-            // Check for ${VAR} syntax
+            // Check for ${VAR} or ${VAR:-default} syntax
             if chars.peek() == Some(&'{') {
                 chars.next(); // Consume {
-                let var_name: String = chars
-                    .by_ref()
-                    .take_while(|&c| c != '}')
-                    .collect();
+                
+                // Collect characters until we hit either } or :-
+                let mut var_name = String::new();
+                let mut has_default = false;
+                let mut default_value = String::new();
+                
+                while let Some(&c) = chars.peek() {
+                    if c == '}' {
+                        chars.next(); // Consume }
+                        break;
+                    } else if c == ':' {
+                        chars.next(); // Consume :
+                        if chars.peek() == Some(&'-') {
+                            chars.next(); // Consume -
+                            has_default = true;
+                            // Collect default value until }
+                            while let Some(&d) = chars.peek() {
+                                if d == '}' {
+                                    chars.next(); // Consume }
+                                    break;
+                                }
+                                default_value.push(d);
+                                chars.next();
+                            }
+                            break;
+                        } else {
+                            // Just a colon in var name (unusual but valid)
+                            var_name.push(':');
+                        }
+                    } else {
+                        var_name.push(c);
+                        chars.next();
+                    }
+                }
                 
                 if var_name.is_empty() {
                     warn!("Empty variable name in path: ${{}}");
@@ -187,9 +249,20 @@ fn expand_env_vars(path: &str) -> Result<String> {
                     match env::var(&var_name) {
                         Ok(value) => result.push_str(&value),
                         Err(_) => {
-                            // Variable not set - keep as-is and warn
-                            warn!("Environment variable not set: {}", var_name);
-                            result.push_str(&format!("${{{}}}", var_name));
+                            if has_default {
+                                // Use default value
+                                result.push_str(&default_value);
+                            } else if lenient {
+                                // Lenient mode: keep as-is and warn
+                                warn!("Environment variable not set: {}", var_name);
+                                result.push_str(&format!("${{{}}}", var_name));
+                            } else {
+                                // Strict mode: return error
+                                return Err(anyhow!(
+                                    "Environment variable '{}' not found and no default provided",
+                                    var_name
+                                ));
+                            }
                         }
                     }
                 }
@@ -207,9 +280,17 @@ fn expand_env_vars(path: &str) -> Result<String> {
                     match env::var(&var_name) {
                         Ok(value) => result.push_str(&value),
                         Err(_) => {
-                            // Variable not set - keep as-is and warn
-                            warn!("Environment variable not set: {}", var_name);
-                            result.push_str(&format!("${}", var_name));
+                            if lenient {
+                                // Lenient mode: keep as-is and warn
+                                warn!("Environment variable not set: {}", var_name);
+                                result.push_str(&format!("${}", var_name));
+                            } else {
+                                // Strict mode: return error
+                                return Err(anyhow!(
+                                    "Environment variable '{}' not found and no default provided",
+                                    var_name
+                                ));
+                            }
                         }
                     }
                 }
@@ -217,6 +298,48 @@ fn expand_env_vars(path: &str) -> Result<String> {
         } else {
             result.push(ch);
         }
+    }
+    
+    // Platform-specific: Windows %VAR% syntax
+    #[cfg(windows)]
+    {
+        let mut windows_result = String::new();
+        let mut chars = result.chars().peekable();
+        
+        while let Some(ch) = chars.next() {
+            if ch == '%' {
+                // Collect variable name until next %
+                let var_name: String = chars
+                    .by_ref()
+                    .take_while(|&c| c != '%')
+                    .collect();
+                
+                if var_name.is_empty() {
+                    // Lone % not followed by closing %
+                    windows_result.push('%');
+                } else {
+                    match env::var(&var_name) {
+                        Ok(value) => windows_result.push_str(&value),
+                        Err(_) => {
+                            if lenient {
+                                // Lenient mode: keep as-is and warn
+                                warn!("Environment variable not set: {}", var_name);
+                                windows_result.push_str(&format!("%{}%", var_name));
+                            } else {
+                                // Strict mode: return error
+                                return Err(anyhow!(
+                                    "Environment variable '{}' not found and no default provided",
+                                    var_name
+                                ));
+                            }
+                        }
+                    }
+                }
+            } else {
+                windows_result.push(ch);
+            }
+        }
+        result = windows_result;
     }
     
     Ok(result)

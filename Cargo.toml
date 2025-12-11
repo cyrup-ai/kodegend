@@ -1,6 +1,6 @@
 [package]
 name = "kodegend"
-version = "0.10.5"
+version = "0.10.6"
 edition = "2024"
 description = "KODEGEN.ᴀɪ: Memory-efficient, Blazing-Fast, MCP tools for code generation agents."
 authors = ["KODEGEN.ᴀɪ"]
@@ -54,11 +54,13 @@ log = "0.4"
 multi_log = "0.1"  # Enables multiple simultaneous loggers
 sysinfo = "0.37"
 netstat2 = "0.11"  # Cross-platform network socket introspection
+log-panics = { version = "2.1", features = ["with-backtrace"] }  # Route panics through log crate with backtrace
 once_cell = "1" # one‑time global config
 scopeguard = "1.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.9"
+serde_yaml_ng = "0.10"
 clap = { version = "4", features = ["derive"] } # for the new CLI
 which = "8" # locate system executables
 wait-timeout = "0.2"  # Cross-platform Child::wait_timeout() for graceful shutdown
@@ -76,6 +78,7 @@ libc = "0.2"
 hex = "0.4"
 shlex = "1.3"  # POSIX shell escaping (MUST be >= 1.2.1 to avoid RUSTSEC-2024-0006)
 polycvss = { version = "0.3", default-features = false }  # CVSS v2/v3/v4 parsing and scoring
+hostname = "0.4"  # For structured HOSTNAME field in journal logs
 
 # Archive extraction (for installer binary downloads)
 zip = { version = "6", default-features = false, features = ["deflate"] }
@@ -159,6 +162,7 @@ systemd = ["dep:systemd"]
 [target.'cfg(target_os = "linux")'.dependencies]
 users = "0.11"
 systemd = { version = "0.10", optional = true }
+systemd-journal-logger = "2.2"  # Direct journal API via sd_journal_send
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.30", default-features = false, features = [
@@ -187,6 +191,8 @@ windows = { version = "0.62", features = [
   "Win32_Security_Cryptography",
   "Win32_Security_WinTrust",
   "Win32_Storage_FileSystem",
+  "Win32_System_IO",
+  "Win32_System_JobObjects",
   "Win32_System_Pipes",
   "Win32_System_Registry",
   "Win32_System_RemoteDesktop",
@@ -200,6 +206,7 @@ windows = { version = "0.62", features = [
 
 [target.'cfg(target_os = "macos")'.dependencies]
 plist = "1"
+oslog = "0.2"  # macOS Unified Logging integration
 core-graphics2 = { version = "0.4.1", default-features = false, features = ["display", "link"] }
 security-framework = "3.5"  # Native macOS certificate trust settings
 core-foundation = "0.10"    # Required by security-framework

@@ -14,10 +14,11 @@ pub(crate) mod paths;
 pub(crate) mod privileges;
 mod registry;
 mod service_creation;
+mod task_scheduler;
 pub(crate) mod utils;
 
 use handles::ScManagerHandle;
-use privileges::{check_privileges, ensure_helper_path};
+use privileges::check_privileges;
 use registry::{
     cleanup_registry_entries, create_registry_entries, register_event_source,
     unregister_event_source,
@@ -27,8 +28,13 @@ use service_creation::{
     configure_service_sid, create_service, install_services, open_service, start_service,
     stop_service,
 };
+use task_scheduler::{
+    create_user_scheduled_task, delete_user_scheduled_task, start_user_scheduled_task,
+};
+use super::super::component_fixers::add_to_windows_path_sync;
 // Re-export paths module for use in other modules
-pub use paths::{hosts_file, install_dir, installer_data_dir, temp_cert_file};
+// TODO(WINDOWS_06): Uncomment when path consolidation is implemented
+// pub use paths::{hosts_file, install_dir, installer_data_dir, temp_cert_file};
 
 #[allow(dead_code)]
 pub(crate) struct PlatformExecutor;
@@ -57,33 +63,62 @@ impl ScManagerHandle {
 impl PlatformExecutor {
     /// Install the daemon as a Windows service with comprehensive configuration
     pub fn install(b: InstallerBuilder) -> Result<(), InstallerError> {
-        // Check if we have sufficient privileges
-        check_privileges()?;
+        use paths::InstallScope;
 
-        // Create the service with full configuration
-        let sc_manager = ScManagerHandle::new()?;
-        let service = create_service(&sc_manager, &b)?;
+        match b.scope {
+            InstallScope::System => {
+                // System scope: Use Windows Service (requires elevation)
+                check_privileges()?;
 
-        // Configure advanced service properties
-        configure_service_description(&service, &b.description)?;
-        configure_failure_actions(&service, b.auto_restart)?;
-        configure_delayed_start(&service)?;
-        configure_service_sid(&service)?;
+                // Create the service with full configuration
+                let sc_manager = ScManagerHandle::new()?;
+                let service = create_service(&sc_manager, &b)?;
 
-        // Create registry entries for custom configuration
-        create_registry_entries(&b)?;
+                // Configure advanced service properties
+                configure_service_description(&service, &b.description)?;
+                configure_failure_actions(&service, b.auto_restart)?;
+                configure_delayed_start(&service)?;
+                configure_service_sid(&service)?;
 
-        // Register Windows Event Log source
-        register_event_source(&b.label)?;
+                // Create registry entries for custom configuration
+                create_registry_entries(&b)?;
 
-        // Install service definitions if any
-        if !b.services.is_empty() {
-            install_services(&b.services)?;
-        }
+                // Register Windows Event Log source
+                register_event_source(&b.label)?;
 
-        // Start the service if requested
-        if b.auto_start {
-            start_service(&service)?;
+                // Add installation directory to system PATH
+                add_to_windows_path_sync(InstallScope::System)
+                    .map_err(|e| InstallerError::System(format!("Failed to add to system PATH: {}", e)))?;
+
+                // Install service definitions if any
+                if !b.services.is_empty() {
+                    install_services(&b.services)?;
+                }
+
+                // Start the service if requested
+                if b.auto_start {
+                    start_service(&service)?;
+                }
+            }
+
+            InstallScope::User => {
+                // User scope: Use Task Scheduler (no elevation required)
+                create_user_scheduled_task(&b)?;
+
+                // Add installation directory to user PATH
+                add_to_windows_path_sync(InstallScope::User)
+                    .map_err(|e| InstallerError::System(format!("Failed to add to user PATH: {}", e)))?;
+
+                // Still install service definitions for user scope
+                if !b.services.is_empty() {
+                    install_services(&b.services)?;
+                }
+
+                // Start the task if requested
+                if b.auto_start {
+                    start_user_scheduled_task(&b.label)?;
+                }
+            }
         }
 
         Ok(())
@@ -91,21 +126,23 @@ impl PlatformExecutor {
 
     /// Uninstall the Windows service and clean up all resources
     pub fn uninstall(label: &str) -> Result<(), InstallerError> {
-        let sc_manager = ScManagerHandle::new()?;
+        // Try to detect which scope was used by attempting to clean up both
+        // This ensures we clean up regardless of how it was installed
 
-        // Open the service
-        let service = open_service(&sc_manager, label)?;
+        // Try to delete scheduled task (user scope)
+        let _ = delete_user_scheduled_task(label);
 
-        // Stop the service first
-        stop_service(&service)?;
-
-        // Delete the service
-        unsafe {
-            windows::Win32::System::Services::DeleteService(service.handle())
-                .map_err(|e| InstallerError::System(format!("Failed to delete service: {}", e)))?;
+        // Try to delete SCM service (system scope)
+        if let Ok(sc_manager) = ScManagerHandle::new()
+            && let Ok(service) = open_service(&sc_manager, label)
+        {
+            let _ = stop_service(&service);
+            unsafe {
+                let _ = windows::Win32::System::Services::DeleteService(service.handle());
+            }
         }
 
-        // Clean up registry entries
+        // Clean up registry entries (both scopes)
         cleanup_registry_entries(label)?;
 
         // Unregister event source

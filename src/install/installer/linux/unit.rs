@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use super::InstallerError;
 use super::file_ops::write_file_atomic;
+use super::super::builder::ResourceLimits;
 
 // Pre-computed systemd unit template for zero allocation
 #[allow(dead_code)]
@@ -25,6 +26,7 @@ pub struct SystemdConfig<'a> {
     pub wants_network: bool,
     pub user: Option<&'a str>,
     pub group: Option<&'a str>,
+    pub resource_limits: Option<ResourceLimits>,
 }
 
 /// Create systemd unit file with comprehensive configuration in specified directory
@@ -132,9 +134,12 @@ fn generate_unit_content(config: &SystemdConfig) -> Result<String, InstallerErro
     content.push_str("ReadWritePaths=/var/log /var/lib /tmp\n");
     content.push_str("ReadOnlyPaths=/etc\n");
 
-    // Resource limits
-    content.push_str("LimitNOFILE=65536\n");
-    content.push_str("LimitNPROC=4096\n");
+    // Resource limits (configurable via builder, defaults match ResourceLimits::default())
+    let limits = config.resource_limits.clone().unwrap_or_default();
+    content.push_str(&format!("LimitNOFILE={}\n", limits.max_files));
+    content.push_str(&format!("LimitNPROC={}\n", limits.max_processes));
+    content.push_str(&format!("LimitAS={}\n", limits.max_memory_bytes));
+    content.push_str(&format!("Nice={}\n", limits.nice));
 
     // User/Group configuration
     if let Some(user) = config.user {

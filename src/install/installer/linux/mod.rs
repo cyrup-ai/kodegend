@@ -79,6 +79,7 @@ impl PlatformExecutor {
             wants_network: b.wants_network,
             user: Some(&b.run_as_user),
             group: Some(&b.run_as_group),
+            resource_limits: b.resource_limits.clone(),
         };
 
         // Generate and install systemd unit file

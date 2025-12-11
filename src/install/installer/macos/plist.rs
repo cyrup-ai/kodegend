@@ -42,6 +42,7 @@ pub(super) fn generate_plist(b: &InstallerBuilder) -> Result<String, InstallerEr
     }
 
     // Auto-restart
+    // KeepAlive with SuccessfulExit=false ensures the service restarts on failure
     plist.insert(
         "KeepAlive".to_string(),
         if b.auto_restart {
@@ -55,7 +56,33 @@ pub(super) fn generate_plist(b: &InstallerBuilder) -> Result<String, InstallerEr
         },
     );
 
-    // Logging
+    // Advanced restart policies
+    if b.auto_restart {
+        // ThrottleInterval: Minimum time (in seconds) between restart attempts.
+        // Set to 5 seconds to match Linux systemd's RestartSec=5s.
+        //
+        // Platform limitation: Unlike Linux (StartLimitBurst) and Windows (failure actions),
+        // launchd does NOT support retry limits. The service will restart indefinitely with
+        // this throttle delay. This is a fundamental launchd limitation and cannot be changed.
+        plist.insert("ThrottleInterval".to_string(), Value::Integer(5.into()));
+    }
+
+    // ExitTimeOut: Time (in seconds) to wait for graceful shutdown before force-killing.
+    // Set to 10 seconds to provide sufficient time for cleanup operations.
+    // This matches typical systemd TimeoutStopSec values.
+    plist.insert("ExitTimeOut".to_string(), Value::Integer(10.into()));
+
+    // Logging - Dual approach for reliability and platform integration
+    //
+    // PRIMARY: macOS Unified Logging (os_log) via logging/macos.rs
+    //   - Native Console.app integration
+    //   - Automatic retention management (no app-level rotation needed)
+    //   - Structured queries: log show --predicate 'subsystem == "ai.kodegen.kodegend"'
+    //
+    // BACKUP: File-based logging via launchd stdout/stderr capture
+    //   - Maintains backward compatibility
+    //   - Emergency access if os_log unavailable
+    //   - Files remain for troubleshooting but are NOT the primary log destination
     plist.insert(
         "StandardOutPath".to_string(),
         Value::String(format!("/var/log/{}/stdout.log", b.label)),
@@ -64,6 +91,52 @@ pub(super) fn generate_plist(b: &InstallerBuilder) -> Result<String, InstallerEr
         "StandardErrorPath".to_string(),
         Value::String(format!("/var/log/{}/stderr.log", b.label)),
     );
+
+    // Resource limits (matching Linux defaults)
+    // Get resource limits from builder or use defaults
+    let limits = b.resource_limits.as_ref().cloned().unwrap_or_default();
+
+    // SoftResourceLimits: Advisory limits that can be adjusted by the process
+    let mut soft_limits = HashMap::new();
+    soft_limits.insert(
+        "NumberOfFiles".to_string(),
+        Value::Integer(limits.max_files.into()),
+    );
+    soft_limits.insert(
+        "NumberOfProcesses".to_string(),
+        Value::Integer(limits.max_processes.into()),
+    );
+    // RSS (Resident Set Size) - approximate memory limit in bytes
+    // Note: macOS RSS limit is advisory, not hard-enforced like Linux cgroups
+    soft_limits.insert(
+        "RSS".to_string(),
+        Value::Integer(limits.max_memory_bytes.into()),
+    );
+
+    plist.insert(
+        "SoftResourceLimits".to_string(),
+        Value::Dictionary(soft_limits.into_iter().collect()),
+    );
+
+    // HardResourceLimits: Enforced limits that cannot be exceeded
+    let mut hard_limits = HashMap::new();
+    hard_limits.insert(
+        "NumberOfFiles".to_string(),
+        Value::Integer(limits.max_files.into()),
+    );
+    hard_limits.insert(
+        "NumberOfProcesses".to_string(),
+        Value::Integer(limits.max_processes.into()),
+    );
+
+    plist.insert(
+        "HardResourceLimits".to_string(),
+        Value::Dictionary(hard_limits.into_iter().collect()),
+    );
+
+    // Process priority (nice value)
+    // Range: -20 (highest) to 20 (lowest), default -5 matches Linux
+    plist.insert("Nice".to_string(), Value::Integer(limits.nice.into()));
 
     // Run at load
     plist.insert("RunAtLoad".to_string(), Value::Boolean(true));

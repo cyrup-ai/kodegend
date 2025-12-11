@@ -16,6 +16,10 @@ pub enum ServiceState {
     Starting,
     /// Service is actively running
     Running,
+    /// Service is being paused (Windows pause pending)
+    Pausing,
+    /// Service is paused (Windows paused state)
+    Paused,
     /// Service is being stopped
     Stopping,
     /// Service has stopped (generic state)
@@ -33,6 +37,8 @@ impl fmt::Display for ServiceState {
         match self {
             Self::Starting => write!(f, "starting"),
             Self::Running => write!(f, "running"),
+            Self::Pausing => write!(f, "pausing"),
+            Self::Paused => write!(f, "paused"),
             Self::Stopping => write!(f, "stopping"),
             Self::Stopped => write!(f, "stopped"),
             Self::StoppedClean => write!(f, "stopped-clean"),
@@ -56,6 +62,16 @@ pub enum Cmd {
     /// Restart the service (stop + start)
     /// correlation_id: Used to match Evt::State responses
     Restart { correlation_id: u64 },
+
+    /// Pause the service (Windows SERVICE_CONTROL_PAUSE)
+    /// Implementation: Stops child process, reports Paused state
+    /// correlation_id: Used to match Evt::State responses
+    Pause { correlation_id: u64 },
+
+    /// Continue the service (Windows SERVICE_CONTROL_CONTINUE)
+    /// Implementation: Restarts child process, reports Running state
+    /// correlation_id: Used to match Evt::State responses
+    Continue { correlation_id: u64 },
 
     /// Shutdown worker thread
     /// No correlation_id: This is a fire-and-forget broadcast command

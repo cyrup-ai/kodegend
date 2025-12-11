@@ -9,6 +9,7 @@ mod ipc;
 mod lifecycle;
 mod logging;
 mod manager;
+mod panic_handler;
 mod platform;
 mod security;
 mod service;
@@ -21,7 +22,6 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use kodegen_config::KodegenConfig;
 use crate::install::ensure_installed;
 use log::{error, info};
 use manager::ServiceManager;
@@ -41,10 +41,20 @@ fn main() {
                 .skip(1)  // Skip the flag itself
                 .collect();
 
-            if let Err(e) = install::run_privileged_install_ops(staged_files) {
+            // Detect install scope based on elevation
+            #[cfg(windows)]
+            let scope = if platform::is_elevated() {
+                install::installer::windows::paths::InstallScope::System
+            } else {
+                install::installer::windows::paths::InstallScope::User
+            };
+
+            #[cfg(windows)]
+            if let Err(e) = install::run_privileged_install_ops(staged_files, scope) {
                 eprintln!("Privileged installation failed: {}", e);
                 std::process::exit(1);
             }
+
             std::process::exit(0);
         }
 
@@ -60,6 +70,10 @@ fn main() {
         }
     }
 
+    // Initialize panic handler FIRST (before anything else)
+    // This ensures panics during logging setup are captured
+    panic_handler::init();
+    
     // Initialize platform-appropriate logging (Unix or Windows)
     if let Err(e) = logging::init_logging() {
         cli_output::error(&format!("Failed to initialize logging: {}", e));
@@ -97,12 +111,20 @@ async fn handle_uninstall() -> Result<()> {
 async fn real_main() -> Result<()> {
     let args = cli::Args::parse();
 
+    // Extract config path and CLI overrides
+    let config_path = args.config.as_ref().map(|p| p.display().to_string());
+    let cli_overrides = args.to_overrides();
+
     // Default behavior: run daemon (automagical installation happens inside)
     match args.sub {
-        None => run_daemon(false, None, false).await,
+        None => run_daemon(false, config_path, cli_overrides, None).await,
         Some(cli::Cmd::Uninstall) => handle_uninstall().await,
         Some(cli::Cmd::Status) => handle_status().await,
-        Some(cli::Cmd::Start) => handle_start().await,
+        Some(cli::Cmd::Start { config_permissions, .. }) => {
+            use crate::security::config_permissions::PermissionMode;
+            let mode = PermissionMode::from_str(&config_permissions);
+            handle_start(mode).await
+        }
         Some(cli::Cmd::Stop) => handle_stop().await,
         Some(cli::Cmd::Restart) => handle_restart().await,
         Some(cli::Cmd::Vulnerabilities { filter, package, critical_only }) => {
@@ -114,49 +136,77 @@ async fn real_main() -> Result<()> {
 async fn run_daemon(
     _force_foreground: bool, // NOTE: Parameter kept for API compatibility but unused
     config_path: Option<String>,
-    use_system: bool,
+    cli_overrides: serde_json::Value,
+    permission_mode: Option<crate::security::config_permissions::PermissionMode>,
 ) -> Result<()> {
     // Main process always stays in foreground - service managers handle daemonization
 
-    // Determine config path based on CLI arguments
-    let cfg_path = if let Some(path) = config_path {
-        // User specified an explicit config path
-        PathBuf::from(path)
-    } else if use_system {
-        // User wants system-wide config
-        KodegenConfig::config_dir()?.join("kodegend.toml")
+    // Load merged config from all sources
+    let cfg = if let Some(explicit_path) = config_path {
+        // Explicit config path provided - load only that file (bypass multi-source merge)
+        info!("Loading explicit config: {}", explicit_path);
+        
+        // Auto-generate config file if it doesn't exist
+        let cfg_path = PathBuf::from(&explicit_path);
+        if !cfg_path.exists() {
+            info!(
+                "Config not found at {}, creating default configuration",
+                cfg_path.display()
+            );
+
+            // Create parent directory if needed
+            if let Some(parent) = cfg_path.parent() {
+                fs::create_dir_all(parent).context("Failed to create config directory")?;
+            }
+
+            // Serialize and write default config
+            let default_toml = toml::to_string_pretty(&config::ServiceConfig::default())
+                .context("Failed to serialize default config")?;
+            fs::write(&cfg_path, default_toml).context("Failed to write config file")?;
+
+            info!("Created default configuration at {}", cfg_path.display());
+        }
+        
+        config::ServiceConfig::load_from_file(&explicit_path, permission_mode)?
     } else {
-        // Default to user config directory
-        let config_dir = KodegenConfig::user_config_dir()?.join("kodegend");
-        fs::create_dir_all(&config_dir)?;
-        config_dir.join("kodegend.toml")
+        // Multi-source merge with precedence chain
+        info!("Loading configuration with multi-source merging");
+        let loader = config::ConfigLoader::new();
+        loader.load_with_overrides(cli_overrides)?
     };
 
-    // Auto-generate config file if it doesn't exist
-    if !cfg_path.exists() {
-        info!(
-            "Config not found at {}, creating default configuration",
-            cfg_path.display()
-        );
+    info!("Configuration loaded successfully");
+    log::debug!("  log_dir: {:?}", cfg.log_dir);
+    log::debug!("  mcp_bind: {:?}", cfg.mcp_bind);
+    log::debug!("  services_dir: {:?}", cfg.services_dir);
 
-        // Create parent directory if needed
-        if let Some(parent) = cfg_path.parent() {
-            fs::create_dir_all(parent).context("Failed to create config directory")?;
+    // Apply Windows Job Object resource limits early in daemon startup
+    // This must be done before spawning any child processes
+    // The Job Object handle must remain alive for the daemon's lifetime
+    #[cfg(target_os = "windows")]
+    let _job_object = {
+        use crate::platform::windows::job_object;
+
+        // Use default resource limits (same as installer builder defaults)
+        // max_memory_bytes: 1GB, max_processes: 4096
+        let max_memory: u64 = 1024 * 1024 * 1024; // 1GB
+        let max_processes: u64 = 4096;
+
+        match job_object::apply_resource_limits(max_memory, max_processes) {
+            Ok(job) => {
+                info!(
+                    "Applied Windows Job Object limits: memory={}MB, processes={}",
+                    max_memory / (1024 * 1024),
+                    max_processes
+                );
+                Some(job)
+            }
+            Err(e) => {
+                log::warn!("Failed to apply Job Object limits: {e}");
+                None
+            }
         }
-
-        // Serialize and write default config
-        let default_toml = toml::to_string_pretty(&config::ServiceConfig::default())
-            .context("Failed to serialize default config")?;
-        fs::write(&cfg_path, default_toml).context("Failed to write config file")?;
-
-        info!("Created default configuration at {}", cfg_path.display());
-    }
-
-    // Load config from disk
-    let cfg_str = fs::read_to_string(&cfg_path).context("Failed to read config file")?;
-    let cfg: config::ServiceConfig = toml::from_str(&cfg_str).context("Failed to parse config")?;
-
-    info!("Using config from: {}", cfg_path.display());
+    };
 
     // Create PID file AFTER daemonization and config loading
     // Store in variable to keep it alive for entire daemon lifetime
@@ -301,8 +351,9 @@ async fn handle_status() -> Result<()> {
 
                 match connect_named_pipe(path_str) {
                     Ok(mut stream) => {
-                        // Note: Windows Named Pipes don't have set_read_timeout in our wrapper
-                        // Timeout is handled at pipe creation level
+                        // ✅ FIX: Set read timeout (parity with Unix at main.rs:233)
+                        stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                            .context("Failed to set pipe read timeout")?;
 
                         // Send query
                         if let Err(e) = send_message(&mut stream, &StatusQuery::All) {
@@ -375,15 +426,6 @@ async fn handle_status() -> Result<()> {
                     }
                 }
             }
-            
-            #[cfg(not(unix))]
-            {
-                // Windows: Basic status only for now
-                cli_output::info("● kodegend.service - KODEGEN Daemon");
-                cli_output::info("   Active: active (running)");
-                cli_output::info(&format!("   Main PID: {}", pid));
-                std::process::exit(0);
-            }
         }
     }
     
@@ -439,7 +481,9 @@ async fn handle_status() -> Result<()> {
 }
 
 /// Handle start command - start the daemon service
-async fn handle_start() -> Result<()> {
+async fn handle_start(
+    _permission_mode: Option<crate::security::config_permissions::PermissionMode>,
+) -> Result<()> {
     match control::start_daemon().await {
         Ok(()) => {
             cli_output::success("kodegend started successfully");

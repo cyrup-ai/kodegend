@@ -28,6 +28,7 @@ impl ProcessHandle {
     /// Open process with PROCESS_QUERY_LIMITED_INFORMATION access
     ///
     /// Used for checking if process exists without requiring full access.
+    #[cfg(test)]
     pub fn open_query(pid: u32) -> Result<Self> {
         unsafe {
             OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
@@ -38,6 +39,25 @@ impl ProcessHandle {
                     std::io::Error::from_raw_os_error(e.code().0),
                     e.code().0
                 ))
+        }
+    }
+
+    /// Open process with PROCESS_QUERY_LIMITED_INFORMATION access (io::Error variant)
+    ///
+    /// This variant returns std::io::Error instead of anyhow::Error, preserving
+    /// raw Windows error codes for callers that need to inspect specific errors.
+    ///
+    /// Use this when you need to distinguish between:
+    /// - ERROR_INVALID_PARAMETER: Process doesn't exist
+    /// - ERROR_ACCESS_DENIED: Process exists but access denied
+    /// - Other errors
+    ///
+    /// Use `open_query()` if you just need to propagate errors with `?`.
+    pub fn try_open_query(pid: u32) -> Result<Self, std::io::Error> {
+        unsafe {
+            OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+                .map(ProcessHandle)
+                .map_err(|e| std::io::Error::from_raw_os_error(e.code().0))
         }
     }
 

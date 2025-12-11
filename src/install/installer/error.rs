@@ -4,8 +4,8 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum InstallerError {
-    /// User cancelled the authorization prompt
-    #[error("User cancelled authorization")]
+    /// User cancelled the UAC elevation prompt
+    #[error("Installation cancelled by user. Administrator privileges are required to install kodegen.")]
     #[cfg_attr(target_os = "linux", allow(dead_code))]
     Cancelled,
 

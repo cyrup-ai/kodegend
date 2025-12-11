@@ -12,6 +12,12 @@ use windows::Win32::Security::WinTrust::{
     WTD_CHOICE_FILE, WTD_REVOKE_WHOLECHAIN, WTD_STATEACTION_VERIFY, WTD_UI_NONE, WinVerifyTrust,
 };
 use windows::core::GUID;
+use windows::Win32::Security::Cryptography::{
+    CryptQueryObject, CertFreeCertificateContext, CertGetNameStringW,
+    CERT_QUERY_OBJECT_FILE, CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED,
+    CERT_QUERY_FORMAT_FLAG_BINARY, CERT_NAME_SIMPLE_DISPLAY_TYPE,
+    HCERTSTORE, CERT_CONTEXT,
+};
 
 /// Expected publisher name for Kodegen binaries
 ///
@@ -120,6 +126,101 @@ pub fn verify_signature(exe_path: &Path) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
+/// Extract signer certificate from signed executable
+///
+/// Uses CryptQueryObject to retrieve the certificate context from the
+/// Authenticode signature embedded in the executable.
+///
+/// # Returns
+///
+/// Returns a pointer to CERT_CONTEXT which must be freed with
+/// CertFreeCertificateContext when done.
+///
+/// # Errors
+///
+/// Returns error if:
+/// - Path contains invalid UTF-8 characters
+/// - CryptQueryObject fails to extract certificate
+fn get_signer_certificate(exe_path: &Path) -> Result<*const CERT_CONTEXT, Box<dyn std::error::Error>> {
+    // Convert path to wide string (following pattern from line 51-54)
+    let path_str = exe_path.to_str()
+        .ok_or("Invalid path: contains non-UTF-8 characters")?;
+    let path_wide: Vec<u16> = path_str.encode_utf16().chain(Some(0)).collect();
+    
+    let mut cert_encoding_type: u32 = 0;
+    let mut content_type: u32 = 0;
+    let mut format_type: u32 = 0;
+    let mut cert_store: HCERTSTORE = HCERTSTORE(std::ptr::null_mut());
+    let mut msg: *mut std::ffi::c_void = std::ptr::null_mut();
+    let mut context: *mut std::ffi::c_void = std::ptr::null_mut();
+
+    unsafe {
+        CryptQueryObject(
+            CERT_QUERY_OBJECT_FILE,
+            path_wide.as_ptr() as *const std::ffi::c_void,
+            CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED,
+            CERT_QUERY_FORMAT_FLAG_BINARY,
+            0,
+            Some(std::ptr::addr_of_mut!(cert_encoding_type) as *mut _),
+            Some(std::ptr::addr_of_mut!(content_type) as *mut _),
+            Some(std::ptr::addr_of_mut!(format_type) as *mut _),
+            Some(&mut cert_store),
+            Some(&mut msg),
+            Some(std::ptr::addr_of_mut!(context) as *mut _),
+        )
+        .map_err(|_| "CryptQueryObject failed to extract certificate from signed binary")?;
+    }
+    
+    // The context points to a CERT_CONTEXT structure
+    Ok(context as *const CERT_CONTEXT)
+}
+
+/// Extract Subject Common Name from certificate
+///
+/// Uses CertGetNameStringW to retrieve the Common Name from the certificate's
+/// Subject field.
+///
+/// # Safety
+///
+/// The cert pointer must be a valid CERT_CONTEXT pointer obtained from
+/// CryptQueryObject or similar Windows crypto API.
+///
+/// # Returns
+///
+/// Returns the Subject CN as a String.
+///
+/// # Errors
+///
+/// Returns error if:
+/// - Certificate pointer is null
+/// - CertGetNameStringW fails to extract the CN
+fn get_certificate_subject_cn(cert: *const CERT_CONTEXT) -> Result<String, Box<dyn std::error::Error>> {
+    if cert.is_null() {
+        return Err("Certificate context is null".into());
+    }
+    
+    // First call to get required buffer size
+    let mut buffer = [0u16; 256];  // Common Name typically < 256 characters
+    
+    unsafe {
+        let len = CertGetNameStringW(
+            cert,
+            CERT_NAME_SIMPLE_DISPLAY_TYPE,
+            0,
+            None,
+            Some(&mut buffer),
+        );
+        
+        if len == 0 || len == 1 {
+            return Err("Failed to extract certificate Subject CN".into());
+        }
+        
+        // Convert wide string to Rust String (len includes null terminator)
+        let subject_cn = String::from_utf16_lossy(&buffer[..(len as usize - 1)]);
+        Ok(subject_cn)
+    }
+}
+
 /// Verify the publisher certificate matches expected identity
 ///
 /// This function extracts the certificate from the signed executable and
@@ -127,28 +228,38 @@ pub fn verify_signature(exe_path: &Path) -> Result<(), Box<dyn std::error::Error
 /// This prevents accepting arbitrary signed executables - only binaries signed
 /// by Kodegen are accepted.
 ///
-/// # Implementation Note
+/// # Security
 ///
-/// Currently returns Ok() as a placeholder. A full implementation would:
-/// 1. Use CryptQueryObject to extract certificate from signature
-/// 2. Parse certificate Subject field
-/// 3. Extract CN (Common Name) value
-/// 4. Compare against EXPECTED_PUBLISHER constant
-/// 5. Return error if mismatch
+/// This provides defense-in-depth against supply chain attacks:
+/// - WinVerifyTrust validates signature integrity and trust chain
+/// - This function validates the specific identity of the signer
 ///
-/// For production deployment, implement certificate extraction using
-/// windows::Win32::Security::Cryptography APIs.
-fn verify_publisher(_exe_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    // TODO: Implement publisher verification using CryptQueryObject
-    // This requires:
-    // 1. CryptQueryObject to get certificate context from signed file
-    // 2. CertGetNameString to extract Subject CN from certificate
-    // 3. Compare CN against EXPECTED_PUBLISHER
-    //
-    // For now, WinVerifyTrust provides strong verification that signature
-    // is valid and chains to trusted root. Publisher check adds defense-in-depth.
-
-    // Placeholder implementation - production code should verify publisher
+/// Both checks must pass for installation to proceed.
+fn verify_publisher(exe_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    // Extract certificate from Authenticode signature
+    let cert = get_signer_certificate(exe_path)?;
+    
+    // Ensure we clean up the certificate context on all exit paths
+    let _guard = scopeguard::guard(cert, |c| {
+        if !c.is_null() {
+            unsafe { let _ = CertFreeCertificateContext(Some(c)); }
+        }
+    });
+    
+    // Extract Subject Common Name from certificate
+    let subject_cn = get_certificate_subject_cn(cert)?;
+    
+    // Compare against expected publisher
+    if subject_cn != EXPECTED_PUBLISHER {
+        return Err(format!(
+            "Publisher verification failed. Binary signed by '{}', expected '{}'.\n\
+             This binary may be malicious or from an untrusted source.\n\
+             Only binaries signed by {} are accepted.",
+            subject_cn, EXPECTED_PUBLISHER, EXPECTED_PUBLISHER
+        ).into());
+    }
+    
+    log::info!("Publisher verified: {}", subject_cn);
     Ok(())
 }
 

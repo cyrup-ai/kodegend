@@ -268,6 +268,8 @@ pub(super) fn install_services(
         // Create services directory
         use super::paths;
         let services_dir = paths::services_dir();
+        // Note: Directory already created by create_installer_directories()
+        // Kept here for defensive programming in case services are installed separately
         std::fs::create_dir_all(&services_dir).map_err(|e| {
             InstallerError::System(format!("Failed to create services directory: {}", e))
         })?;

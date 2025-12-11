@@ -1,8 +1,18 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::Context;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+
+use crate::service::path_validation::expand_env_vars;
+
+pub mod migration;
+pub mod merge;
+pub mod backup;
+
+#[allow(unused_imports)]
+pub use merge::{ConfigLoader, deep_merge, toml_to_json};
+pub use backup::ConfigBackupManager;
 
 /// Resolve a path relative to a base directory (typically config file's directory)
 ///
@@ -62,6 +72,45 @@ fn canonicalize_path_vec(paths: &[String], base_dir: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Expand environment variables in Option<String>
+///
+/// Convenience wrapper for path fields that are Option<String>
+fn expand_optional_env(opt: &Option<String>, field_name: &str) -> Result<Option<String>, anyhow::Error> {
+    match opt {
+        Some(s) => {
+            let expanded = expand_env_vars(s)
+                .with_context(|| format!("Failed to expand environment variables in {}", field_name))?;
+            Ok(Some(expanded))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Expand environment variables in Vec<String>
+///
+/// Used for fields like `watch_dirs` that contain multiple paths
+fn expand_path_vec(paths: &[String], field_name: &str) -> Result<Vec<String>, anyhow::Error> {
+    paths
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            expand_env_vars(p).with_context(|| {
+                format!("Failed to expand environment variables in {}[{}]", field_name, i)
+            })
+        })
+        .collect()
+}
+
+/// Expand environment variables in PathBuf
+///
+/// Converts PathBuf → String → expand → PathBuf
+fn expand_pathbuf_env(path: &std::path::Path, field_name: &str) -> Result<std::path::PathBuf, anyhow::Error> {
+    let path_str = path.display().to_string();
+    let expanded = expand_env_vars(&path_str)
+        .with_context(|| format!("Failed to expand environment variables in {}", field_name))?;
+    Ok(std::path::PathBuf::from(expanded))
+}
+
 /// Vulnerability scanning thresholds configuration
 ///
 /// Configures maximum allowed vulnerabilities by severity level.
@@ -103,6 +152,14 @@ pub struct SecurityConfig {
 /// Top‑level daemon configuration (mirrors original defaults).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceConfig {
+    /// Config schema version (default: 2 for new configs, detected for old configs)
+    /// 
+    /// Version history:
+    /// - v1: Initial version (no version field, used restart_delay_s)
+    /// - v2: Current version (uses restart_policy with exponential backoff)
+    #[serde(default = "default_config_version")]
+    pub version: u32,
+
     #[serde(default = "default_services_dir")]
     pub services_dir: Option<String>,
 
@@ -353,6 +410,12 @@ impl ServiceConfig {
 
     /// Load config from file and canonicalize all path fields
     ///
+    /// # Permission Validation
+    ///
+    /// Before loading, the config file's permissions are validated to prevent
+    /// privilege escalation attacks (CWE-732). See `security::config_permissions`
+    /// for validation logic.
+    ///
     /// # Path Resolution Strategy
     ///
     /// All relative paths in the config file are resolved relative to the **config file's directory**,
@@ -380,20 +443,76 @@ impl ServiceConfig {
     /// After daemonization, the working directory is `/` on Unix systems.
     /// Without canonicalization, `./run/daemon.pid` would resolve to `/run/daemon.pid`,
     /// which is almost certainly wrong (and may cause permission errors).
-    pub fn load_from_file<P: AsRef<std::path::Path>>(path: P) -> Result<Self, anyhow::Error> {
+    pub fn load_from_file<P: AsRef<std::path::Path>>(
+        path: P,
+        permission_mode: Option<crate::security::config_permissions::PermissionMode>,
+    ) -> Result<Self, anyhow::Error> {
         let path = path.as_ref();
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read config file: {}", path.display()))?;
-
-        let mut cfg: ServiceConfig = toml::from_str(&content)
-            .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
-
+        
+        // ════════════════════════════════════════════════════════════════════
+        // NEW: Validate config file permissions BEFORE reading
+        // ════════════════════════════════════════════════════════════════════
+        
+        use crate::security::config_permissions::{validate_config_permissions, PermissionMode};
+        
+        // Determine permission mode:
+        // 1. Use explicit parameter if provided (from CLI)
+        // 2. Fall back to environment variable KODEGEND_CONFIG_PERMISSIONS
+        // 3. Default to Strict mode for security
+        let mode = permission_mode
+            .or_else(|| {
+                std::env::var("KODEGEND_CONFIG_PERMISSIONS")
+                    .ok()
+                    .and_then(|s| PermissionMode::from_str(&s))
+            })
+            .unwrap_or(PermissionMode::Strict);
+        
+        // Validate permissions (fails fast in Strict mode)
+        validate_config_permissions(path, mode)
+            .with_context(|| format!(
+                "Config file failed security validation: {}",
+                path.display()
+            ))?;
+        
+        // ════════════════════════════════════════════════════════════════════
+        // Load with Automatic Migration
+        // ════════════════════════════════════════════════════════════════════
+        // This replaces the old toml::from_str() call with migration support.
+        // V1 configs are automatically detected and migrated to V2.
+        
+        let mut cfg = migration::load_with_migration(path)?;
+        
+        // ════════════════════════════════════════════════════════════════════
+        // Canonicalize Paths (existing logic - unchanged)
+        // ════════════════════════════════════════════════════════════════════
+        
         // Determine base directory for path resolution
         // Use config file's parent directory, or current directory if path has no parent
         let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
 
         // ════════════════════════════════════════════════════════════════════
-        // Canonicalize Top-Level ServiceConfig Paths
+        // Expand Environment Variables (BEFORE canonicalization)
+        // ════════════════════════════════════════════════════════════════════
+
+        // Expand top-level path fields
+        cfg.services_dir = expand_optional_env(&cfg.services_dir, "services_dir")?;
+        cfg.log_dir = expand_optional_env(&cfg.log_dir, "log_dir")?;
+        cfg.pid_file = expand_pathbuf_env(&cfg.pid_file, "pid_file")?;
+        cfg.working_directory = expand_pathbuf_env(&cfg.working_directory, "working_directory")?;
+
+        // Expand service-level path fields
+        for (idx, service) in cfg.services.iter_mut().enumerate() {
+            let service_context = format!("services[{}] ({})", idx, service.name);
+
+            service.working_dir = expand_optional_env(&service.working_dir, &format!("{}.working_dir", service_context))?;
+            service.log_stdout = expand_optional_env(&service.log_stdout, &format!("{}.log_stdout", service_context))?;
+            service.log_stderr = expand_optional_env(&service.log_stderr, &format!("{}.log_stderr", service_context))?;
+            service.ephemeral_dir = expand_optional_env(&service.ephemeral_dir, &format!("{}.ephemeral_dir", service_context))?;
+            service.watch_dirs = expand_path_vec(&service.watch_dirs, &format!("{}.watch_dirs", service_context))?;
+        }
+
+        // ════════════════════════════════════════════════════════════════════
+        // Canonicalize Top-Level ServiceConfig Paths (AFTER expansion)
         // ════════════════════════════════════════════════════════════════════
 
         // pid_file is PathBuf, need to convert through string
@@ -462,12 +581,40 @@ impl ServiceConfig {
         cfg.config_file_path = Some(path.to_path_buf());
         Ok(cfg)
     }
+
+    /// Canonicalize all path fields relative to base directory
+    ///
+    /// Used by ConfigLoader after merging to ensure paths are absolute.
+    /// This is the same logic as load_from_file() but separated for reuse.
+    pub fn canonicalize_paths(&mut self, base_dir: &Path) -> Result<(), anyhow::Error> {
+        self.pid_file = canonicalize_config_path(&self.pid_file, base_dir);
+        self.services_dir = canonicalize_optional_string(&self.services_dir, base_dir);
+        self.log_dir = canonicalize_optional_string(&self.log_dir, base_dir);
+        
+        for service in &mut self.services {
+            service.working_dir = canonicalize_optional_string(&service.working_dir, base_dir);
+            service.log_stdout = canonicalize_optional_string(&service.log_stdout, base_dir);
+            service.log_stderr = canonicalize_optional_string(&service.log_stderr, base_dir);
+            service.ephemeral_dir = canonicalize_optional_string(&service.ephemeral_dir, base_dir);
+            service.watch_dirs = canonicalize_path_vec(&service.watch_dirs, base_dir);
+        }
+        
+        Ok(())
+    }
 }
 
 /// Smart default for services directory based on privilege level
 ///
 /// Uses platform module to get correct path:
 /// - Unix (elevated): /etc/kodegend/services
+///
+/// Default config version (v2 - current)
+/// 
+/// New configs default to v2. V1 configs are detected by absence of version field.
+fn default_config_version() -> u32 {
+    2
+}
+
 /// - Unix (user): ~/.config/kodegend/services
 /// - Windows (elevated): C:\ProgramData\kodegend\services
 /// - Windows (user): %APPDATA%\kodegend\services
@@ -500,6 +647,7 @@ fn default_log_dir() -> Option<String> {
 impl Default for ServiceConfig {
     fn default() -> Self {
         Self {
+            version: default_config_version(),
             services_dir: default_services_dir(),
             log_dir: default_log_dir(),
             default_user: Some("kodegend".into()),

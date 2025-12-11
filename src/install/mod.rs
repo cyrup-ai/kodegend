@@ -170,8 +170,9 @@ fn log_component_errors(report: &InstallationFixReport) {
 ///
 /// 1. Create installation directory
 /// 2. Copy staged files to install directory
-/// 3. Add hosts entry (idempotent)
-/// 4. Flush DNS cache
+/// 3. Add installation directory to system PATH
+/// 4. Add hosts entry (idempotent)
+/// 5. Flush DNS cache
 ///
 /// # Requirements
 ///
@@ -183,23 +184,24 @@ fn log_component_errors(report: &InstallationFixReport) {
 /// Returns error if:
 /// - Not running with elevated privileges
 /// - File copy operations fail
+/// - PATH modification fails
 /// - Hosts modification fails
 #[cfg(windows)]
-pub fn run_privileged_install_ops(staged_files: Vec<String>) -> Result<()> {
-    use crate::install::installer::windows::paths::{self, InstallScope};
+pub fn run_privileged_install_ops(staged_files: Vec<String>, scope: installer::windows::paths::InstallScope) -> Result<()> {
+    use crate::install::installer::windows::paths::{self};
     use anyhow::Context;
     use std::fs;
 
-    log::info!("Running privileged installation operations");
+    log::info!("Running privileged installation operations (scope: {:?})", scope);
 
-    // Verify we're elevated
+    // Verify we're elevated (required for privileged operations)
     installer::windows::privileges::check_privileges()
         .context("Not running with elevated privileges")?;
 
-    // 1. Create installation directory
-    let install_dir = paths::install_dir(InstallScope::System);
-    fs::create_dir_all(&install_dir)
-        .context("Failed to create install directory")?;
+    // 1. Create all installer directories atomically
+    paths::create_installer_directories(scope)
+        .context("Failed to create installer directories")?;
+    let install_dir = paths::install_dir(scope);
 
     // 2. Copy all staged files
     for file in &staged_files {
@@ -215,9 +217,13 @@ pub fn run_privileged_install_ops(staged_files: Vec<String>) -> Result<()> {
         log::info!("Copied {} to {}", file, dest_path.display());
     }
 
+    // 2.5. Add installation directory to system PATH
+    component_fixers::add_to_windows_path_sync(scope)
+        .context("Failed to add to system PATH")?;
+
     // 3. Update hosts file (idempotent)
     if !hosts::hosts_entry_exists() {
-        installer::config::hosts::add_kodegen_host_entries()
+        installer::config::add_kodegen_host_entries()
             .context("Failed to add hosts entry")?;
 
         // 4. Flush DNS cache

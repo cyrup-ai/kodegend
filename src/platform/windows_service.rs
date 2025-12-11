@@ -8,7 +8,7 @@
 //! - Integration with kodegend's ServiceManager and ServiceStateMachine
 
 use anyhow::{Context, Result};
-use crossbeam_channel::{Sender, bounded};
+use crossbeam_channel::{Sender, bounded, select};
 use log::{error, info, warn};
 use std::ffi::OsString;
 use std::sync::{Arc, Mutex};
@@ -17,7 +17,7 @@ use windows_service::{
     define_windows_service,
     service::{
         ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
-        ServiceType,
+        ServiceType, UserEventCode,
     },
     service_control_handler::{self, ServiceControlHandlerResult, ServiceStatusHandle},
     service_dispatcher,
@@ -29,8 +29,22 @@ use crate::manager::ServiceManager;
 /// Service name for SCM registration
 const SERVICE_NAME: &str = "kodegend";
 
-/// Define the Windows service entry point
-/// This macro generates the FFI wrapper required by SCM
+/// Windows error code for invalid service control
+/// https://learn.microsoft.com/en-us/windows/win32/debug/system-error-codes--1000-1299-
+const ERROR_INVALID_SERVICE_CONTROL: u32 = 1052;
+
+/// Custom service control code for configuration reload
+///
+/// Windows reserves control codes 128-255 for user-defined controls.
+/// Code 128 is used to trigger configuration reload without restarting the service.
+///
+/// Usage: `sc control kodegend 128`
+///
+/// See: https://learn.microsoft.com/en-us/windows/win32/services/service-control-requests
+const SERVICE_CONTROL_RELOAD_CONFIG: UserEventCode = unsafe { UserEventCode::from_unchecked(128) };
+
+// Define the Windows service entry point.
+// This macro generates the FFI wrapper required by SCM.
 define_windows_service!(ffi_service_main, service_main);
 
 /// Service main function - called by SCM when service starts
@@ -67,13 +81,27 @@ fn run_service() -> Result<()> {
     // SCM sends stop events to control handler, which signals via this channel
     let (shutdown_tx, shutdown_rx) = bounded::<()>(1);
 
+    // Pause/continue channels for Windows SCM pause/continue control
+    let (pause_tx, pause_rx) = bounded::<()>(1);
+    let (continue_tx, continue_rx) = bounded::<()>(1);
+
+    // Create reload channel for coordinating config reload
+    // SCM sends custom control code 128, which signals via this channel
+    let (reload_tx, reload_rx) = bounded::<()>(1);
+
     // Shared state for service lifecycle tracking
     // Used by control handler to update state when SCM sends control events
     let lifecycle = Arc::new(Mutex::new(ServiceLifecycle::Starting));
 
     // Register service control handler with SCM
-    // This handler receives SERVICE_CONTROL_STOP, PAUSE, etc. events
-    let status_handle = register_service_handler(shutdown_tx.clone(), lifecycle.clone())?;
+    // This handler receives SERVICE_CONTROL_STOP, PAUSE, UserEvent, etc.
+    let status_handle = register_service_handler(
+        shutdown_tx.clone(),
+        pause_tx.clone(),
+        continue_tx.clone(),
+        reload_tx.clone(),
+        lifecycle.clone()
+    )?;
 
     // Report service is starting (3-second wait_hint for initialization)
     // SCM will wait up to 3 seconds for us to report Running status
@@ -93,7 +121,7 @@ fn run_service() -> Result<()> {
     // Load config with graceful fallback to defaults
     // If config file missing/corrupt, use default config to ensure service starts
     let config = if config_path.exists() {
-        match crate::config::ServiceConfig::load_from_file(&config_path) {
+        match crate::config::ServiceConfig::load_from_file(&config_path, None) {
             Ok(cfg) => {
                 info!("Loaded configuration from: {}", config_path.display());
                 cfg
@@ -111,7 +139,7 @@ fn run_service() -> Result<()> {
 
     // Initialize ServiceManager with loaded config
     // This creates worker channels and prepares for service startup
-    let service_manager = match ServiceManager::new(config) {
+    let mut service_manager = match ServiceManager::new(config) {
         Ok(mgr) => {
             info!("ServiceManager initialized successfully");
             mgr
@@ -129,9 +157,26 @@ fn run_service() -> Result<()> {
         }
     };
 
+    // Set pause/continue receivers on ServiceManager (Windows-only)
+    // Clone receivers before moving to service_manager
+    // The clones will be used in the select! loop below
+    #[cfg(windows)]
+    let (pause_rx_loop, continue_rx_loop) = (pause_rx.clone(), continue_rx.clone());
+    
+    #[cfg(windows)]
+    {
+        service_manager.set_pause_rx(pause_rx);
+        service_manager.set_continue_rx(continue_rx);
+    }
+
     // Get ServiceManager's shutdown sender BEFORE moving it into the thread
     // This allows us to signal the manager to stop after receiving SCM stop event
     let mgr_shutdown_tx = service_manager.get_shutdown_sender();
+
+    // Get ServiceManager's reload sender BEFORE moving it into the thread
+    // This allows us to signal the manager to reload config when SCM sends control code 128
+    // Returns Some(sender) on Windows, None on other platforms
+    let mgr_reload_tx = service_manager.get_reload_sender();
 
     // Spawn ServiceManager::run() in a dedicated thread with its own runtime
     // We use std::thread instead of tokio::spawn because:
@@ -175,14 +220,92 @@ fn run_service() -> Result<()> {
 
     info!("kodegend Windows service running");
 
-    // Block until shutdown signal received from SCM
-    // This keeps the service thread alive while ServiceManager runs in background
-    // Control handler sends () on this channel when SCM sends SERVICE_CONTROL_STOP
-    if let Err(e) = shutdown_rx.recv() {
-        warn!("Shutdown channel error: {}", e);
+    // Main service loop - handle shutdown, pause, and continue
+    loop {
+        select! {
+            recv(shutdown_rx) -> _ => {
+                info!("kodegend Windows service stopping...");
+                break;  // Exit loop to begin shutdown sequence
+            }
+            
+            recv(reload_rx) -> result => {
+                if let Err(e) = result {
+                    error!("Reload channel error: {}", e);
+                    continue;
+                }
+                
+                info!("Forwarding config reload request to ServiceManager");
+                // Forward reload signal to ServiceManager
+                if let Some(ref tx) = mgr_reload_tx {
+                    if let Err(e) = tx.send(()) {
+                        error!("Failed to send reload signal to ServiceManager: {}", e);
+                    } else {
+                        info!("Config reload signal sent to ServiceManager successfully");
+                    }
+                } else {
+                    error!("Reload sender not available (should not happen on Windows)");
+                }
+            }
+            
+            recv(pause_rx_loop) -> _ => {
+                info!("Processing SERVICE_CONTROL_PAUSE...");
+                
+                // Report pausing to SCM
+                report_service_status(
+                    &status_handle,
+                    ServiceState::PausePending,
+                    Duration::from_secs(2),  // 2-second pause timeout
+                    0,
+                )?;
+                
+                // Signal already sent to manager thread via pause_tx in control handler
+                // Manager broadcasts Pause command to all workers
+                // Workers stop their child processes and report Paused state
+                
+                // Wait briefly for workers to pause (2 seconds max)
+                std::thread::sleep(Duration::from_millis(2000));
+                
+                // Report paused to SCM
+                report_service_status(
+                    &status_handle,
+                    ServiceState::Paused,
+                    Duration::from_secs(0),
+                    0,
+                )?;
+                
+                info!("Service paused - all child processes stopped");
+            }
+            
+            recv(continue_rx_loop) -> _ => {
+                info!("Processing SERVICE_CONTROL_CONTINUE...");
+                
+                // Report continuing to SCM
+                report_service_status(
+                    &status_handle,
+                    ServiceState::ContinuePending,
+                    Duration::from_secs(2),  // 2-second resume timeout
+                    0,
+                )?;
+                
+                // Signal already sent to manager thread via continue_tx in control handler
+                // Manager broadcasts Continue command to all workers
+                // Workers restart their child processes and report Running state
+                
+                // Wait briefly for workers to resume (2 seconds max)
+                std::thread::sleep(Duration::from_millis(2000));
+                
+                // Report running to SCM
+                report_service_status(
+                    &status_handle,
+                    ServiceState::Running,
+                    Duration::from_secs(0),
+                    0,
+                )?;
+                
+                info!("Service resumed - all child processes restarted");
+            }
+        }
     }
-
-    info!("kodegend Windows service stopping...");
 
     // Update lifecycle state to Stopping
     if let Ok(mut lc) = lifecycle.lock() {
@@ -273,6 +396,9 @@ fn run_service() -> Result<()> {
 /// Returns a ServiceStatusHandle that can be used to report status changes
 fn register_service_handler(
     shutdown_tx: Sender<()>,
+    pause_tx: Sender<()>,
+    continue_tx: Sender<()>,
+    reload_tx: Sender<()>,
     lifecycle: Arc<Mutex<ServiceLifecycle>>,
 ) -> Result<ServiceStatusHandle> {
     let event_handler = move |control_event| -> ServiceControlHandlerResult {
@@ -300,13 +426,52 @@ fn register_service_handler(
                 ServiceControlHandlerResult::NoError
             }
             ServiceControl::Pause => {
-                // Pause not currently supported
-                info!("Received SERVICE_CONTROL_PAUSE (not implemented)");
-                ServiceControlHandlerResult::NotImplemented
+                info!("Received SERVICE_CONTROL_PAUSE event");
+                
+                // Validate current state - only allow pause from Running
+                if let Ok(lc) = lifecycle.lock()
+                    && *lc != ServiceLifecycle::Running {
+                    warn!("Cannot pause service - not in Running state (current: {:?})", *lc);
+                    return ServiceControlHandlerResult::Other(ERROR_INVALID_SERVICE_CONTROL);
+                }
+                
+                // Signal pause to main loop
+                if let Err(e) = pause_tx.send(()) {
+                    error!("Failed to send pause signal: {}", e);
+                    return ServiceControlHandlerResult::Other(1);
+                }
+                
+                ServiceControlHandlerResult::NoError
             }
             ServiceControl::Continue => {
-                // Continue not currently supported
-                info!("Received SERVICE_CONTROL_CONTINUE (not implemented)");
+                info!("Received SERVICE_CONTROL_CONTINUE event");
+                
+                // Signal continue to main loop
+                if let Err(e) = continue_tx.send(()) {
+                    error!("Failed to send continue signal: {}", e);
+                    return ServiceControlHandlerResult::Other(1);
+                }
+                
+                ServiceControlHandlerResult::NoError
+            }
+            ServiceControl::UserEvent(code) if code == SERVICE_CONTROL_RELOAD_CONFIG => {
+                // UserEventCode wrapper guarantees code is in range 128-255
+                // Code 128 is used for configuration reload
+                // Usage: sc control kodegend 128
+                info!("Received SERVICE_CONTROL_RELOAD_CONFIG (code 128)");
+                
+                // Send reload signal to main loop via service's reload channel
+                // This will be forwarded to ServiceManager's reload channel
+                if let Err(e) = reload_tx.send(()) {
+                    error!("Failed to send reload signal to service loop: {}", e);
+                    return ServiceControlHandlerResult::Other(1);
+                }
+                
+                ServiceControlHandlerResult::NoError
+            }
+            ServiceControl::UserEvent(code) => {
+                // Codes 128-255 are user-defined, but we only support code 128 (reload)
+                warn!("Received unsupported user control code: {:?} (only code 128 is supported)", code);
                 ServiceControlHandlerResult::NotImplemented
             }
             _ => {
@@ -336,8 +501,11 @@ fn report_service_status(
     wait_hint: Duration,
     exit_code: u32,
 ) -> Result<()> {
-    let controls_accepted = if current_state == ServiceState::Running {
-        ServiceControlAccept::STOP
+    // Accept PAUSE_CONTINUE when Running or Paused
+    let controls_accepted = if current_state == ServiceState::Running 
+        || current_state == ServiceState::Paused 
+    {
+        ServiceControlAccept::STOP | ServiceControlAccept::PAUSE_CONTINUE
     } else {
         ServiceControlAccept::empty()
     };

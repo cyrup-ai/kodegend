@@ -87,7 +87,7 @@ fn set_windows_certificate_permissions(path: &Path) -> Result<()> {
 
     use windows::Win32::Security::Authorization::SetNamedSecurityInfoW;
     use windows::Win32::Security::{
-        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, Authorization::SE_FILE_OBJECT,
+        ACL, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, Authorization::SE_FILE_OBJECT,
     };
 
     unsafe {
@@ -97,7 +97,7 @@ fn set_windows_certificate_permissions(path: &Path) -> Result<()> {
             DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
             None,                              // Don't change owner
             None,                              // Don't change group
-            Some(std::mem::transmute(sd_ptr)), // Set DACL from security descriptor
+            Some(std::mem::transmute::<PSECURITY_DESCRIPTOR, *const ACL>(sd_ptr)), // Set DACL from security descriptor
             None,                              // Don't change SACL
         );
         if result != WIN32_ERROR(0) {

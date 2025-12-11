@@ -16,6 +16,9 @@ use super::progress::InstallProgress;
 use super::service::ServiceConfig;
 
 #[cfg(windows)]
+use super::super::error::InstallerError;
+
+#[cfg(windows)]
 use windows::{
     Win32::Foundation::{CloseHandle, GetLastError, HWND},
     Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject},
@@ -512,7 +515,7 @@ impl InstallContext {
             lpFile: PCWSTR(exe_path_wide.as_ptr()),
             lpParameters: PCWSTR(args_wide.as_ptr()),
             lpDirectory: PCWSTR::null(),
-            nShow: SW_SHOWNORMAL.0 as i32, // Show window normally
+            nShow: SW_SHOWNORMAL.0,  // SW_SHOWNORMAL.0 is already i32
             hInstApp: Default::default(),
             lpIDList: std::ptr::null_mut(),
             lpClass: PCWSTR::null(),
@@ -534,9 +537,7 @@ impl InstallContext {
             // Check if user cancelled UAC (ERROR_CANCELLED = 1223)
             let error_code = unsafe { GetLastError() };
             if error_code.0 == 1223 {
-                return Err(anyhow::anyhow!(
-                    "UAC elevation cancelled by user. Administrator privileges are required to install kodegen."
-                ));
+                return Err(InstallerError::Cancelled.into());
             }
 
             return Err(anyhow::anyhow!(

@@ -53,6 +53,14 @@ pub async fn uninstall_kodegen_daemon() -> Result<()> {
         warn!("Failed to remove wildcard certificate from system: {e}");
     }
 
+    // Remove installation directories from Windows PATH
+    #[cfg(target_os = "windows")]
+    {
+        if let Err(e) = remove_from_windows_path() {
+            warn!("Failed to remove kodegen from Windows PATH: {e}");
+        }
+    }
+
     // Clean up installation directories
     if let Err(e) = cleanup_installation_directories() {
         warn!("Failed to clean up installation directories: {e}");
@@ -142,6 +150,8 @@ async fn remove_wildcard_certificate_from_system() -> Result<()> {
             remove_wildcard_certificate_macos().await
         } else if #[cfg(target_os = "linux")] {
             remove_wildcard_certificate_linux().await
+        } else if #[cfg(target_os = "windows")] {
+            remove_wildcard_certificate_windows().await
         } else {
             warn!("Wildcard certificate removal not supported on this platform");
             Ok(())
@@ -209,6 +219,212 @@ async fn remove_wildcard_certificate_linux() -> Result<()> {
     Ok(())
 }
 
+/// Remove wildcard certificate from Windows Root certificate store
+#[cfg(target_os = "windows")]
+async fn remove_wildcard_certificate_windows() -> Result<()> {
+    use windows::Win32::Security::Cryptography::{
+        CERT_FIND_SUBJECT_STR_W, CERT_OPEN_STORE_FLAGS, CERT_QUERY_ENCODING_TYPE,
+        CERT_STORE_PROV_SYSTEM_W, CERT_SYSTEM_STORE_LOCAL_MACHINE,
+        CertCloseStore, CertDeleteCertificateFromStore, CertFindCertificateInStore, CertOpenStore,
+    };
+    use windows::core::HSTRING;
+
+    info!("Removing Kodegen certificate from Windows Root certificate store");
+
+    // Perform CryptoAPI operations in blocking task (sync Win32 API)
+    tokio::task::spawn_blocking(move || {
+        unsafe {
+            // Open the Root certificate store for LOCAL_MACHINE
+            let store_name = HSTRING::from("Root");
+
+            let store_handle = CertOpenStore(
+                CERT_STORE_PROV_SYSTEM_W,
+                CERT_QUERY_ENCODING_TYPE(0),
+                None,
+                CERT_OPEN_STORE_FLAGS(CERT_SYSTEM_STORE_LOCAL_MACHINE),
+                Some(&store_name as *const _ as *const _),
+            )
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to open Root certificate store (error: {}). Ensure running with Administrator privileges.",
+                    e
+                )
+            })?;
+
+            // Ensure store is always closed
+            let _store_guard = scopeguard::guard(store_handle, |handle| {
+                let _ = CertCloseStore(Some(handle), 0);
+            });
+
+            // Search for certificate containing "mcp.kodegen.ai" in subject
+            let search_string = HSTRING::from("mcp.kodegen.ai");
+            
+            let mut cert_context = CertFindCertificateInStore(
+                store_handle,
+                CERT_QUERY_ENCODING_TYPE(0),
+                0,
+                CERT_FIND_SUBJECT_STR_W,
+                Some(&search_string as *const _ as *const _),
+                None,
+            );
+
+            let mut deleted_count = 0;
+
+            // Enumerate and delete all matching certificates
+            // cert_context is *const CERT_CONTEXT - check for null pointer
+            while !cert_context.is_null() {
+                info!("Found Kodegen certificate in Root store, removing...");
+
+                // CertDeleteCertificateFromStore frees the context automatically
+                // We must NOT call CertFreeCertificateContext after this
+                let delete_result = CertDeleteCertificateFromStore(cert_context);
+
+                if delete_result.is_ok() {
+                    deleted_count += 1;
+                    info!("Successfully deleted certificate from Root store");
+                } else {
+                    warn!("Failed to delete certificate from Root store");
+                }
+
+                // Find next matching certificate
+                cert_context = CertFindCertificateInStore(
+                    store_handle,
+                    CERT_QUERY_ENCODING_TYPE(0),
+                    0,
+                    CERT_FIND_SUBJECT_STR_W,
+                    Some(&search_string as *const _ as *const _),
+                    None,
+                );
+            }
+
+            if deleted_count > 0 {
+                info!("✓ Removed {} Kodegen certificate(s) from Windows Root certificate store", deleted_count);
+                Ok(())
+            } else {
+                info!("Kodegen certificate not found in Windows Root store");
+                Ok(())
+            }
+        }
+    })
+    .await
+    .context("Task panicked during certificate removal")?
+}
+
+/// Remove Kodegen installation directories from Windows system PATH
+///
+/// Reads the current system PATH from the registry, removes any entries that match
+/// Kodegen installation directories (both System and User scope), writes the cleaned
+/// PATH back to the registry, and broadcasts WM_SETTINGCHANGE to notify running processes.
+#[cfg(target_os = "windows")]
+fn remove_from_windows_path() -> Result<()> {
+    use std::process::Command;
+
+    info!("Removing Kodegen directories from Windows system PATH");
+
+    // Get list of installation directories to remove
+    let dirs_to_remove = get_installation_directories();
+    let dirs_to_remove_strings: Vec<String> = dirs_to_remove
+        .iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
+
+    // Read current PATH from registry
+    let output = Command::new("reg")
+        .args([
+            "query",
+            r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+            "/v",
+            "Path",
+        ])
+        .output()
+        .context("Failed to query system PATH registry")?;
+
+    let current_path = String::from_utf8_lossy(&output.stdout);
+
+    // Extract current PATH value (after "REG_EXPAND_SZ" or "REG_SZ")
+    let path_value = current_path
+        .lines()
+        .find(|line| line.contains("REG_"))
+        .and_then(|line| {
+            // Format is "    Path    REG_EXPAND_SZ    value"
+            let parts: Vec<&str> = line.splitn(3, "    ").collect();
+            parts.get(2).map(|s| s.trim())
+        })
+        .unwrap_or("");
+
+    if path_value.is_empty() {
+        info!("System PATH is empty, nothing to remove");
+        return Ok(());
+    }
+
+    // Split PATH into individual entries and filter out Kodegen directories
+    let path_entries: Vec<&str> = path_value.split(';').collect();
+    let mut filtered_entries = Vec::new();
+    let mut removed_count = 0;
+
+    for entry in path_entries {
+        let entry_trimmed = entry.trim();
+        if entry_trimmed.is_empty() {
+            continue;
+        }
+
+        // Check if this entry matches any Kodegen installation directory (case-insensitive)
+        let should_remove = dirs_to_remove_strings.iter().any(|dir| {
+            entry_trimmed.eq_ignore_ascii_case(dir)
+        });
+
+        if should_remove {
+            info!("Removing from PATH: {}", entry_trimmed);
+            removed_count += 1;
+        } else {
+            filtered_entries.push(entry_trimmed);
+        }
+    }
+
+    if removed_count == 0 {
+        info!("No Kodegen directories found in PATH, nothing to remove");
+        return Ok(());
+    }
+
+    // Reconstruct PATH with filtered entries
+    let new_path = filtered_entries.join(";");
+
+    // Write cleaned PATH back to registry
+    let status = Command::new("reg")
+        .args([
+            "add",
+            r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+            "/v",
+            "Path",
+            "/t",
+            "REG_EXPAND_SZ",
+            "/d",
+            &new_path,
+            "/f",
+        ])
+        .status()
+        .context("Failed to update system PATH registry")?;
+
+    if !status.success() {
+        return Err(anyhow::anyhow!("Failed to write cleaned PATH to registry"));
+    }
+
+    // Broadcast WM_SETTINGCHANGE to notify running processes (best effort)
+    let _ = Command::new("powershell")
+        .args([
+            "-Command",
+            "Add-Type -Namespace Win32 -Name NativeMethods -MemberDefinition '[DllImport(\"user32.dll\", SetLastError = true, CharSet = CharSet.Auto)] public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wParam, string lParam, uint fuFlags, uint uTimeout, out UIntPtr lpdwResult);'; $HWND_BROADCAST = [IntPtr]0xffff; $WM_SETTINGCHANGE = 0x1a; $result = [UIntPtr]::Zero; [Win32.NativeMethods]::SendMessageTimeout($HWND_BROADCAST, $WM_SETTINGCHANGE, [UIntPtr]::Zero, 'Environment', 2, 5000, [ref]$result)",
+        ])
+        .status();
+
+    info!("Successfully removed {} Kodegen director{} from system PATH", 
+        removed_count, 
+        if removed_count == 1 { "y" } else { "ies" }
+    );
+
+    Ok(())
+}
+
 /// Clean up installation directories with comprehensive cleanup
 #[allow(dead_code)] // Function IS used at line 56, but compiler doesn't track usage correctly
 fn cleanup_installation_directories() -> Result<()> {
@@ -257,7 +473,9 @@ fn get_installation_directories() -> Vec<PathBuf> {
         dirs.push(paths::installer_data_dir());
 
         use crate::install::installer::windows::paths::{InstallScope, install_dir};
+        // Add both System and User scope installation directories
         dirs.push(install_dir(InstallScope::System));
+        dirs.push(install_dir(InstallScope::User));
     }
 
     // Common legacy directories

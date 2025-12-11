@@ -9,7 +9,11 @@
 //! This replaces the incorrect extract-and-copy approach with proper package
 //! installation using platform-native tools and package managers.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
+#[cfg(not(target_os = "linux"))]
+#[allow(unused_imports)]
+use anyhow::anyhow;
+#[allow(unused_imports)]
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 
@@ -447,12 +451,6 @@ async fn install_windows_packages(
 
         log::info!("Installer completed successfully");
 
-        // Add to system PATH
-        log::info!("Adding installation directory to PATH");
-        add_to_windows_path(r"C:\Program Files\Kodegen", executor)
-            .await
-            .context("Failed to add to Windows PATH")?;
-
         // Clean up installer
         if let Err(e) = tokio::fs::remove_file(installer_path).await {
             log::warn!("Failed to remove installer file (non-fatal): {}", e);
@@ -462,33 +460,7 @@ async fn install_windows_packages(
     Ok(())
 }
 
-/// Add directory to Windows system PATH
-///
-/// Modifies HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Session Manager\Environment
-/// Requires Administrator privileges
-#[cfg(target_os = "windows")]
-async fn add_to_windows_path(
-    dir: &str,
-    executor: &mut PrivilegedExecutor,
-) -> Result<()> {
-    // PowerShell command to add to system PATH
-    let ps_command = format!(
-        "$currentPath = [Environment]::GetEnvironmentVariable('Path', 'Machine'); \
-         if ($currentPath -notlike '*{}*') {{ \
-             [Environment]::SetEnvironmentVariable('Path', $currentPath + ';{}', 'Machine') \
-         }}",
-        dir, dir
-    );
 
-    executor
-        .exec(&["powershell", "-Command", &ps_command])
-        .await
-        .context("Failed to modify Windows PATH")?;
-
-    log::info!("Successfully added {} to system PATH", dir);
-
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {

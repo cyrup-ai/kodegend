@@ -94,6 +94,7 @@ use std::os::unix::fs::{OpenOptionsExt, MetadataExt, PermissionsExt};
 use nix::unistd::{Uid, geteuid};
 
 use crate::platform;
+use crate::platform::signal::SignalMask;
 
 // systemd notification helpers
 //
@@ -980,6 +981,69 @@ fn handle_write_error(e: std::io::Error, path: &Path) -> anyhow::Error {
     anyhow::Error::from(e).context(format!("Failed to write PID file: {}", path.display()))
 }
 
+/// Handle write errors with specific context for disk full (ERROR_DISK_FULL)
+///
+/// Windows equivalent of Unix ENOSPC handling. Detects ERROR_DISK_FULL (0x70)
+/// and provides actionable error messages with Windows-specific diagnostic commands.
+///
+/// Uses the `windows` crate's ERROR_DISK_FULL constant for type-safe error detection.
+/// This matches the pattern used elsewhere in the codebase (see platform/windows/mod.rs).
+///
+/// # Arguments
+/// * `e` - The I/O error from write/sync operation
+/// * `path` - Path to the PID file being written
+///
+/// # Returns
+/// `anyhow::Error` with specific context based on error type
+///
+/// # Platform Notes
+/// ERROR_DISK_FULL (0x70 / 112) is returned by Windows file system APIs when:
+/// - The volume is completely full
+/// - No free space available for the write operation
+/// - Quota limit exceeded for the user/process
+///
+/// # See Also
+/// - Unix equivalent: `handle_write_error()` for ENOSPC
+/// - Error code reference: https://learn.microsoft.com/en-us/windows/win32/debug/system-error-codes--0-499-
+#[cfg(windows)]
+fn handle_write_error(e: std::io::Error, path: &Path) -> anyhow::Error {
+    use windows::Win32::Foundation::ERROR_DISK_FULL;
+    
+    // Check if this is a "disk full" error
+    if let Some(os_error) = e.raw_os_error() {
+        // ERROR_DISK_FULL = 0x70 (112 decimal)
+        // Compare as u32 because WIN32_ERROR wraps a u32
+        if os_error as u32 == ERROR_DISK_FULL.0 {
+            // Extract drive letter from path for targeted diagnostic command
+            let drive = path
+                .components()
+                .next()
+                .and_then(|c| {
+                    let s = c.as_os_str().to_string_lossy();
+                    s.chars().next().filter(|ch| ch.is_ascii_alphabetic())
+                })
+                .unwrap_or('C');
+            
+            return anyhow!(
+                "Cannot write PID file: Disk is full\n\
+                 File: {}\n\n\
+                 The disk is full. Free up disk space and try again.\n\
+                 Check disk usage in PowerShell:\n\
+                 \n\
+                 Get-PSDrive {} | Select-Object Used,Free\n\
+                 \n\
+                 Or check all volumes:\n\
+                 Get-Volume | Select-Object DriveLetter,SizeRemaining,Size",
+                path.display(),
+                drive
+            );
+        }
+    }
+    
+    // Generic error with context
+    anyhow::Error::from(e).context(format!("Failed to write PID file: {}", path.display()))
+}
+
 impl PidFile {
     /// Create and validate PID file with atomic file locking
     ///
@@ -1024,6 +1088,19 @@ impl PidFile {
         
         // Validate parent directory security (even if we didn't create it)
         validate_pid_file_security(&path)?;
+
+        // ========================================
+        // CRITICAL SECTION (SIGNALS BLOCKED)
+        // ========================================
+        
+        // Block all signals during atomic PID file creation
+        // This prevents SIGTERM/SIGINT from interrupting the sequence:
+        //   open → lock → write → sync
+        // Signals are queued by the kernel and delivered after guard drops.
+        let _signal_guard = SignalMask::block_all()
+            .context("Failed to block signals during PID file creation")?;
+        
+        log::debug!("PID file creation: signals blocked during atomic operation");
 
         // Open PID file with O_CREAT | O_RDWR | O_NOFOLLOW
         // We use O_CREAT (not O_EXCL) because we need to handle stale locks
@@ -1172,6 +1249,10 @@ impl PidFile {
             our_pid
         );
 
+        // Signal guard drops here - signals now delivered
+        drop(_signal_guard);
+        log::debug!("PID file creation complete: signals unblocked");
+
         // Return PidFile with lock guard
         // Lock will be held for entire daemon lifetime
         Ok(Self {
@@ -1209,15 +1290,77 @@ impl PidFile {
         validate_pid_file_security(&path)?;
 
         // ========================================
-        // WRITE PID FILE
+        // CHECK FOR EXISTING PID FILE
         // ========================================
 
-        // Simple write without locking (SCM handles instance uniqueness)
+        // If PID file exists, verify it's stale before overwriting
+        if path.exists()
+            && let Ok(existing_content) = fs::read_to_string(&path)
+            && let Ok(existing_pid) = existing_content.trim().parse::<platform::ProcessId>()
+        {
+            // CRITICAL SECURITY: Validate PID before using it
+            if let Err(e) = platform::validate_pid_range(existing_pid) {
+                warn!(
+                    "Existing PID file {} contains invalid PID: {}. Treating as stale.",
+                    path.display(),
+                    e
+                );
+                // Continue - will overwrite the invalid PID file
+            } else {
+                // PID is in valid range, check if process is running as kodegend
+                match platform::verify_kodegend_running(existing_pid) {
+                    Ok(true) => {
+                        // Process exists AND is kodegend
+                        // On Windows, SCM should prevent this, but check anyway
+                        return Err(anyhow!(
+                            "Daemon appears to be running as kodegend (PID {}). \
+                             Cannot create PID file.\n\
+                             \n\
+                             Use 'kodegend stop' to stop the existing daemon first.\n\
+                             Or check Windows Service Control Manager for running kodegend service.",
+                            existing_pid
+                        ));
+                    }
+                    Ok(false) => {
+                        // Process doesn't exist OR is not kodegend - safe to overwrite
+                        warn!(
+                            "Overwriting stale/hijacked PID file {} (PID {} is not running kodegend)",
+                            path.display(),
+                            existing_pid
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Cannot verify PID {} status: {}. Proceeding to overwrite PID file.",
+                            existing_pid, e
+                        );
+                    }
+                }
+            }
+        }
+
+        // ========================================
+        // CRITICAL SECTION (SIGNALS DEFERRED)
+        // ========================================
+        
+        // Enter critical section - console event handlers will defer signal processing
+        let _signal_guard = SignalMask::block_all()
+            .context("Failed to enter critical section during PID file creation")?;
+        
+        log::debug!("PID file creation: entered critical section (signals deferred)");
+
+        // Write PID file with disk full error checking
+        // Uses handle_write_error() for Windows-specific error handling (ERROR_DISK_FULL)
         let pid = std::process::id();
-        fs::write(&path, pid.to_string())
-            .with_context(|| format!("Writing PID file: {}", path.display()))?;
+        if let Err(e) = fs::write(&path, pid.to_string()) {
+            return Err(handle_write_error(e, &path));
+        }
 
         info!("Created PID file: {} (PID: {})", path.display(), pid);
+
+        // Signal guard drops here - signal handling resumed
+        drop(_signal_guard);
+        log::debug!("PID file creation complete: critical section exited");
 
         Ok(Self { path })
     }
@@ -1618,24 +1761,37 @@ pub fn get_service_status(pid_file: &Path) -> Result<ServiceStatus> {
         }
     };
     
-    // Step 3: Check if process is running
-    let process_running = match platform::is_process_running(pid) {
-        Ok(running) => running,
+    // Step 3: Check if process is running AND is kodegend
+    match platform::verify_kodegend_running(pid) {
+        Ok(true) => {
+            // Process exists AND is kodegend - continue to zombie check
+        }
+        Ok(false) => {
+            // Process doesn't exist OR is NOT kodegend
+            // Treat as stale PID file (PID reused by another process)
+            log::warn!(
+                "PID file {} contains PID {} which is not kodegend (PID reuse or stale file)",
+                pid_file.display(),
+                pid
+            );
+            return Ok(ServiceStatus::StaleFile { pid });
+        }
         Err(e) => {
-            // Unexpected error checking process status
-            // Treat as invalid file rather than crashing
+            // Cannot verify - permission denied or system error
+            // Fail safe: treat as invalid file
+            log::warn!(
+                "Cannot verify PID {} from file {}: {}",
+                pid,
+                pid_file.display(),
+                e
+            );
             return Ok(ServiceStatus::InvalidFile {
-                error: format!("Cannot verify process status: {}", e),
+                error: format!("Cannot verify PID {} belongs to kodegend: {}", pid, e),
             });
         }
-    };
-    
-    if !process_running {
-        // Process not running = stale PID file
-        return Ok(ServiceStatus::StaleFile { pid });
     }
     
-    // Step 4: Process is running - check if it's a zombie
+    // Step 4: Verified as kodegend - check if it's a zombie
     match is_zombie_process(pid) {
         Ok(true) => {
             // Process exists but is a zombie (defunct)

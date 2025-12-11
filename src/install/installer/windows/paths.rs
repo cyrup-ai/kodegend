@@ -80,6 +80,7 @@ pub fn kodegend_exe(scope: InstallScope) -> PathBuf {
 }
 
 /// Get the kodegen CLI executable path
+#[allow(dead_code)]
 pub fn kodegen_exe(scope: InstallScope) -> PathBuf {
     install_dir(scope).join("kodegen.exe")
 }
@@ -118,27 +119,6 @@ pub fn hosts_file() -> PathBuf {
     std::env::var("SystemRoot")
         .map(|root| PathBuf::from(root).join(r"System32\drivers\etc\hosts"))
         .unwrap_or_else(|_| PathBuf::from(r"C:\Windows\System32\drivers\etc\hosts"))
-}
-
-/// Get the Windows temp directory
-///
-/// Uses Rust standard library temp_dir() which reads %TEMP% environment variable
-pub fn temp_dir() -> PathBuf {
-    std::env::temp_dir()
-}
-
-/// Create a unique temp file for certificate import
-///
-/// Returns a NamedTempFile that will be automatically cleaned up when dropped.
-/// The caller can write certificate content to it and use .path() to get the path.
-pub fn temp_cert_file() -> Result<tempfile::NamedTempFile> {
-    use tempfile::Builder;
-
-    Builder::new()
-        .prefix("kodegen_cert_")
-        .suffix(".crt")
-        .tempfile()
-        .context("Failed to create temp certificate file")
 }
 
 /// Create all standard installer directories

@@ -17,17 +17,10 @@
 pub mod macos;
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(windows)]
+mod windows;
 
 use anyhow::{Context, Result};
-
-#[cfg(windows)]
-use windows::{
-    Win32::Foundation::{CloseHandle, GetLastError, HWND},
-    Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject},
-    Win32::UI::Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW},
-    Win32::UI::WindowsAndMessaging::SW_HIDE,
-    core::PCWSTR,
-};
 
 
 // ============================================================================
@@ -78,6 +71,7 @@ use tokio::process::Command as TokioCommand;
 /// - macOS GUI: AuthorizationServices
 /// - Linux CLI: Sudo
 /// - Linux GUI: PolicyKit
+/// - Windows: UAC
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy)]
 enum PrivilegeMode {
@@ -94,6 +88,16 @@ enum PrivilegeMode {
     /// Linux GUI mode: use PolicyKit (pkexec)
     #[cfg(target_os = "linux")]
     PolicyKit,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy)]
+enum PrivilegeMode {
+    /// Already running as Administrator - no elevation needed
+    AlreadyElevated,
+
+    /// Windows UAC elevation
+    Uac,
 }
 
 #[cfg(unix)]
@@ -346,6 +350,14 @@ fn shell_quote_args(args: &[&str]) -> String {
         .join(" ")
 }
 
+/// Quote shell arguments for Windows cmd.exe
+///
+/// Joins arguments with proper escaping for passing to cmd.exe
+#[cfg(windows)]
+fn shell_quote_args(args: &[&str]) -> String {
+    args.join(" ")
+}
+
 /// Helper for sudo mode (Unix CLI)
 ///
 /// Checks if sudo credentials are cached, prompts if needed.
@@ -379,89 +391,133 @@ async fn spawn_sudo_mode() -> Result<PrivilegedExecutor> {
     })
 }
 
-// Windows implementation using UAC elevation via helper executable
+// Windows implementation using UAC self-elevation
+#[cfg(windows)]
+use std::path::Path;
+#[cfg(windows)]
+use tokio::process::Command as TokioCommand;
+
 #[cfg(windows)]
 pub struct PrivilegedExecutor {
-    helper_path: std::path::PathBuf,
+    mode: PrivilegeMode,
 }
 
 #[cfg(windows)]
 impl PrivilegedExecutor {
     /// Spawn privileged executor using Windows UAC
     ///
-    /// Extracts and verifies the KodegenHelper.exe which has requireAdministrator
-    /// manifest, causing UAC prompt when first invoked.
+    /// Checks if already elevated, otherwise prepares for UAC elevation
     pub async fn spawn() -> Result<Self> {
-        use crate::install::installer::windows::privileges::{ensure_helper_path, HELPER_PATH};
+        use crate::install::installer::windows::privileges::check_privileges;
 
-        // Extract and verify helper executable (shows UAC if needed)
-        ensure_helper_path()?;
+        // Check if already elevated (running as Administrator)
+        if check_privileges().is_ok() {
+            log::info!("Already running with Administrator privileges");
+            return Ok(Self {
+                mode: PrivilegeMode::AlreadyElevated,
+            });
+        }
 
-        let helper_path = HELPER_PATH
-            .get()
-            .ok_or_else(|| anyhow::anyhow!("Helper path not initialized"))?
-            .clone();
-
-        Ok(Self { helper_path })
+        // Not elevated - will need UAC for each operation
+        log::info!("Not elevated - will use UAC for privileged operations");
+        Ok(Self {
+            mode: PrivilegeMode::Uac,
+        })
     }
 
-    /// Execute command with elevated privileges via helper
+    /// Execute command with elevated privileges
     pub async fn exec(&self, args: &[&str]) -> Result<()> {
         if args.is_empty() {
             anyhow::bail!("exec() called with empty args");
         }
 
-        let status = tokio::process::Command::new(&self.helper_path)
-            .args(args)
-            .status()
-            .await
-            .context("Failed to execute privileged command")?;
+        log::debug!("Executing privileged command: {}", args.join(" "));
 
-        if !status.success() {
-            anyhow::bail!("Privileged command failed: {:?}", args);
+        match self.mode {
+            PrivilegeMode::AlreadyElevated => {
+                // Already Administrator - run directly
+                let output = TokioCommand::new(args[0])
+                    .args(&args[1..])
+                    .output()
+                    .await
+                    .with_context(|| format!("Failed to execute {}", args[0]))?;
+
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    anyhow::bail!("Command {:?} failed: {}", args, stderr.trim());
+                }
+                Ok(())
+            }
+
+            PrivilegeMode::Uac => {
+                // Not elevated - use UAC
+                let command = shell_quote_args(args);
+                windows::execute_privileged_windows(&command)
+                    .map_err(|e| anyhow::anyhow!("UAC elevation failed: {}", e))?;
+                Ok(())
+            }
+
+            #[cfg(target_os = "macos")]
+            _ => unreachable!("macOS-specific modes on Windows"),
+            #[cfg(target_os = "linux")]
+            _ => unreachable!("Linux-specific modes on Windows"),
         }
-
-        Ok(())
     }
 
     /// Write file with elevated privileges
-    pub async fn write_file(&self, path: &std::path::Path, content: &str) -> Result<()> {
-        // Create parent directory first
-        if let Some(parent) = path.parent() {
-            if !parent.exists() {
-                self.exec(&["cmd", "/c", "mkdir", &parent.to_string_lossy()]).await?;
-            }
+    pub async fn write_file(&self, path: &Path, content: &str) -> Result<()> {
+        // Create parent directory first (uses same dispatch via self.exec)
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+            && !parent.exists()
+        {
+            let parent_str = parent.to_string_lossy();
+            self.exec(&["cmd", "/c", "mkdir", &parent_str])
+                .await?;
         }
 
-        // Write content to temp file first (unprivileged)
-        let temp_dir = std::env::temp_dir();
-        let temp_file = temp_dir.join(format!("kodegen_temp_{}", uuid::Uuid::new_v4()));
-        tokio::fs::write(&temp_file, content).await?;
+        match self.mode {
+            PrivilegeMode::AlreadyElevated => {
+                // Already Administrator - write directly
+                tokio::fs::write(path, content)
+                    .await
+                    .with_context(|| format!("Failed to write {}", path.display()))?;
+            }
 
-        // Copy temp file to destination with privileges
-        self.exec(&[
-            "cmd",
-            "/c",
-            "copy",
-            "/Y",
-            &temp_file.to_string_lossy(),
-            &path.to_string_lossy(),
-        ])
-        .await?;
+            PrivilegeMode::Uac => {
+                // Not elevated - write to temp, then copy with UAC
+                let temp_dir = std::env::temp_dir();
+                let temp_file = temp_dir.join(format!("kodegen_temp_{}.txt", uuid::Uuid::new_v4()));
+                
+                tokio::fs::write(&temp_file, content)
+                    .await
+                    .context("Failed to write temp file")?;
 
-        // Clean up temp file
-        let _ = tokio::fs::remove_file(&temp_file).await;
+                let temp_str = temp_file.to_string_lossy();
+                let dest_str = path.to_string_lossy();
+                self.exec(&["cmd", "/c", "copy", "/Y", &temp_str, &dest_str])
+                    .await?;
+
+                // Clean up temp file
+                let _ = tokio::fs::remove_file(&temp_file).await;
+            }
+
+            #[cfg(target_os = "macos")]
+            _ => unreachable!("macOS-specific modes on Windows"),
+            #[cfg(target_os = "linux")]
+            _ => unreachable!("Linux-specific modes on Windows"),
+        }
 
         Ok(())
     }
 
     /// Set file permissions (Windows ACL)
-    pub async fn chmod(&self, path: &std::path::Path, _mode: &str) -> Result<()> {
+    pub async fn chmod(&self, path: &Path, _mode: &str) -> Result<()> {
         // Windows uses icacls for permissions
-        // Reset to owner-only access (equivalent to Unix 600/755)
+        let path_str = path.to_string_lossy();
         self.exec(&[
             "icacls",
-            &path.to_string_lossy(),
+            &path_str,
             "/inheritance:r",
             "/grant:r",
             "*S-1-5-32-544:(F)", // Administrators: Full

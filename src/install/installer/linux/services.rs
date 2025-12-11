@@ -4,7 +4,6 @@
 //! configuration directory with proper permissions.
 
 use std::fs;
-use std::path::PathBuf;
 
 use kodegen_config::KodegenConfig;
 

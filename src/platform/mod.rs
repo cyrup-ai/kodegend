@@ -240,3 +240,9 @@ pub use signal::{SignalKind, SignalWatcher, watch_signals};
 // GUI detection for installation wizard
 mod gui_detection;
 pub use gui_detection::is_gui_available;
+
+// macOS watchdog for service health monitoring
+#[cfg(target_os = "macos")]
+pub mod macos_watchdog;
+#[cfg(target_os = "macos")]
+pub use macos_watchdog::WatchdogHandle;

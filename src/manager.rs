@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, bounded, select, tick};
 use log::{error, info};
 
-use crate::config::ServiceConfig;
+use crate::config::{ServiceConfig, ConfigBackupManager};
 use crate::ipc::{Cmd, Evt, ServiceState};
 use crate::lifecycle::Lifecycle;
 use crate::platform::{SignalKind, watch_signals};
@@ -90,6 +90,245 @@ pub struct ServiceManager {
     /// way to trigger graceful shutdown.
     #[cfg_attr(not(windows), allow(dead_code))]
     shutdown_tx: Sender<()>,
+
+    /// External config reload trigger channel
+    /// 
+    /// Allows Windows service control handler to trigger config reload via
+    /// custom control code 128. The run() loop monitors this receiver and
+    /// calls reload_config() when signaled.
+    /// 
+    /// This provides Windows service mode equivalent to Unix SIGHUP/CTRL+BREAK.
+    /// On non-Windows platforms, this is always None
+    reload_rx: Option<Receiver<()>>,
+
+    /// Sender half of reload channel - used by Windows service control handler
+    /// On non-Windows platforms, this is always None
+    #[cfg_attr(not(windows), allow(dead_code))]
+    reload_tx: Option<Sender<()>>,
+
+    /// Windows service pause signal receiver
+    /// When SCM sends SERVICE_CONTROL_PAUSE, this receives ()
+    /// On non-Windows platforms, this is always None
+    pause_rx: Option<Receiver<()>>,
+    
+    /// Windows service continue signal receiver  
+    /// When SCM sends SERVICE_CONTROL_CONTINUE, this receives ()
+    /// On non-Windows platforms, this is always None
+    continue_rx: Option<Receiver<()>>,
+
+    /// Shutdown flag for Windows named pipe accept thread
+    /// 
+    /// Allows graceful shutdown of the blocking accept thread by signaling
+    /// it to exit on the next timeout cycle (100ms max delay).
+    #[cfg(windows)]
+    pipe_accept_shutdown: Option<Arc<std::sync::atomic::AtomicBool>>,
+
+    /// Watchdog heartbeat timestamp for Windows internal watchdog
+    /// 
+    /// Updated by main event loop on each iteration. Watchdog thread checks
+    /// this timestamp every 15 seconds and exits if >30 seconds stale,
+    /// triggering SCM recovery actions.
+    #[cfg(windows)]
+    watchdog_state: Arc<std::sync::Mutex<Instant>>,
+
+    /// Watchdog monitoring thread handle
+    /// 
+    /// Background thread that monitors watchdog_state and exits the process
+    /// if heartbeat becomes stale (>30s). This triggers Windows SCM recovery
+    /// actions configured in service_creation.rs.
+    #[cfg(windows)]
+    #[allow(dead_code)]
+    watchdog_thread: Option<std::thread::JoinHandle<()>>,
+
+    /// macOS internal watchdog handle
+    /// 
+    /// Self-monitoring watchdog thread that checks heartbeat every 15 seconds
+    /// and exits if >30 seconds stale, triggering launchd restart via KeepAlive.
+    /// 
+    /// Linux uses native systemd WatchdogSec, Windows uses internal watchdog,
+    /// macOS uses this WatchdogHandle for equivalent functionality.
+    #[cfg(target_os = "macos")]
+    macos_watchdog: Option<crate::platform::WatchdogHandle>,
+}
+
+/// Result type for non-blocking named pipe accept operations
+#[cfg(windows)]
+enum AcceptResult {
+    Connected,
+    Timeout,
+    Error(std::io::Error),
+}
+
+/// Accept a connection on a Windows named pipe with timeout using overlapped I/O
+/// 
+/// This function converts blocking ConnectNamedPipe to non-blocking operation
+/// with a timeout, enabling graceful shutdown of the accept thread.
+/// 
+/// # Arguments
+/// * `listener` - The named pipe instance to accept on
+/// * `timeout` - Maximum time to wait for a connection
+/// 
+/// # Returns
+/// * `AcceptResult::Connected` - Client connected successfully
+/// * `AcceptResult::Timeout` - No client connected within timeout
+/// * `AcceptResult::Error` - An error occurred
+#[cfg(windows)]
+fn accept_connection_with_timeout(
+    listener: &mut crate::platform::windows::named_pipe::NamedPipeStream,
+    timeout: Duration,
+) -> AcceptResult {
+    use windows::Win32::Foundation::GetLastError;
+    use windows::Win32::System::IO::{CancelIo, GetOverlappedResult, OVERLAPPED};
+    use windows::Win32::System::Pipes::ConnectNamedPipe;
+    use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+
+    // Create event for overlapped operation
+    let event_handle = match unsafe { CreateEventW(None, true, false, None) } {
+        Ok(handle) => handle,
+        Err(e) => {
+            return AcceptResult::Error(std::io::Error::other(format!(
+                "CreateEventW failed: {}",
+                e
+            )));
+        }
+    };
+
+    // RAII cleanup for event handle
+    let _guard = scopeguard::guard(event_handle, |handle| unsafe {
+        let _ = CloseHandle(handle);
+    });
+
+    // Initialize overlapped structure
+    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    overlapped.hEvent = event_handle;
+
+    // Start asynchronous connect
+    let connect_result = unsafe { ConnectNamedPipe(listener.as_raw_handle(), Some(&mut overlapped)) };
+
+    // Handle immediate completion or pending operation
+    if let Err(e) = connect_result {
+        let error_code = unsafe { GetLastError() };
+
+        // ERROR_IO_PENDING (997) means async operation started successfully
+        if error_code.0 != 997 {
+            // ERROR_PIPE_CONNECTED (535) means client already connected
+            // This can happen if client connects between CreateNamedPipe and ConnectNamedPipe
+            if error_code.0 == 535 {
+                return AcceptResult::Connected;
+            }
+
+            // Actual error
+            return AcceptResult::Error(std::io::Error::other(format!(
+                "ConnectNamedPipe failed: {}",
+                e
+            )));
+        }
+    }
+
+    // Wait for connection with timeout
+    let timeout_ms = timeout.as_millis().min(u32::MAX as u128) as u32;
+    let wait_result = unsafe { WaitForSingleObject(event_handle, timeout_ms) };
+
+    match wait_result {
+        WAIT_OBJECT_0 => {
+            // Connection completed - verify success
+            let mut transferred = 0u32;
+            match unsafe {
+                GetOverlappedResult(
+                    listener.as_raw_handle(),
+                    &overlapped,
+                    &mut transferred,
+                    false, // Don't wait (already signaled)
+                )
+            } {
+                Ok(_) => AcceptResult::Connected,
+                Err(e) => AcceptResult::Error(std::io::Error::other(format!(
+                    "GetOverlappedResult failed: {}",
+                    e
+                ))),
+            }
+        }
+        WAIT_TIMEOUT => {
+            // Timeout expired - no client connected
+            // Cancel pending operation
+            unsafe {
+                let _ = CancelIo(listener.as_raw_handle());
+            }
+            AcceptResult::Timeout
+        }
+        _ => {
+            // Wait error
+            AcceptResult::Error(std::io::Error::other(format!(
+                "WaitForSingleObject failed: {:?}",
+                wait_result
+            )))
+        }
+    }
+}
+
+/// Spawn internal watchdog thread for Windows
+///
+/// Monitors heartbeat timestamp and exits process if stale (>30s),
+/// triggering Windows SCM recovery actions.
+///
+/// # Architecture
+/// - Watchdog checks every 15 seconds (WatchdogSec/2, matching Linux)
+/// - Timeout after 30 seconds of no heartbeat (matching Linux WatchdogSec)
+/// - On timeout: logs to Windows Event Log, then calls std::process::exit(1)
+/// - Exit triggers SCM recovery actions (restart after 5s, 10s, 30s)
+///
+/// # Arguments
+/// * `state` - Shared timestamp updated by main event loop
+///
+/// # Returns
+/// JoinHandle for the watchdog thread (can be ignored or joined on shutdown)
+#[cfg(windows)]
+fn spawn_watchdog_thread(state: Arc<std::sync::Mutex<Instant>>) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let watchdog_interval = Duration::from_secs(15); // Check every 15s
+        let watchdog_timeout = Duration::from_secs(30);  // Timeout after 30s
+        
+        loop {
+            std::thread::sleep(watchdog_interval);
+            
+            // Check heartbeat timestamp
+            let elapsed = {
+                let last_heartbeat = state.lock().unwrap_or_else(|poisoned| {
+                    // Mutex poisoned (panic in another thread) - this is a critical failure
+                    // Treat as timeout to trigger restart
+                    error!("Watchdog mutex poisoned, forcing restart");
+                    poisoned.into_inner()
+                });
+                last_heartbeat.elapsed()
+            };
+            
+            if elapsed > watchdog_timeout {
+                error!("Watchdog timeout: no heartbeat for {:?}, forcing restart", elapsed);
+                
+                // Log to Windows Event Log before exit
+                // Use eventlog crate (already in Cargo.toml)
+                match eventlog::init("kodegend", log::Level::Error) {
+                    Ok(()) => {
+                        log::error!(
+                            "kodegend watchdog timeout after {:?}, initiating restart via SCM recovery", 
+                            elapsed
+                        );
+                    }
+                    Err(e) => {
+                        // Event log initialization failed - still exit but log to stderr
+                        eprintln!("Failed to log to Event Log: {}", e);
+                        eprintln!("kodegend watchdog timeout after {:?}, initiating restart", elapsed);
+                    }
+                }
+                
+                // Exit to trigger SCM recovery actions
+                std::process::exit(1);
+            }
+            
+            log::trace!("Watchdog: last heartbeat {:?} ago", elapsed);
+        }
+    })
 }
 
 impl ServiceManager {
@@ -192,6 +431,30 @@ impl ServiceManager {
         // Bounded channel (size 1) for external shutdown trigger (Windows service, API, etc.)
         let (shutdown_tx, shutdown_rx) = bounded::<()>(1);
 
+        // Initialize config reload coordination channel (Windows only)
+        // Used by Windows service control handler to trigger reload via custom control code 128
+        #[cfg(windows)]
+        let (reload_tx, reload_rx) = bounded::<()>(1);
+
+        // Initialize Windows watchdog thread
+        #[cfg(windows)]
+        let watchdog_state = Arc::new(std::sync::Mutex::new(Instant::now()));
+        #[cfg(windows)]
+        let watchdog_thread = {
+            let state = watchdog_state.clone();
+            Some(spawn_watchdog_thread(state))
+        };
+
+        // Initialize macOS watchdog thread
+        #[cfg(target_os = "macos")]
+        let macos_watchdog = Some(crate::platform::WatchdogHandle::spawn());
+
+        info!("ServiceManager initialized with {} workers", workers.len());
+        #[cfg(windows)]
+        info!("Windows watchdog thread started (30s timeout, 15s check interval)");
+        #[cfg(target_os = "macos")]
+        info!("macOS watchdog thread started (30s timeout, 15s check interval)");
+
         Ok(Self {
             bus_tx,
             bus_rx,
@@ -206,6 +469,28 @@ impl ServiceManager {
             next_correlation_id: AtomicU64::new(1),
             shutdown_rx,
             shutdown_tx,
+            reload_rx: {
+                #[cfg(windows)]
+                { Some(reload_rx) }
+                #[cfg(not(windows))]
+                { None }
+            },
+            reload_tx: {
+                #[cfg(windows)]
+                { Some(reload_tx) }
+                #[cfg(not(windows))]
+                { None }
+            },
+            pause_rx: None,
+            continue_rx: None,
+            #[cfg(windows)]
+            pipe_accept_shutdown: None,
+            #[cfg(windows)]
+            watchdog_state,
+            #[cfg(windows)]
+            watchdog_thread,
+            #[cfg(target_os = "macos")]
+            macos_watchdog,
         })
     }
 
@@ -321,14 +606,32 @@ impl ServiceManager {
         self.embedded_servers = Some(servers);
     }
 
-    /// Reload configuration from disk and apply changes
+    /// Reload configuration from disk with atomic backup/rollback
     ///
-    /// Compares old and new service definitions:
-    /// - Starts new services
-    /// - Stops removed services  
-    /// - Restarts modified services
+    /// # Process
+    ///
+    /// 1. Create backup of current config file
+    /// 2. Load and validate new config from disk
+    /// 3. Apply service changes (stop/start/restart)
+    /// 4. On success: Commit new config
+    /// 5. On failure: Restore from backup and reload
+    ///
+    /// # Atomicity
+    ///
+    /// Uses backup/rollback pattern from embedded_servers.rs:
+    /// - All changes succeed → new config active
+    /// - Any change fails → backup restored, old config active
+    ///
+    /// # Error Handling
+    ///
+    /// - Backup creation fails → Abort reload, keep current config
+    /// - Config validation fails → Keep current config (no rollback needed)
+    /// - Service changes fail → Rollback to backup, restore services
+    /// - Rollback fails → Critical error logged, manual intervention required
     fn reload_config(&mut self) -> Result<()> {
-        info!("Reloading configuration from disk");
+        info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        info!("Config reload requested (SIGHUP)");
+        info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
         // Read current config to find file path
         let config_path = {
@@ -343,15 +646,105 @@ impl ServiceManager {
             }
         };
 
-        // Load new config from disk
-        let new_cfg = ServiceConfig::load_from_file(&config_path).with_context(|| {
-            format!(
-                "Failed to load updated configuration from {:?}",
-                config_path
-            )
-        })?;
+        info!("Config file: {}", config_path.display());
 
-        // Get old service names
+        // ═══════════════════════════════════════════════════════════════
+        // STEP 1: Create backup before making any changes
+        // ═══════════════════════════════════════════════════════════════
+        
+        let backup_manager = ConfigBackupManager::new(&config_path);
+        let backup_path = backup_manager.create_backup()
+            .context("Failed to create config backup - aborting reload")?;
+        
+        info!("✓ Backup created: {}", backup_path.display());
+
+        // ═══════════════════════════════════════════════════════════════
+        // STEP 2: Load and validate new config
+        // ═══════════════════════════════════════════════════════════════
+        
+        let new_cfg = match ServiceConfig::load_from_file(&config_path, None) {
+            Ok(cfg) => {
+                info!("✓ New config loaded and validated");
+                cfg
+            }
+            Err(e) => {
+                // Config is invalid - keep current config, no rollback needed
+                error!("✗ New config is invalid, keeping current config");
+                return Err(e).context("Config validation failed");
+            }
+        };
+
+        // ═══════════════════════════════════════════════════════════════
+        // STEP 3: Apply changes with rollback on failure
+        // ═══════════════════════════════════════════════════════════════
+        
+        match self.apply_config_changes(&new_cfg) {
+            Ok(_) => {
+                // Success - commit new config
+                *self.config.write() = new_cfg;
+                info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                info!("✓ Config reload successful");
+                info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                Ok(())
+            }
+            Err(e) => {
+                // Failure - rollback to backup
+                error!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                error!("✗ Config apply failed: {:#}", e);
+                error!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                
+                // Restore backup to config file location
+                error!("Attempting rollback to backup...");
+                backup_manager.rollback_from_backup(&backup_path)
+                    .context("Critical: Rollback failed - manual intervention required")?;
+                
+                info!("✓ Backup restored to config file");
+                
+                // Reload from restored backup
+                info!("Reloading services from backup config...");
+                let restored_config = ServiceConfig::load_from_file(&config_path, None)
+                    .context("Critical: Failed to reload from backup")?;
+                
+                // Re-apply restored config to services
+                self.apply_config_changes(&restored_config)
+                    .context("Critical: Failed to apply backup config")?;
+                
+                *self.config.write() = restored_config;
+                
+                error!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                error!("✓ Rolled back to previous config");
+                error!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                
+                Err(e).context("Config reload failed and was rolled back")
+            }
+        }
+    }
+
+    /// Apply configuration changes to services
+    ///
+    /// Compares old vs new service definitions and applies changes:
+    /// - Stops services removed from config
+    /// - Starts services added to config
+    /// - Restarts services with modified definitions
+    ///
+    /// # Arguments
+    ///
+    /// * `new_cfg` - New configuration to apply
+    ///
+    /// # Errors
+    ///
+    /// Returns error on first failure. Caller should rollback config on error.
+    ///
+    /// # Future Enhancement
+    ///
+    /// Currently stops/starts services sequentially. Could be made more atomic by:
+    /// 1. Track all changes to be made
+    /// 2. Validate all changes can be made
+    /// 3. Apply all changes or rollback all
+    ///
+    /// For now, backup/rollback at config file level provides sufficient atomicity.
+    fn apply_config_changes(&mut self, new_cfg: &ServiceConfig) -> Result<()> {
+        // Get old service definitions
         let old_services: HashMap<String, _> = {
             let cfg = self.config.read();
             cfg.services
@@ -360,77 +753,72 @@ impl ServiceManager {
                 .collect()
         };
 
-        // Get new service names
+        // Get new service definitions
         let new_services: HashMap<String, _> = new_cfg
             .services
             .iter()
             .map(|def| (def.name.clone(), def.clone()))
             .collect();
 
+        // ═══════════════════════════════════════════════════════════════
         // Find services to stop (in old but not in new)
+        // ═══════════════════════════════════════════════════════════════
+        
         for name in old_services.keys() {
             if !new_services.contains_key(name) {
                 info!("Stopping removed service: {}", name);
-                if let Some(tx) = self.workers.get(name)
-                    && let Err(e) = tx.send(Cmd::Shutdown)
-                {
-                    error!("Failed to send shutdown to service {}: {}", name, e);
+                if let Some(tx) = self.workers.get(name) {
+                    tx.send(Cmd::Shutdown)
+                        .with_context(|| format!("Failed to send shutdown to service {}", name))?;
                 }
                 self.workers.remove(name);
                 self.restart_policies.remove(name);
             }
         }
 
+        // ═══════════════════════════════════════════════════════════════
         // Find services to start (in new but not in old)
+        // ═══════════════════════════════════════════════════════════════
+        
         for (name, def) in &new_services {
             if !old_services.contains_key(name.as_str()) {
                 info!("Starting new service: {}", name);
-                match crate::service::spawn(def.clone(), self.bus_tx.clone()) {
-                    Ok(tx) => {
-                        self.workers.insert(name.clone(), tx);
-                        self.restart_policies
-                            .insert(name.clone(), def.restart_policy.clone());
-                    }
-                    Err(e) => {
-                        error!("Failed to spawn new service '{}': {}", name, e);
-                    }
-                }
+                let tx = crate::service::spawn(def.clone(), self.bus_tx.clone())
+                    .with_context(|| format!("Failed to spawn new service '{}'", name))?;
+                self.workers.insert(name.clone(), tx);
+                self.restart_policies
+                    .insert(name.clone(), def.restart_policy.clone());
             }
         }
 
+        // ═══════════════════════════════════════════════════════════════
         // Find services to restart (in both but definition changed)
+        // ═══════════════════════════════════════════════════════════════
+        
         for (name, new_def) in &new_services {
             if let Some(old_def) = old_services.get(name.as_str()) {
-                // Compare definitions (simplified - check if debug representation differs)
+                // Compare definitions using debug representation
+                // (Not ideal but works for now - proper Eq impl would be better)
                 if format!("{:?}", old_def) != format!("{:?}", new_def) {
                     info!("Restarting modified service: {}", name);
 
                     // Stop old version
-                    if let Some(tx) = self.workers.get(name)
-                        && let Err(e) = tx.send(Cmd::Shutdown)
-                    {
-                        error!("Failed to send shutdown to service {}: {}", name, e);
+                    if let Some(tx) = self.workers.get(name) {
+                        tx.send(Cmd::Shutdown)
+                            .with_context(|| format!("Failed to shutdown service {}", name))?;
                     }
 
                     // Start new version
-                    match crate::service::spawn(new_def.clone(), self.bus_tx.clone()) {
-                        Ok(tx) => {
-                            self.workers.insert(name.clone(), tx);
-                            self.restart_policies
-                                .insert(name.clone(), new_def.restart_policy.clone());
-                        }
-                        Err(e) => {
-                            error!("Failed to restart service '{}': {}", name, e);
-                        }
-                    }
+                    let tx = crate::service::spawn(new_def.clone(), self.bus_tx.clone())
+                        .with_context(|| format!("Failed to restart service '{}'", name))?;
+                    self.workers.insert(name.clone(), tx);
+                    self.restart_policies
+                        .insert(name.clone(), new_def.restart_policy.clone());
                 }
             }
         }
 
-        // Update stored config
-        *self.config.write() = new_cfg;
-
-        info!("Configuration reload complete");
+        info!("✓ All service changes applied successfully");
         Ok(())
     }
 
@@ -593,7 +981,7 @@ impl ServiceManager {
 
         #[cfg(windows)]
         let socket_rx = {
-            use crate::platform::windows::named_pipe::{NamedPipeStream, create_named_pipe_server};
+            use crate::platform::windows::named_pipe::create_named_pipe_server;
 
             let is_elevated = crate::platform::is_elevated();
             let socket_path = crate::platform::status_socket_path(is_elevated);
@@ -605,19 +993,24 @@ impl ServiceManager {
                     let (socket_tx, socket_rx) = bounded(8);
                     let path_string = path_str.to_string();
 
+                    // Create shutdown flag for graceful termination
+                    let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let shutdown_flag_clone = shutdown_flag.clone();
+
                     std::thread::spawn(move || {
-                        use windows::Win32::System::Pipes::ConnectNamedPipe;
-
                         let mut listener = initial_listener;
-                        loop {
-                            // Wait for client connection
-                            let connect_result = unsafe {
-                                ConnectNamedPipe(listener.as_raw_handle(), None)
-                            };
 
-                            match connect_result {
-                                Ok(_) => {
-                                    // Successfully connected - send stream through channel
+                        loop {
+                            // Check shutdown flag before accepting
+                            if shutdown_flag_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                                log::debug!("Named pipe accept thread shutting down gracefully");
+                                break;
+                            }
+
+                            // Non-blocking accept with 100ms timeout
+                            match accept_connection_with_timeout(&mut listener, Duration::from_millis(100)) {
+                                AcceptResult::Connected => {
+                                    // Client connected - send stream through channel
                                     if socket_tx.send(listener).is_err() {
                                         break; // Receiver dropped, exit thread
                                     }
@@ -631,13 +1024,22 @@ impl ServiceManager {
                                         }
                                     }
                                 }
-                                Err(e) => {
+                                AcceptResult::Timeout => {
+                                    // No client within timeout - loop and check shutdown flag
+                                    continue;
+                                }
+                                AcceptResult::Error(e) => {
                                     log::error!("Error accepting named pipe connection: {}", e);
                                     std::thread::sleep(Duration::from_millis(100));
                                 }
                             }
                         }
+
+                        log::debug!("Named pipe accept thread exited");
                     });
+
+                    // Store shutdown flag for signaling during manager shutdown
+                    self.pipe_accept_shutdown = Some(shutdown_flag);
 
                     info!("Status query named pipe listening at: {}", socket_path.display());
                     Some(socket_rx)
@@ -672,6 +1074,13 @@ impl ServiceManager {
                 recv(self.shutdown_rx) -> _ => {
                     info!("External shutdown signal received (Windows service or API)");
                     
+                    // Signal named pipe accept thread to shutdown gracefully
+                    #[cfg(windows)]
+                    if let Some(ref shutdown_flag) = self.pipe_accept_shutdown {
+                        shutdown_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                        log::debug!("Signaled pipe accept thread to shutdown");
+                    }
+                    
                     // Announce manager stopping
                     self.bus_tx.send(Evt::State {
                         service: Arc::from("manager"),
@@ -689,10 +1098,61 @@ impl ServiceManager {
                     break;  // Exit event loop
                 }
                 
+                // External config reload trigger (Windows service custom control code 128)
+                recv(self.reload_rx.as_ref().unwrap_or(never())) -> _ => {
+                    info!("Received config reload request from Windows service (control code 128)");
+                    if let Err(e) = self.reload_config() {
+                        error!("Config reload failed: {}", e);
+                        // Continue running with old config
+                    } else {
+                        info!("Configuration reloaded successfully");
+                    }
+                }
+                
+                recv(self.pause_rx.as_ref().unwrap_or(never())) -> _ => {
+                    info!("Pause signal received from Windows SCM");
+                    
+                    // Broadcast Pause command to all worker services
+                    for (name, tx) in &self.workers {
+                        let correlation_id = self.next_correlation_id();
+                        if let Err(e) = tx.send(Cmd::Pause { correlation_id }) {
+                            error!("Failed to send Pause to service {}: {}", name, e);
+                        }
+                    }
+                    
+                    info!("Pause command sent to all {} services", self.workers.len());
+                }
+                
+                recv(self.continue_rx.as_ref().unwrap_or(never())) -> _ => {
+                    info!("Continue signal received from Windows SCM");
+                    
+                    // Broadcast Continue command to all worker services
+                    for (name, tx) in &self.workers {
+                        let correlation_id = self.next_correlation_id();
+                        if let Err(e) = tx.send(Cmd::Continue { correlation_id }) {
+                            error!("Failed to send Continue to service {}: {}", name, e);
+                        }
+                    }
+                    
+                    info!("Continue command sent to all {} services", self.workers.len());
+                }
+                
+                // Signal handling: All operations here run OUTSIDE signal handler context
+                // The actual signal handler (inside tokio) only writes to a pipe.
+                // This code runs in the async task after reading from pipe, so all
+                // operations are safe: logging, channel sends, atomic stores, etc.
+                // See platform/signal.rs module docs for full safety analysis.
                 recv(signal_watcher.receiver()) -> sig => {
                     match sig {
                         Ok(SignalKind::Terminate) | Ok(SignalKind::Interrupt) => {
                             info!("Received shutdown signal: {:?}", sig);
+                            
+                            // Signal named pipe accept thread to shutdown gracefully
+                            #[cfg(windows)]
+                            if let Some(ref shutdown_flag) = self.pipe_accept_shutdown {
+                                shutdown_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                                log::debug!("Signaled pipe accept thread to shutdown");
+                            }
                             
                             // Notify systemd of graceful shutdown
                             crate::daemon::systemd_notify_stopping();
@@ -721,6 +1181,13 @@ impl ServiceManager {
                         Ok(SignalKind::Shutdown) => {
                             info!("Received system shutdown signal - graceful shutdown");
 
+                            // Signal named pipe accept thread to shutdown gracefully
+                            #[cfg(windows)]
+                            if let Some(ref shutdown_flag) = self.pipe_accept_shutdown {
+                                shutdown_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                                log::debug!("Signaled pipe accept thread to shutdown");
+                            }
+
                             // Transition lifecycle to stopping state
                             let action = self.lifecycle.step(Event::CmdStop);
                             self.handle_lifecycle_action(action).await;
@@ -744,10 +1211,29 @@ impl ServiceManager {
                     }
                 }
                 recv(watchdog_tick) -> _ => {
-                    // Send watchdog keepalive to systemd
+                    // Send watchdog keepalive to systemd (Linux only)
                     // Only has effect if unit file contains WatchdogSec=
                     if self.lifecycle.is_running() {
                         crate::daemon::systemd_notify_watchdog();
+                        
+                        // Update Windows internal watchdog heartbeat
+                        #[cfg(windows)]
+                        {
+                            if let Ok(mut heartbeat) = self.watchdog_state.lock() {
+                                *heartbeat = Instant::now();
+                                log::trace!("Updated Windows watchdog heartbeat");
+                            } else {
+                                error!("Failed to acquire watchdog mutex lock");
+                            }
+                        }
+                        
+                        // Update macOS internal watchdog heartbeat
+                        #[cfg(target_os = "macos")]
+                        {
+                            if let Some(ref watchdog) = self.macos_watchdog {
+                                watchdog.update_heartbeat();
+                            }
+                        }
                     }
                 }
                 recv(log_rotate_tick) -> _ => {
@@ -908,6 +1394,10 @@ impl ServiceManager {
         // Set read timeout to prevent hanging on malicious clients
         stream.set_read_timeout(Some(Duration::from_secs(5)))
             .context("Failed to set socket read timeout")?;
+        
+        // Set write timeout to prevent slow-read DoS attacks
+        stream.set_write_timeout(Some(Duration::from_secs(5)))
+            .context("Failed to set socket write timeout")?;
 
         // Receive query from CLI
         let query: StatusQuery = recv_message(&mut stream)
@@ -949,8 +1439,13 @@ impl ServiceManager {
     fn handle_status_query(&mut self, mut stream: crate::platform::windows::named_pipe::NamedPipeStream) -> Result<()> {
         use crate::status::{StatusQuery, recv_message, send_message};
 
-        // Note: Windows Named Pipes don't have set_read_timeout in our wrapper
-        // The timeout is handled at the pipe creation level
+        // ✅ FIX: Set read timeout (parity with Unix)
+        stream.set_read_timeout(Some(Duration::from_secs(5)))
+            .context("Failed to set pipe read timeout")?;
+        
+        // ✅ FIX: Set write timeout to prevent slow-read DoS attacks
+        stream.set_write_timeout(Some(Duration::from_secs(5)))
+            .context("Failed to set pipe write timeout")?;
 
         // Receive query from CLI
         let query: StatusQuery = recv_message(&mut stream)
@@ -1006,6 +1501,8 @@ impl ServiceManager {
                 match last.state {
                     ServiceState::Starting => ServiceStateKind::Starting,
                     ServiceState::Running => ServiceStateKind::Running,
+                    ServiceState::Pausing => ServiceStateKind::Running,  // Transitioning to paused
+                    ServiceState::Paused => ServiceStateKind::Stopped,   // Paused = stopped child processes
                     ServiceState::Stopping => ServiceStateKind::Stopped,
                     ServiceState::Stopped => ServiceStateKind::Stopped,
                     ServiceState::StoppedClean => ServiceStateKind::Stopped,
@@ -1130,6 +1627,16 @@ impl ServiceManager {
                         log::warn!("Continuing with daemon shutdown despite worker timeout");
                         log::warn!("Hung workers may be forcefully terminated by OS");
                         // Don't return error - allow PID cleanup to proceed
+                    }
+                }
+                
+                // Phase 4: Shutdown macOS watchdog thread
+                // This prevents false positive watchdog timeouts during service shutdown
+                #[cfg(target_os = "macos")]
+                {
+                    if let Some(watchdog) = self.macos_watchdog.take() {
+                        log::info!("Shutting down macOS watchdog thread");
+                        watchdog.shutdown();
                     }
                 }
             }
@@ -1859,68 +2366,79 @@ impl ServiceManager {
         }
     }
 
-    /// Trigger graceful shutdown
-    /// 
-    /// This method enables external callers (like Windows services) to shut down
-    /// the ServiceManager event loop gracefully. It sends a shutdown signal to
-    /// the run() loop which will then break from its select! and perform cleanup.
-    /// 
-    /// # Shutdown Sequence
-    /// 
-    /// 1. Sends shutdown signal to run() loop (non-blocking)
-    /// 2. run() loop breaks from select! and enters cleanup:
-    ///    - Calls handle_lifecycle_action(Action::KillProcess)
-    ///    - Shuts down embedded HTTP servers
-    ///    - Sends Shutdown commands to all workers
-    ///    - Waits for worker termination
-    /// 3. Returns immediately after sending signal
-    /// 
-    /// # Note on Timeout
-    /// 
-    /// This method returns immediately after sending the shutdown signal.
-    /// The caller (Windows service) is responsible for:
-    /// - Waiting on the run() task to complete (via JoinHandle)
-    /// - Enforcing timeout at the task level
-    /// - Handling timeout by allowing SCM to force-kill if needed
-    /// 
-    /// This design keeps shutdown() simple and avoids complex async/sync bridging.
-    /// 
-    /// # Arguments
-    /// 
-    /// * `_timeout` - Ignored, provided for API compatibility
-    /// 
-    /// # Example
-    /// 
-    /// ```rust
-    /// // Send shutdown signal
-    /// service_manager.shutdown(Duration::from_secs(5))?;
-    /// 
-    /// // Wait for run() task with timeout
-    /// match tokio::time::timeout(Duration::from_secs(5), run_handle).await {
-    ///     Ok(_) => info!("Shutdown complete"),
-    ///     Err(_) => error!("Shutdown timeout"),
-    /// }
-    /// ```
-    #[cfg_attr(not(windows), allow(dead_code))]
-    pub fn shutdown(&self, _timeout: Duration) -> Result<()> {
-        info!("Sending shutdown signal to ServiceManager");
-
-        // Send shutdown signal to run() loop
-        // This will cause the select! to break and cleanup to begin
-        self.shutdown_tx
-            .send(())
-            .context("Failed to send shutdown signal - channel disconnected")?;
-
-        info!("Shutdown signal sent successfully");
-        Ok(())
-    }
-
     /// Get a clone of the shutdown sender for external signaling
     ///
-    /// This allows external code (like Windows SCM handler) to send shutdown
-    /// signals even after the ServiceManager is moved into a thread.
-    #[cfg(windows)]
+    /// This is the correct way to trigger ServiceManager shutdown from external code
+    /// (Windows SCM, Unix daemon control, API endpoints, etc.).
+    ///
+    /// # Why This Pattern?
+    ///
+    /// The ServiceManager must be consumed by `run()` (Unix) or moved into a thread (Windows),
+    /// so you cannot call methods on it after initialization. Instead, get a sender clone
+    /// BEFORE consuming/moving the manager:
+    ///
+    /// ```rust
+    /// let manager = ServiceManager::new(config)?;
+    /// let shutdown_tx = manager.get_shutdown_sender(); // Clone sender first
+    /// 
+    /// // Now move/consume manager
+    /// tokio::spawn(async move {
+    ///     manager.run().await
+    /// });
+    ///
+    /// // Later: trigger shutdown
+    /// shutdown_tx.send(()).ok();
+    /// ```
+    ///
+    /// The sender will signal the `run()` event loop to break and begin cleanup.
+    #[cfg(target_os = "windows")]
     pub fn get_shutdown_sender(&self) -> crossbeam_channel::Sender<()> {
         self.shutdown_tx.clone()
     }
+
+    /// Get a sender for triggering config reload (Windows service control handler)
+    ///
+    /// Returns a channel sender that can be used to trigger configuration reload
+    /// from the Windows service control handler. When the sender sends `()`, the
+    /// ServiceManager's run() loop will call reload_config().
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// let mgr = ServiceManager::new(config)?;
+    /// let reload_tx = mgr.get_reload_sender();
+    ///
+    /// // Later: Windows service receives custom control code 128
+    /// reload_tx.send(()).ok();
+    /// ```
+    ///
+    /// The sender will signal the `run()` event loop to reload configuration.
+    /// 
+    /// Returns a clone of the reload sender if available (Windows only).
+    /// On Windows, this will always return a valid sender after initialization.
+    #[cfg(windows)]
+    pub fn get_reload_sender(&self) -> Option<crossbeam_channel::Sender<()>> {
+        self.reload_tx.clone()
+    }
+
+    /// Set pause receiver (called from Windows service before run())
+    #[cfg(windows)]
+    pub fn set_pause_rx(&mut self, rx: Receiver<()>) {
+        self.pause_rx = Some(rx);
+    }
+    
+    /// Set continue receiver (called from Windows service before run())
+    #[cfg(windows)]
+    pub fn set_continue_rx(&mut self, rx: Receiver<()>) {
+        self.continue_rx = Some(rx);
+    }
+}
+
+/// Returns a receiver that never receives (used for Optional channels in select!)
+fn never() -> &'static Receiver<()> {
+    static NEVER: std::sync::OnceLock<Receiver<()>> = std::sync::OnceLock::new();
+    NEVER.get_or_init(|| {
+        let (_tx, rx) = bounded(0);
+        rx
+    })
 }

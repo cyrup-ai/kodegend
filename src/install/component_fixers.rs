@@ -24,6 +24,23 @@ fn send_progress(tx: &Option<mpsc::Sender<InstallProgress>>, progress: InstallPr
     }
 }
 
+/// Detect installation scope based on privilege level (Windows only)
+#[cfg(windows)]
+fn detect_install_scope() -> crate::install::installer::windows::paths::InstallScope {
+    use crate::platform::is_elevated;
+    use crate::install::installer::windows::paths::InstallScope;
+
+    // Auto-detect: If we have elevation, use System scope
+    // If not, use User scope
+    if is_elevated() {
+        log::info!("Elevated privileges detected - using System scope installation");
+        InstallScope::System
+    } else {
+        log::info!("Running without elevation - using User scope installation");
+        InstallScope::User
+    }
+}
+
 /// Fix hosts file entry using atomic flock + write operations
 ///
 /// Uses the proper `add_kodegen_host_entries()` function which provides:
@@ -66,57 +83,31 @@ pub async fn fix_hosts(_executor: &mut PrivilegedExecutor) -> ComponentFixResult
 pub async fn fix_hosts_windows(executor: &mut PrivilegedExecutor) -> ComponentFixResult {
     log::info!("Fixing Windows hosts file entry...");
 
-    let hosts_path = PathBuf::from(r"C:\Windows\System32\drivers\etc\hosts");
-
-    // Read existing hosts file (no elevation needed for reading)
-    let existing_content = match tokio::fs::read_to_string(&hosts_path).await {
-        Ok(content) => content,
+    // Use the proper atomic function from installer::config::hosts
+    // This handles checking if entry exists, atomic write, and structured block
+    match crate::install::installer::config::add_kodegen_host_entries() {
+        Ok(()) => {
+            log::info!("Hosts entry: OK");
+            
+            // Flush DNS cache (Windows-specific)
+            let _ = executor.exec(&["ipconfig", "/flushdns"]).await;
+            
+            ComponentFixResult {
+                component: "hosts",
+                success: true,
+                error: None,
+                required_sudo: true,
+            }
+        }
         Err(e) => {
-            return ComponentFixResult {
+            log::error!("Failed to fix hosts: {}", e);
+            ComponentFixResult {
                 component: "hosts",
                 success: false,
-                error: Some(format!("Failed to read hosts file: {}", e)),
+                error: Some(e.to_string()),
                 required_sudo: true,
-            };
+            }
         }
-    };
-
-    // Check if kodegen entries already exist
-    if existing_content.contains("mcp.kodegen.ai") {
-        log::info!("Hosts entry already exists");
-        return ComponentFixResult {
-            component: "hosts",
-            success: true,
-            error: None,
-            required_sudo: false,
-        };
-    }
-
-    // Append kodegen entries
-    let new_content = format!(
-        "{}\n\n# Kodegen MCP Server\n127.0.0.1 mcp.kodegen.ai\n::1 mcp.kodegen.ai\n",
-        existing_content.trim_end()
-    );
-
-    // Write using privileged executor
-    if let Err(e) = executor.write_file(&hosts_path, &new_content).await {
-        return ComponentFixResult {
-            component: "hosts",
-            success: false,
-            error: Some(format!("Failed to write hosts file: {}", e)),
-            required_sudo: true,
-        };
-    }
-
-    // Flush DNS cache
-    let _ = executor.exec(&["ipconfig", "/flushdns"]).await;
-
-    log::info!("Hosts entry added successfully");
-    ComponentFixResult {
-        component: "hosts",
-        success: true,
-        error: None,
-        required_sudo: true,
     }
 }
 
@@ -232,13 +223,9 @@ pub async fn fix_certificates_windows(executor: &mut PrivilegedExecutor) -> Comp
         }
     };
 
-    // Step 2: Get Windows certificate path
+    // Step 2: Get Windows certificate path using centralized path function
     // %PROGRAMDATA%\kodegen\certs\wildcard.pem (typically C:\ProgramData\kodegen\certs\)
-    let cert_dir = std::env::var("PROGRAMDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(r"C:\ProgramData"))
-        .join("kodegen")
-        .join("certs");
+    let cert_dir = crate::install::installer::windows::paths::cert_dir();
     let cert_path = cert_dir.join("wildcard.pem");
 
     // Step 3: Create directory using privileged executor
@@ -543,21 +530,50 @@ pub async fn fix_kodegen_version_windows(
     }
 }
 
-/// Add installation directory to system PATH via registry
+/// Add installation directory to system PATH via registry (sync version)
+///
+/// This is called from `run_privileged_install_ops()` which is already running elevated.
+/// Uses `std::process::Command` directly instead of PrivilegedExecutor.
 #[cfg(windows)]
-async fn add_to_system_path_windows(
-    executor: &mut PrivilegedExecutor,
-    install_dir: &std::path::Path,
+/// Add installation directory to Windows PATH via registry (sync version)
+///
+/// Supports both System scope (HKLM) and User scope (HKCU).
+/// Both scopes use REG_EXPAND_SZ to allow environment variable expansion.
+///
+/// # Registry Keys
+/// - System: HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment
+/// - User: HKCU\Environment
+///
+/// # Security
+/// - System scope: Requires Administrator elevation
+/// - User scope: No elevation required
+pub(crate) fn add_to_windows_path_sync(
+    scope: crate::install::installer::windows::paths::InstallScope,
 ) -> anyhow::Result<()> {
     use std::process::Command;
+    use crate::install::installer::windows::paths;
 
+    // Determine registry key based on scope
+    let registry_key = match scope {
+        paths::InstallScope::System => {
+            r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment"
+        }
+        paths::InstallScope::User => {
+            r"HKCU\Environment"
+        }
+    };
+
+    // Get installation directory using centralized path function
+    let install_dir = paths::install_dir(scope);
     let install_dir_str = install_dir.to_string_lossy();
+
+    log::info!("Adding {} to {:?} PATH", install_dir.display(), scope);
 
     // Read current PATH from registry (no elevation needed for reading)
     let output = Command::new("reg")
         .args([
             "query",
-            r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+            registry_key,
             "/v",
             "Path",
         ])
@@ -565,7 +581,7 @@ async fn add_to_system_path_windows(
 
     let current_path = String::from_utf8_lossy(&output.stdout);
 
-    // Check if already in PATH
+    // Check if already in PATH (case-insensitive)
     if current_path.to_lowercase().contains(&install_dir_str.to_lowercase()) {
         log::info!("Installation directory already in PATH");
         return Ok(());
@@ -589,32 +605,35 @@ async fn add_to_system_path_windows(
         format!("{};{}", path_value, install_dir_str)
     };
 
-    // Set new PATH using reg command via elevated helper
-    executor
-        .exec(&[
-            "reg",
+    // Set new PATH using reg command
+    // BOTH scopes use REG_EXPAND_SZ to allow environment variable expansion
+    let status = Command::new("reg")
+        .args([
             "add",
-            r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+            registry_key,
             "/v",
             "Path",
             "/t",
-            "REG_EXPAND_SZ",
+            "REG_EXPAND_SZ",  // ✅ CORRECT for both System and User
             "/d",
             &new_path,
             "/f",
         ])
-        .await?;
+        .status()?;
+
+    if !status.success() {
+        anyhow::bail!("Failed to update {:?} PATH registry key", scope);
+    }
 
     // Broadcast WM_SETTINGCHANGE to notify other processes (best effort)
-    let _ = executor
-        .exec(&[
-            "powershell",
+    let _ = Command::new("powershell")
+        .args([
             "-Command",
             "Add-Type -Namespace Win32 -Name NativeMethods -MemberDefinition '[DllImport(\"user32.dll\", SetLastError = true, CharSet = CharSet.Auto)] public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wParam, string lParam, uint fuFlags, uint uTimeout, out UIntPtr lpdwResult);'; $HWND_BROADCAST = [IntPtr]0xffff; $WM_SETTINGCHANGE = 0x1a; $result = [UIntPtr]::Zero; [Win32.NativeMethods]::SendMessageTimeout($HWND_BROADCAST, $WM_SETTINGCHANGE, [UIntPtr]::Zero, 'Environment', 2, 5000, [ref]$result)",
         ])
-        .await;
+        .status();
 
-    log::info!("Added {} to system PATH", install_dir.display());
+    log::info!("Added {} to {:?} PATH", install_dir.display(), scope);
     Ok(())
 }
 
@@ -950,6 +969,18 @@ pub async fn fix_service_registration(
     // Build installer config
     let exe_path = std::env::current_exe().unwrap_or_default();
 
+    #[cfg(windows)]
+    let builder = {
+        let scope = detect_install_scope();
+        crate::install::installer::InstallerBuilder::new("kodegend", exe_path)
+            .description("Kodegen Service Manager")
+            .args(["run", "--foreground"])
+            .auto_restart(true)
+            .auto_start(true)
+            .with_scope(scope)
+    };
+
+    #[cfg(not(windows))]
     let builder = crate::install::installer::InstallerBuilder::new("kodegend", exe_path)
         .description("Kodegen Service Manager")
         .args(["run", "--foreground"])
@@ -964,6 +995,16 @@ pub async fn fix_service_registration(
                 component: "service",
                 success: true,
                 error: None,
+                required_sudo: true,
+            }
+        }
+        Err(crate::install::installer::InstallerError::Cancelled) => {
+            // User intentionally cancelled - treat as non-error
+            log::info!("Installation cancelled by user");
+            ComponentFixResult {
+                component: "service",
+                success: false,
+                error: Some("Cancelled by user".to_string()),
                 required_sudo: true,
             }
         }
@@ -1080,6 +1121,7 @@ fn check_macos_plist_needs_update() -> bool {
 #[cfg(target_os = "linux")]
 fn check_linux_unit_needs_update() -> bool {
     use std::fs;
+    use std::path::PathBuf;
     let unit_paths = [
         PathBuf::from("/etc/systemd/system/kodegend.service"),
         dirs::config_dir()

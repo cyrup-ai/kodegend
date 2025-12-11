@@ -118,6 +118,28 @@ pub async fn start_daemon() -> Result<()> {
         return Ok(());
     }
     
+    // Layer 1.5: Handle cleanup cases before starting
+    let status = check_status().await?;
+    if status.needs_cleanup() {
+        match status {
+            crate::daemon::ServiceStatus::StaleFile { pid } => {
+                warn!("Found stale PID file (PID: {}), will clean up and start", pid);
+                // Systemd will handle cleanup when we start
+            }
+            crate::daemon::ServiceStatus::InvalidFile { error } => {
+                warn!("Found invalid PID file ({}), will clean up and start", error);
+                // Systemd will handle cleanup when we start
+            }
+            crate::daemon::ServiceStatus::Zombie { pid } => {
+                warn!("Found zombie process (PID: {}), force killing before start", pid);
+                crate::service::port_cleanup::force_kill_process(pid as u32).await
+                    .context("Failed to force kill zombie process")?;
+                info!("Zombie process {} killed, proceeding with start", pid);
+            }
+            _ => {} // Unreachable due to needs_cleanup() check
+        }
+    }
+    
     // Layer 2: Start the service
     let service_name = format!("{}.service", SERVICE_NAME);
     let args = if is_root() {

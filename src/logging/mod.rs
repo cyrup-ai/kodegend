@@ -3,8 +3,11 @@
 //! Follows the pattern established in src/platform/mod.rs for platform abstraction.
 //!
 //! ## Platform Behavior
-//! - **Unix**: env_logger → stdout/stderr (captured by systemd/syslog)
-//! - **Windows Service**: multi_log combining:
+//! - **Linux**: multi_log combining:
+//!   - env_logger → stdout/stderr (for console debugging)
+//!   - systemd-journal-logger → systemd journal (for journalctl with structured fields)
+//! - **macOS**: env_logger → stdout/stderr (captured by launchd unified logging)
+//! - **Windows**: multi_log combining:
 //!   - env_logger → stdout/stderr (for console debugging)
 //!   - eventlog → Windows Event Log (for Event Viewer)
 //!
@@ -15,15 +18,20 @@
 //! Registration happens during `kodegend install` (requires Administrator).
 //! Runtime logging does NOT require elevation.
 
-#[cfg(unix)]
-mod unix;
-#[cfg(unix)]
-pub use unix::*;
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+use linux::platform_init_logging;
+
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "macos")]
+use macos::platform_init_logging;
 
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-pub(crate) use windows::*;
+use windows::platform_init_logging;
 
 use anyhow::Result;
 

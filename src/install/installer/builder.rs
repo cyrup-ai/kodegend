@@ -2,6 +2,48 @@ use std::{collections::HashMap, path::PathBuf};
 
 use crate::config::ServiceDefinition;
 
+/// Resource limits for daemon processes.
+///
+/// Configures operating system resource constraints to prevent runaway processes
+/// from destabilizing the system. Applies to macOS (launchd), Linux (systemd),
+/// and Windows (Job Objects).
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct ResourceLimits {
+    /// Maximum number of open file descriptors (default: 65536)
+    pub max_files: u64,
+
+    /// Maximum number of processes/threads (default: 4096)
+    pub max_processes: u64,
+
+    /// Maximum memory usage in bytes (default: 1GB = 1073741824)
+    ///
+    /// Platform notes:
+    /// - Linux: Hard limit via cgroups (MemoryMax)
+    /// - macOS: Soft limit via RSS, advisory only
+    /// - Windows: Hard limit via Job Objects
+    pub max_memory_bytes: u64,
+
+    /// Process scheduling priority (default: -5)
+    ///
+    /// Range: -20 (highest) to 19 (lowest)
+    /// - Negative values = higher priority (requires elevated permissions)
+    /// - Positive values = lower priority
+    /// - Zero = normal priority
+    pub nice: i32,
+}
+
+impl Default for ResourceLimits {
+    fn default() -> Self {
+        Self {
+            max_files: 65536,
+            max_processes: 4096,
+            max_memory_bytes: 1024 * 1024 * 1024, // 1GB
+            nice: -5,
+        }
+    }
+}
+
 /// Builder for daemon installation metadata.
 ///
 /// This struct describes the daemon to be installed, including its executable path,
@@ -40,6 +82,16 @@ pub struct InstallerBuilder {
 
     /// Whether to start service automatically after installation
     pub auto_start: bool,
+
+    /// Resource limits for the daemon process
+    ///
+    /// Controls file descriptors, process count, memory usage, and scheduling priority.
+    /// If None, platform-specific defaults are applied (65536 files, 4096 processes, 1GB memory, nice -5).
+    pub resource_limits: Option<ResourceLimits>,
+
+    /// Installation scope (Windows only)
+    #[cfg(windows)]
+    pub scope: crate::install::installer::windows::paths::InstallScope,
 }
 
 impl InstallerBuilder {
@@ -62,6 +114,9 @@ impl InstallerBuilder {
             wants_network: true,
             services: Vec::new(),
             auto_start: true,
+            resource_limits: None,
+            #[cfg(windows)]
+            scope: crate::install::installer::windows::paths::InstallScope::System,
         }
     }
 
@@ -131,6 +186,13 @@ impl InstallerBuilder {
     /// Set whether to start service automatically after installation.
     pub fn auto_start(mut self, auto_start: bool) -> Self {
         self.auto_start = auto_start;
+        self
+    }
+
+    /// Set the installation scope (Windows only).
+    #[cfg(windows)]
+    pub fn with_scope(mut self, scope: crate::install::installer::windows::paths::InstallScope) -> Self {
+        self.scope = scope;
         self
     }
 }

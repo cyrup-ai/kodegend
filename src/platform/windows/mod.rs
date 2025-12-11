@@ -18,8 +18,11 @@
 mod handles;
 pub(crate) use handles::{ProcessHandle, TokenHandle};
 
+pub mod job_object;
 pub mod named_pipe;
-pub(crate) use named_pipe::create_named_pipe_server;
+
+// Re-export job_object for convenience
+pub use job_object::JobObject;
 
 use anyhow::{Result, bail};
 use kodegen_config::KodegenConfig;
@@ -96,7 +99,6 @@ pub(super) fn platform_running_under_service_manager() -> bool {
         // If GetConsoleWindow returns NULL, we're likely a service
         // (Services don't have console windows)
         use windows::Win32::System::Console::GetConsoleWindow;
-        use std::ptr;
         let console_window = GetConsoleWindow();
         let is_service = console_window.0.is_null();
 
@@ -124,9 +126,9 @@ pub(super) fn platform_current_process_id() -> u32 {
     unsafe { GetCurrentProcessId() }
 }
 
-/// Check if a process is running using OpenProcess()
+/// Check if a process is running using ProcessHandle RAII wrapper
 ///
-/// Uses OpenProcess() with PROCESS_QUERY_LIMITED_INFORMATION.
+/// Uses ProcessHandle::try_open_query() for automatic handle cleanup.
 /// Similar semantics to Unix kill(pid, 0).
 ///
 /// Returns:
@@ -141,33 +143,30 @@ pub(super) fn platform_current_process_id() -> u32 {
 /// See: https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-openprocess
 pub(super) fn platform_is_process_running(pid: u32) -> Result<bool, std::io::Error> {
     use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER};
-    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
-    use windows::Win32::Foundation::CloseHandle;
     
-    unsafe {
-        match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
-            Ok(handle) => {
-                let _ = CloseHandle(handle);
-                Ok(true)  // Process exists and we can query it
+    match ProcessHandle::try_open_query(pid) {
+        Ok(_handle) => {
+            // Handle automatically closed when _handle goes out of scope
+            Ok(true)
+        }
+        Err(e) => {
+            // Extract Windows error code from io::Error
+            let error_code = e.raw_os_error().unwrap_or(0) as u32;
+            
+            // Process doesn't exist (invalid PID)
+            if error_code == ERROR_INVALID_PARAMETER.0 {
+                return Ok(false);
             }
-            Err(e) => {
-                let error_code = e.code().0 as u32;
-                
-                // Process doesn't exist (invalid PID)
-                if error_code == ERROR_INVALID_PARAMETER.0 {
-                    return Ok(false);
-                }
-                
-                // Process exists but access denied (matches Unix EPERM behavior)
-                // Common for protected processes: System, CSRSS, higher integrity levels
-                if error_code == ERROR_ACCESS_DENIED.0 {
-                    return Ok(true);
-                }
-                
-                // Unknown error - propagate to caller
-                // Should be rare in practice (disk I/O errors, memory issues, etc.)
-                Err(std::io::Error::from_raw_os_error(e.code().0))
+            
+            // Process exists but access denied (matches Unix EPERM behavior)
+            // Common for protected processes: System, CSRSS, higher integrity levels
+            if error_code == ERROR_ACCESS_DENIED.0 {
+                return Ok(true);
             }
+            
+            // Unknown error - propagate to caller
+            // Should be rare in practice (disk I/O errors, memory issues, etc.)
+            Err(e)
         }
     }
 }

@@ -1,9 +1,12 @@
 mod autoconfig;
 pub mod port_cleanup;
 pub mod embedded_servers;
-mod path_validation;
+pub mod path_validation;
 
 pub use path_validation::validate_and_normalize_working_dir;
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -21,6 +24,9 @@ use thiserror::Error;
 
 use crate::config::ServiceDefinition;
 use crate::ipc::{Cmd, Evt, ServiceState};
+
+#[cfg(windows)]
+use crate::platform::windows::JobObject;
 
 /// Maximum iterations when cleaning up old numbered log files.
 /// This prevents unbounded loops while being generous enough for any realistic scenario.
@@ -49,6 +55,11 @@ pub struct ServiceWorker {
     tx: Sender<Cmd>,
     bus: Sender<Evt>,
     def: ServiceDefinition,
+    
+    // Windows-specific: Job object for child process lifecycle management
+    // When this handle is dropped, all assigned children are automatically terminated
+    #[cfg(windows)]
+    job: Option<JobObject>,
 }
 
 impl ServiceWorker {
@@ -60,6 +71,24 @@ impl ServiceWorker {
         let name_for_thread = Arc::clone(&name);
         let tx_clone = tx.clone();
 
+        // Windows-specific: Create job object for child process lifecycle
+        // Uses KILL_ON_CLOSE flag - when handle drops, all children terminate
+        #[cfg(windows)]
+        let job = {
+            // Create job with no resource limits (0, 0) - lifecycle only
+            // Resource limits are handled by the separate job in main.rs
+            match JobObject::new(0, 0) {
+                Ok(j) => {
+                    log::info!("{}: Created job object for child lifecycle management", name);
+                    Some(j)
+                }
+                Err(e) => {
+                    log::warn!("{}: Failed to create job object: {}. Child cleanup not guaranteed.", name, e);
+                    None
+                }
+            }
+        };
+
         thread::Builder::new()
             .name(format!("svc-{}", name_for_thread))
             .spawn(move || {
@@ -69,6 +98,8 @@ impl ServiceWorker {
                     tx: tx_clone,
                     bus,
                     def,
+                    #[cfg(windows)]
+                    job,
                 };
                 if let Err(e) = worker.run() {
                     error!("Worker {} crashed: {:#}", worker.name, e);
@@ -95,6 +126,35 @@ impl ServiceWorker {
                     Cmd::Restart { correlation_id }  => {
                         self.stop(&mut child, Some(correlation_id))?;
                         self.start(&mut child, Some(correlation_id))?;
+                    },
+                    Cmd::Pause { correlation_id } => {
+                        // Report pausing state
+                        self.bus.send(Evt::State {
+                            service: Arc::clone(&self.name),
+                            state: ServiceState::Pausing,
+                            ts: Utc::now(),
+                            pid: child.as_ref().map(|c| c.id()),
+                            correlation_id: Some(correlation_id),
+                        })?;
+                        
+                        // Stop child process (reuse existing stop logic)
+                        self.stop(&mut child, Some(correlation_id))?;
+                        
+                        // Report paused state
+                        self.bus.send(Evt::State {
+                            service: Arc::clone(&self.name),
+                            state: ServiceState::Paused,
+                            ts: Utc::now(),
+                            pid: None,  // No PID when paused
+                            correlation_id: Some(correlation_id),
+                        })?;
+                    },
+                    Cmd::Continue { correlation_id } => {
+                        // Restart child process (reuse existing start logic)
+                        self.start(&mut child, Some(correlation_id))?;
+                        
+                        // Note: start() already sends Running state via bus
+                        // No additional state reporting needed
                     },
                     Cmd::Shutdown => {
                         self.stop(&mut child, None)?;
@@ -212,6 +272,18 @@ impl ServiceWorker {
             cmd.current_dir(&validated_dir);
         }
 
+        // Create new process group with child as leader (PGID = child PID)
+        // This enables process group signaling for clean shutdown of entire subtree
+        #[cfg(unix)]
+        {
+            cmd.process_group(0);
+            
+            log::debug!(
+                "{}: Configuring new process group (PGID will equal PID after spawn)",
+                self.name
+            );
+        }
+
         // Spawn the process (file handles are now owned by child)
         let mut spawned = cmd.spawn().context(format!(
             "Failed to spawn '{}' in directory '{:?}'", 
@@ -219,6 +291,25 @@ impl ServiceWorker {
             self.def.working_dir.as_ref().unwrap_or(&".".to_string())
         ))?;
         let pid = spawned.id();
+
+        // Windows-specific: Assign child to job object for automatic cleanup
+        #[cfg(windows)]
+        if let Some(ref job) = self.job {
+            match job.assign_process(pid) {
+                Ok(_) => {
+                    log::debug!("{}: Assigned child (PID {}) to job object", self.name, pid);
+                }
+                Err(e) => {
+                    // Log warning but continue - child will not be auto-terminated on exit
+                    // Common causes: child already in another job (rare), permission issues
+                    log::warn!(
+                        "{}: Failed to assign child (PID {}) to job object: {}. \
+                         Child may not be cleaned up when daemon exits.",
+                        self.name, pid, e
+                    );
+                }
+            }
+        }
 
         // ADDED: Post-spawn verification - detect immediate failures
         // Wait 100ms to catch fast-fail scenarios (missing libs, permission errors, etc.)
@@ -294,27 +385,30 @@ impl ServiceWorker {
         if let Some(mut ch) = child.take() {
             let pid = ch.id();
 
-            // Unix-only: Try graceful shutdown with SIGTERM first
+            // Unix-only: Try graceful shutdown with SIGTERM to process group first
             #[cfg(unix)]
             {
-                use nix::sys::signal::{Signal, kill};
+                use nix::sys::signal::{Signal, killpg};
                 use nix::unistd::Pid;
 
-                info!("{} sending SIGTERM to pid {}", self.name, pid);
+                let pgid = Pid::from_raw(pid as i32);  // PGID == PID from process_group(0)
+                
+                info!("{} sending SIGTERM to process group (PGID: {})", self.name, pgid);
 
-                // Send SIGTERM for graceful shutdown
-                match kill(Pid::from_raw(pid as i32), Signal::SIGTERM) {
+                // Send SIGTERM to entire process group for graceful shutdown
+                match killpg(pgid, Signal::SIGTERM) {
                     Ok(_) => {
                         // Wait for graceful exit with configurable timeout
-                        let grace_period =
-                            Duration::from_secs(self.def.shutdown_timeout_secs.unwrap_or(10));
+                        let grace_period = Duration::from_secs(
+                            self.def.shutdown_timeout_secs.unwrap_or(10)
+                        );
 
                         // Use wait_timeout - zero polling overhead
                         match ch.wait_timeout(grace_period)? {
                             Some(status) => {
-                                // Process exited gracefully within timeout
+                                // Process group exited gracefully within timeout
                                 info!(
-                                    "{} exited gracefully in <{:.1}s with status: {:?}",
+                                    "{} process group exited gracefully in <{:.1}s with status: {:?}",
                                     self.name,
                                     grace_period.as_secs_f64(),
                                     status
@@ -323,63 +417,62 @@ impl ServiceWorker {
                                 return Ok(());
                             }
                             None => {
-                                // Timeout expired, process still running
+                                // Timeout expired, process group still running
                                 warn!(
-                                    "{} did not exit within {:.1}s grace period, sending SIGKILL",
+                                    "{} process group did not exit within {:.1}s grace period, sending SIGKILL",
                                     self.name,
                                     grace_period.as_secs_f64()
                                 );
-                                // Fall through to SIGKILL below
+                                
+                                // Escalate to SIGKILL for entire process group
+                                killpg(pgid, Signal::SIGKILL)
+                                    .context("Failed to SIGKILL process group")?;
+                                
+                                ch.wait()?;
+                                self.send_stopped_event(pid, correlation_id)?;
+                                return Ok(());
                             }
                         }
                     }
                     Err(e) => {
-                        warn!("{} failed to send SIGTERM: {}, using SIGKILL", self.name, e);
+                        // Process group may have already exited (race condition)
+                        // This is non-fatal - we'll wait on the child handle to confirm
+                        warn!(
+                            "{} killpg(SIGTERM) failed: {} (process group may have already exited)",
+                            self.name, e
+                        );
+                        
+                        // Still try to wait on child to reap zombie
+                        let _ = ch.wait();
+                        self.send_stopped_event(pid, correlation_id)?;
+                        return Ok(());
                     }
                 }
             }
 
-            // Force kill (Unix: after SIGTERM timeout/failure, Windows: only option)
-            #[cfg(unix)]
-            ch.kill().context("SIGKILL failed")?;
-
+            // Windows path: TerminateProcess (unchanged)
             #[cfg(windows)]
             {
-                // Windows uses TerminateProcess for forceful termination. Unlike Unix SIGTERM,
-                // there is no graceful shutdown mechanism for background daemon processes on
-                // Windows. Child::kill() internally calls TerminateProcess, which immediately
-                // terminates the process and all its threads without allowing cleanup.
-                //
-                // See: https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-terminateprocess
                 info!(
                     "{} terminating process (pid {}) via TerminateProcess",
                     self.name, pid
                 );
                 ch.kill().context("TerminateProcess failed")?;
-            }
 
-            // Wait for process to fully terminate
-            match ch.wait() {
-                Ok(status) => {
-                    #[cfg(unix)]
-                    info!("{} terminated with SIGKILL: {:?}", self.name, status);
-
-                    #[cfg(windows)]
-                    info!(
-                        "{} terminated with TerminateProcess: {:?}",
-                        self.name, status
-                    );
+                match ch.wait() {
+                    Ok(status) => {
+                        info!(
+                            "{} terminated with TerminateProcess: {:?}",
+                            self.name, status
+                        );
+                    }
+                    Err(e) => {
+                        warn!("{} wait() failed after TerminateProcess: {}", self.name, e);
+                    }
                 }
-                Err(e) => {
-                    #[cfg(unix)]
-                    warn!("{} wait() failed after SIGKILL: {}", self.name, e);
 
-                    #[cfg(windows)]
-                    warn!("{} wait() failed after TerminateProcess: {}", self.name, e);
-                }
+                self.send_stopped_event(pid, correlation_id)?;
             }
-
-            self.send_stopped_event(pid, correlation_id)?;
         }
         Ok(())
     }
