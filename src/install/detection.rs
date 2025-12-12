@@ -156,20 +156,22 @@ pub async fn get_installed_binary_version(binary_name: &str) -> Option<String> {
     {
         Ok(Ok(output)) => output,
         Ok(Err(e)) => {
-            log::debug!("Failed to execute {}: {}", binary_name, e);
+            log::warn!("Failed to execute '{}': {} (binary may not be in PATH)", binary_name, e);
             return None;
         }
         Err(_) => {
-            log::warn!("Timeout executing {} --version", binary_name);
+            log::warn!("Timeout (2s) executing '{} --version' (binary may be hanging)", binary_name);
             return None;
         }
     };
 
     if !output.status.success() {
-        log::debug!(
-            "Binary {} returned non-zero exit code: {}",
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        log::warn!(
+            "Binary '{}' returned non-zero exit code: {} - stderr: {}",
             binary_name,
-            output.status
+            output.status,
+            stderr.trim()
         );
         return None;
     }
@@ -180,11 +182,22 @@ pub async fn get_installed_binary_version(binary_name: &str) -> Option<String> {
     // Matches: 0.3.1, 1.0.0-beta, 2.1.3-rc.1, etc.
     let re = regex::Regex::new(r"\b(\d+\.\d+\.\d+(?:-[a-zA-Z0-9.-]+)?)\b").ok()?;
 
-    re.captures(&stdout).and_then(|cap| cap.get(1)).map(|m| {
-        let version = m.as_str().to_string();
-        log::info!("Detected version for {}: {}", binary_name, version);
-        version
-    })
+    match re.captures(&stdout).and_then(|cap| cap.get(1)) {
+        Some(m) => {
+            let version = m.as_str().to_string();
+            log::info!("Detected version for {}: {}", binary_name, version);
+            Some(version)
+        }
+        None => {
+            log::warn!(
+                "Failed to parse version from '{}' output: {:?} \
+                (expected format: X.Y.Z)",
+                binary_name,
+                stdout.trim()
+            );
+            None
+        }
+    }
 }
 
 /// Cache entry for crate version lookups
@@ -506,7 +519,10 @@ pub async fn check_kodegen_version_status() -> ComponentStatus {
         }
         (Some(ref installed_str), Some(ref latest_str)) => {
             // Parse and compare versions
-            match (Version::parse(installed_str), Version::parse(latest_str)) {
+            let installed_parse = Version::parse(installed_str);
+            let latest_parse = Version::parse(latest_str);
+
+            match (installed_parse, latest_parse) {
                 (Ok(installed_ver), Ok(latest_ver)) => {
                     if installed_ver >= latest_ver {
                         log::info!("kodegen version OK: {} >= {}", installed_str, latest_str);
@@ -520,8 +536,30 @@ pub async fn check_kodegen_version_status() -> ComponentStatus {
                         ComponentStatus::NeedsUpdate
                     }
                 }
-                _ => {
-                    log::warn!("Failed to parse version for comparison");
+                (Err(e), Ok(_)) => {
+                    log::error!(
+                        "Failed to parse INSTALLED version '{}': {}",
+                        installed_str,
+                        e
+                    );
+                    ComponentStatus::CheckFailed
+                }
+                (Ok(_), Err(e)) => {
+                    log::error!(
+                        "Failed to parse LATEST version from crates.io '{}': {}",
+                        latest_str,
+                        e
+                    );
+                    ComponentStatus::CheckFailed
+                }
+                (Err(e1), Err(e2)) => {
+                    log::error!(
+                        "Failed to parse BOTH versions - installed '{}': {}, latest '{}': {}",
+                        installed_str,
+                        e1,
+                        latest_str,
+                        e2
+                    );
                     ComponentStatus::CheckFailed
                 }
             }

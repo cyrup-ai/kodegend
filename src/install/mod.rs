@@ -33,11 +33,11 @@ mod binaries;
 pub(crate) mod chromium;
 pub(crate) mod cleanup;
 mod component_fixers;
-mod detection;
+pub mod detection;  // Public for integration tests
 mod download;
 mod gui;
 mod hosts;
-pub(crate) mod installer;
+pub mod installer;
 mod orchestration;
 mod platform_installer;
 mod privilege;

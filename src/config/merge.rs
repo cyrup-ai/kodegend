@@ -24,6 +24,12 @@ pub struct ConfigLoader {
     search_paths: Vec<PathBuf>,
 }
 
+impl Default for ConfigLoader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ConfigLoader {
     /// Create loader with standard search paths based on privilege level
     pub fn new() -> Self {

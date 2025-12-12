@@ -10,12 +10,12 @@ use windows::core::PCWSTR;
 use super::{InstallerBuilder, InstallerError};
 
 mod handles;
-pub(crate) mod paths;
-pub(crate) mod privileges;
+pub mod paths;
+pub mod privileges;
 mod registry;
 mod service_creation;
 mod task_scheduler;
-pub(crate) mod utils;
+pub mod utils;
 
 use handles::ScManagerHandle;
 use privileges::check_privileges;

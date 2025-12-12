@@ -352,10 +352,65 @@ pub async fn fix_kodegen_version(
             // Continue with installation
         }
         ComponentStatus::CheckFailed => {
+            // Capture actual error details for user
+            let installed = super::detection::get_installed_binary_version("kodegen").await;
+            let latest = super::detection::get_crates_io_version("kodegen").await;
+            
+            let error_msg = match (installed, latest) {
+                (None, None) => {
+                    "kodegen binary not found in PATH AND crates.io version check failed. \
+                    Install kodegen manually or check network connection.".to_string()
+                }
+                (None, Some(v)) => {
+                    format!(
+                        "kodegen binary not found in PATH (latest version is {}). \
+                        Binary may not be installed or not in PATH.",
+                        v
+                    )
+                }
+                (Some(v), None) => {
+                    format!(
+                        "Found kodegen {} but failed to fetch latest version from crates.io. \
+                        Check network connection or crates.io availability.",
+                        v
+                    )
+                }
+                (Some(inst), Some(lat)) => {
+                    // Both versions available but failed to parse
+                    use semver::Version;
+                    match (Version::parse(&inst), Version::parse(&lat)) {
+                        (Err(e), Ok(_)) => {
+                            format!(
+                                "Failed to parse installed kodegen version '{}': {}. \
+                                Output format may be corrupted.",
+                                inst, e
+                            )
+                        }
+                        (Ok(_), Err(e)) => {
+                            format!(
+                                "Failed to parse crates.io version '{}': {}. \
+                                API may have returned malformed data.",
+                                lat, e
+                            )
+                        }
+                        (Err(e1), Err(e2)) => {
+                            format!(
+                                "Failed to parse both versions - installed '{}': {}, latest '{}': {}",
+                                inst, e1, lat, e2
+                            )
+                        }
+                        (Ok(_), Ok(_)) => {
+                            "Unknown version check failure (this should not happen)".to_string()
+                        }
+                    }
+                }
+            };
+            
+            log::error!("Version check failed: {}", error_msg);
             return ComponentFixResult {
                 component: "kodegen_version",
                 success: false,
-                error: Some("Could not determine kodegen version status".to_string()),
+                error: Some(error_msg),
                 required_sudo: false,
             };
         }
@@ -460,10 +515,65 @@ pub async fn fix_kodegen_version_windows(
             // Continue with installation
         }
         ComponentStatus::CheckFailed => {
+            // Capture actual error details for user
+            let installed = super::detection::get_installed_binary_version("kodegen").await;
+            let latest = super::detection::get_crates_io_version("kodegen").await;
+            
+            let error_msg = match (installed, latest) {
+                (None, None) => {
+                    "kodegen binary not found in PATH AND crates.io version check failed. \
+                    Install kodegen manually or check network connection.".to_string()
+                }
+                (None, Some(v)) => {
+                    format!(
+                        "kodegen binary not found in PATH (latest version is {}). \
+                        Binary may not be installed or not in PATH.",
+                        v
+                    )
+                }
+                (Some(v), None) => {
+                    format!(
+                        "Found kodegen {} but failed to fetch latest version from crates.io. \
+                        Check network connection or crates.io availability.",
+                        v
+                    )
+                }
+                (Some(inst), Some(lat)) => {
+                    // Both versions available but failed to parse
+                    use semver::Version;
+                    match (Version::parse(&inst), Version::parse(&lat)) {
+                        (Err(e), Ok(_)) => {
+                            format!(
+                                "Failed to parse installed kodegen version '{}': {}. \
+                                Output format may be corrupted.",
+                                inst, e
+                            )
+                        }
+                        (Ok(_), Err(e)) => {
+                            format!(
+                                "Failed to parse crates.io version '{}': {}. \
+                                API may have returned malformed data.",
+                                lat, e
+                            )
+                        }
+                        (Err(e1), Err(e2)) => {
+                            format!(
+                                "Failed to parse both versions - installed '{}': {}, latest '{}': {}",
+                                inst, e1, lat, e2
+                            )
+                        }
+                        (Ok(_), Ok(_)) => {
+                            "Unknown version check failure (this should not happen)".to_string()
+                        }
+                    }
+                }
+            };
+            
+            log::error!("Version check failed: {}", error_msg);
             return ComponentFixResult {
                 component: "kodegen_version",
                 success: false,
-                error: Some("Could not determine kodegen version status".to_string()),
+                error: Some(error_msg),
                 required_sudo: false,
             };
         }

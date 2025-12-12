@@ -1,28 +1,25 @@
-mod cli;
-mod cli_output;
-mod config;
-mod constants;
-mod control;
-mod daemon;
-pub(crate) mod install;
-mod ipc;
-mod lifecycle;
-mod logging;
-mod manager;
-mod panic_handler;
-mod platform;
-mod security;
-mod service;
-mod signing;
-mod state_machine;
-mod status;
+// Use the library crate instead of redeclaring modules
+use kodegend::{
+    cli,
+    cli_output,
+    config,
+    control,
+    daemon,
+    install,
+    logging,
+    manager,
+    panic_handler,
+    platform,
+    security,
+    status,
+};
 
 use std::fs;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use crate::install::ensure_installed;
+use install::ensure_installed;
 use log::{error, info};
 use manager::ServiceManager;
 
@@ -122,7 +119,7 @@ async fn real_main() -> Result<()> {
         Some(cli::Cmd::Status) => handle_status().await,
         Some(cli::Cmd::Start { config_permissions, .. }) => {
             use crate::security::config_permissions::PermissionMode;
-            let mode = PermissionMode::from_str(&config_permissions);
+            let mode = PermissionMode::parse(&config_permissions);
             handle_start(mode).await
         }
         Some(cli::Cmd::Stop) => handle_stop().await,

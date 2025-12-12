@@ -463,7 +463,7 @@ impl ServiceConfig {
             .or_else(|| {
                 std::env::var("KODEGEND_CONFIG_PERMISSIONS")
                     .ok()
-                    .and_then(|s| PermissionMode::from_str(&s))
+                    .and_then(|s| PermissionMode::parse(&s))
             })
             .unwrap_or(PermissionMode::Strict);
         
